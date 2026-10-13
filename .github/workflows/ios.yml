@@ -44,7 +44,7 @@ jobs:
           set -euo pipefail
           app="$PWD/build-ios/Release-iphoneos/BBHost.app"
           test -f "$app/BBHost"
-          xcrun lipo -verify_arch arm64 "$app/BBHost"
+          xcrun lipo -archs "\$app/BBHost" | grep -q arm64
           plutil -lint "$app/Info.plist"
           mkdir -p out/Payload
           cp -R "$app" out/Payload/
