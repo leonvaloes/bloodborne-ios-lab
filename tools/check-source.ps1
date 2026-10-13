@@ -21,7 +21,7 @@ if ($LASTEXITCODE -ne 0 -or $files.Count -eq 0) { throw 'No tracked files to ins
 foreach ($path in $files) {
     if (-not (Test-AllowedPath $path)) { throw "Blocked publication path: $path" }
     $full = Join-Path $root $path
-    $item = Get-Item -LiteralPath $full
+    $item = Get-Item -LiteralPath $full -Force
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Links not allowed: $path" }
     if ($item.Length -gt 1MB) { throw "Review oversized file: $path" }
     $bytes = [IO.File]::ReadAllBytes($full)

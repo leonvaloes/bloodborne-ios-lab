@@ -20,7 +20,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Check publishable files
         shell: pwsh
-        run: ./tools/check-source.ps1
+        run: |
+          ./tools/check-source.ps1 -SelfTest
+          ./tools/check-source.ps1
       - name: Host translation and regression tests
         run: |
           cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release -DBB_BUILD_ID=${{ github.sha }}
