@@ -5,29 +5,27 @@
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 static bb::Result native(unsigned op, std::uint64_t a, std::uint64_t b) {
-    std::uint64_t flags;
+    std::uint64_t captured;
     // Inline code is compiled into the executable, never generated at runtime.
-    // Capture arithmetic flags with SETcc/LAHF: no push/pop that could clobber
-    // compiler red-zone locals. LAHF uses AH, so explicitly clobber RAX.
-    unsigned char carry, parity, auxiliary, zero, sign, overflow;
+    // Capture LAHF via RAX, never MOV AH to a memory operand: ASan may put
+    // that operand in R8-R15, whose REX prefix cannot encode AH. No push/pop
+    // is used, so compiler red-zone locals remain untouched.
+    unsigned char overflow;
     if (op == 0) {
-        asm volatile("addq %[b], %[a]; setc %[c]; setp %[p]; setz %[z]; sets %[s]; seto %[o]; lahf; movb %%ah, %[h]"
-            : [a] "+r"(a), [c] "=m"(carry), [p] "=m"(parity), [z] "=m"(zero),
-              [s] "=m"(sign), [o] "=m"(overflow), [h] "=m"(auxiliary)
-            : [b] "r"(b) : "rax", "cc");
+        asm volatile("addq %[b], %[a]; seto %[o]; lahf"
+            : [a] "+r"(a), "=a"(captured), [o] "=m"(overflow)
+            : [b] "r"(b) : "cc");
     } else if (op == 1) {
-        asm volatile("subq %[b], %[a]; setc %[c]; setp %[p]; setz %[z]; sets %[s]; seto %[o]; lahf; movb %%ah, %[h]"
-            : [a] "+r"(a), [c] "=m"(carry), [p] "=m"(parity), [z] "=m"(zero),
-              [s] "=m"(sign), [o] "=m"(overflow), [h] "=m"(auxiliary)
-            : [b] "r"(b) : "rax", "cc");
+        asm volatile("subq %[b], %[a]; seto %[o]; lahf"
+            : [a] "+r"(a), "=a"(captured), [o] "=m"(overflow)
+            : [b] "r"(b) : "cc");
     } else {
-        asm volatile("xorq %[b], %[a]; setc %[c]; setp %[p]; setz %[z]; sets %[s]; seto %[o]; lahf; movb %%ah, %[h]"
-            : [a] "+r"(a), [c] "=m"(carry), [p] "=m"(parity), [z] "=m"(zero),
-              [s] "=m"(sign), [o] "=m"(overflow), [h] "=m"(auxiliary)
-            : [b] "r"(b) : "rax", "cc");
+        asm volatile("xorq %[b], %[a]; seto %[o]; lahf"
+            : [a] "+r"(a), "=a"(captured), [o] "=m"(overflow)
+            : [b] "r"(b) : "cc");
     }
-    flags = (carry ? bb::CF : 0) | (parity ? bb::PF : 0) | (zero ? bb::ZF : 0) |
-        (sign ? bb::SF : 0) | (overflow ? bb::OF : 0) | (op != 2 ? auxiliary & bb::AF : 0);
+    const auto mask = bb::CF | bb::PF | bb::ZF | bb::SF | (op != 2 ? bb::AF : 0);
+    const auto flags = ((captured >> 8) & mask) | (overflow ? bb::OF : 0);
     return {a, flags};
 }
 #endif

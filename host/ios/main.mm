@@ -41,9 +41,9 @@
     UIButton *run = [UIButton buttonWithType:UIButtonTypeSystem];
     [run setTitle:@"Executar testes CPU e memória" forState:UIControlStateNormal];
     [run addTarget:self action:@selector(runTests) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *export = [UIButton buttonWithType:UIButtonTypeSystem];
-    [export setTitle:@"Exportar diagnóstico" forState:UIControlStateNormal];
-    [export addTarget:self action:@selector(exportReport:) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *exportButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [exportButton setTitle:@"Exportar diagnóstico" forState:UIControlStateNormal];
+    [exportButton addTarget:self action:@selector(exportReport:) forControlEvents:UIControlEventTouchUpInside];
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     _metal = [[MTKView alloc] initWithFrame:CGRectZero device:device];
     _metal.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -51,7 +51,7 @@
     _metal.preferredFramesPerSecond = 30;
     _metal.paused = YES;
     [_metal.heightAnchor constraintEqualToConstant:180].active = YES;
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[title, scope, _status, run, _metal, _gpuStatus, export]];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[title, scope, _status, run, _metal, _gpuStatus, exportButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -80,13 +80,13 @@
         "fragment float4 color() { return float4(0.9,0.2,0.15,1); }\n";
     NSError *error = nil;
     id<MTLLibrary> library = [device newLibraryWithSource:shader options:nil error:&error];
-    if (!library || !_queue) { [self gpuError:error.localizedDescription ?: @"Falha ao criar fila Metal"]; return; }
+    if (!library || !_queue) { [self gpuError:error ? error.localizedDescription : @"Falha ao criar fila Metal"]; return; }
     MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = [library newFunctionWithName:@"triangle"];
     descriptor.fragmentFunction = [library newFunctionWithName:@"color"];
     descriptor.colorAttachments[0].pixelFormat = _metal.colorPixelFormat;
     _pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-    if (!_pipeline) { [self gpuError:error.localizedDescription ?: @"Falha no pipeline"]; return; }
+    if (!_pipeline) { [self gpuError:error ? error.localizedDescription : @"Falha no pipeline"]; return; }
     _metal.delegate = self;
     _metal.paused = NO;
 }
@@ -129,7 +129,7 @@
                 if (strongSelf->_completedFrames == 1 || strongSelf->_completedFrames % 30 == 0)
                     strongSelf->_gpuStatus.text = [NSString stringWithFormat:@"Metal: %lu quadros concluídos. Confirme o triângulo visível.", (unsigned long)strongSelf->_completedFrames];
             } else {
-                [strongSelf gpuError:finished.error.localizedDescription ?: @"Erro no command buffer"];
+                [strongSelf gpuError:finished.error ? finished.error.localizedDescription : @"Erro no command buffer"];
             }
         });
     }];
@@ -144,7 +144,7 @@
         inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:&error];
     NSURL *file = [directory URLByAppendingPathComponent:@"bb-lab-report.json"];
     if (!json || !file || ![json writeToURL:file options:NSDataWritingAtomic error:&error]) {
-        _status.text = [@"Erro ao salvar diagnóstico: " stringByAppendingString:error.localizedDescription ?: @"desconhecido"];
+        _status.text = [@"Erro ao salvar diagnóstico: " stringByAppendingString:error ? error.localizedDescription : @"desconhecido"];
         return;
     }
     UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[file] applicationActivities:nil];
