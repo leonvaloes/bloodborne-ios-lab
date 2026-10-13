@@ -1,0 +1,48 @@
+name: Host tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check publishable files
+        shell: pwsh
+        run: ./tools/check-source.ps1
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBB_BUILD_ID=${{ github.sha }}
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Unit and integration tests
+        run: ctest --test-dir build -C Release --output-on-failure --output-junit test-results.xml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: tests-${{ matrix.os }}
+          path: build/test-results.xml
+          if-no-files-found: error
+          retention-days: 7
+  sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBB_SANITIZERS=ON -DCMAKE_CXX_COMPILER=clang++
+      - run: cmake --build build --parallel 4
+      - run: ctest --test-dir build --output-on-failure --output-junit test-results.xml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: sanitizer-tests
+          path: build/test-results.xml
+          if-no-files-found: error
+          retention-days: 7

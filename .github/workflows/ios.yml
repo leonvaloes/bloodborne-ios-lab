@@ -1,0 +1,64 @@
+name: iOS unsigned laboratory
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - core/**
+      - fixtures/**
+      - tools/**
+      - host/ios/**
+      - tests/**
+      - CMakeLists.txt
+      - .github/workflows/ios.yml
+permissions:
+  contents: read
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check publishable files
+        shell: pwsh
+        run: ./tools/check-source.ps1
+      - name: Host translation and regression tests
+        run: |
+          cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release -DBB_BUILD_ID=${{ github.sha }}
+          cmake --build build-host --parallel 4
+          ctest --test-dir build-host --output-on-failure
+      - name: Compile for physical iOS arm64
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          cmake -S . -B build-ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -DBB_BUILD_ID=${{ github.sha }} -DBB_GENERATED_DIR="$PWD/build-host/generated"
+          cmake --build build-ios --config Release --target BBHost -- \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+      - name: Inspect and package unsigned app
+        run: |
+          set -euo pipefail
+          app="$PWD/build-ios/Release-iphoneos/BBHost.app"
+          test -f "$app/BBHost"
+          xcrun lipo -verify_arch arm64 "$app/BBHost"
+          plutil -lint "$app/Info.plist"
+          mkdir -p out/Payload
+          cp -R "$app" out/Payload/
+          (cd out && zip -qry BBHost-unsigned.ipa Payload)
+          shasum -a 256 out/BBHost-unsigned.ipa > out/SHA256SUMS.txt
+          xcrun lipo -info "$app/BBHost" > out/architecture.txt
+          xcrun vtool -show-build "$app/BBHost" > out/platform.txt
+          printf '%s\n' '${{ github.sha }}' > out/revision.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: BBHost-unsigned-arm64
+          path: |
+            out/BBHost-unsigned.ipa
+            out/SHA256SUMS.txt
+            out/architecture.txt
+            out/platform.txt
+            out/revision.txt
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,13 @@
+/build*/
+/out/
+/local/
+*.ipa
+*.mobileprovision
+*.p12
+*.key
+*.pem
+eboot.bin
+*.prx
+*.pkg
+*.xcuserstate
+.DS_Store
