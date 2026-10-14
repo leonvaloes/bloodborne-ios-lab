@@ -73,6 +73,9 @@ set(LIBATRAC9_SOURCES
 add_library(bb_atrac9 STATIC ${LIBATRAC9_SOURCES})
 target_include_directories(bb_atrac9 PUBLIC third_party/LibAtrac9/src)
 set_target_properties(bb_atrac9 PROPERTIES C_STANDARD 99)
+# libatrac9.h usa __declspec(dllimport) em MSVC salvo COMPILING_DLL; a lib e estatica,
+# entao a definicao precisa valer tambem para quem linka (PUBLIC), sem editar o upstream.
+target_compile_definitions(bb_atrac9 PUBLIC COMPILING_DLL)
 if(MSVC)
     target_compile_options(bb_atrac9 PRIVATE /w)
 else()
