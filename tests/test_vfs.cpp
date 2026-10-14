@@ -4,6 +4,8 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <array>
+#include <cstdint>
 
 int main() { return run([] {
     using namespace bb;
@@ -71,6 +73,29 @@ int main() { return run([] {
     CHECK(read_bytes.size() == sizeof(dummy_data));
     CHECK(std::string(reinterpret_cast<char *>(read_bytes.data())) == dummy_data);
 
+    // Sparse fixture: offset beyond 4 GiB without allocating or copying an asset.
+    constexpr std::uint64_t large_offset = (std::uint64_t{1} << 32) + 17;
+    {
+        std::ofstream sparse(app_dir / "sparse.dat", std::ios::binary);
+        sparse.seekp(static_cast<std::streamoff>(large_offset));
+        sparse.write("XYZ", 3);
+        CHECK(sparse.good());
+    }
+    std::array<char, 8> chunk{};
+    std::size_t got = 99;
+    CHECK(vfs.read_at("/app0/sparse.dat", large_offset, chunk.data(), chunk.size(), got) == VfsError::ok);
+    CHECK(got == 3);
+    CHECK(std::string(chunk.data(), got) == "XYZ");
+    CHECK(vfs.read_at("/app0/sparse.dat", large_offset + 3, chunk.data(), chunk.size(), got) == VfsError::ok);
+    CHECK(got == 0);
+    CHECK(vfs.read_at("/app0/sparse.dat", UINT64_MAX, chunk.data(), chunk.size(), got) == VfsError::ok);
+    CHECK(got == 0);
+    CHECK(vfs.read_at("/app0/sparse.dat", 0, nullptr, 1, got) == VfsError::invalid_path);
+    CHECK(got == 0);
+    CHECK(vfs.read_at("/app0/../outside/secret.txt", 0, chunk.data(), chunk.size(), got) == VfsError::traversal_detected);
+    CHECK(got == 0);
+    CHECK(vfs.read_at("/app0/missing", 0, chunk.data(), chunk.size(), got) == VfsError::not_found);
+
     // Remoção
     CHECK(vfs.remove_file("/user/home/savedata/save01.dat") == VfsError::ok);
     CHECK(!vfs.exists("/user/home/savedata/save01.dat"));
@@ -92,13 +117,21 @@ int main() { return run([] {
         CHECK(!vfs.exists("/user/home/savedata/escape/secret.txt"));
         CHECK(vfs.stat("/user/home/savedata/escape/secret.txt", st) == VfsError::access_denied);
         CHECK(vfs.read_file("/user/home/savedata/escape/secret.txt", read_bytes) == VfsError::access_denied);
+        CHECK(vfs.read_at("/user/home/savedata/escape/secret.txt", 0, chunk.data(), chunk.size(), got) == VfsError::access_denied);
+        CHECK(got == 0);
         CHECK(vfs.write_file("/user/home/savedata/escape/new.txt", dummy_data, sizeof(dummy_data)) == VfsError::access_denied);
         CHECK(!std::filesystem::exists(outside / "new.txt"));
     }
     ec.clear();
     std::filesystem::create_directories(save_dir / "nested", ec);
     std::filesystem::create_directory_symlink(save_dir / "nested", save_dir / "inside", ec);
-    if (!ec) CHECK(vfs.resolve("/user/home/savedata/inside/file.txt", host_path, readonly) == VfsError::ok);
+    if (!ec) {
+        CHECK(vfs.resolve("/user/home/savedata/inside/file.txt", host_path, readonly) == VfsError::ok);
+        { std::ofstream file(save_dir / "nested" / "file.txt"); file << "inside"; }
+        CHECK(vfs.read_at("/user/home/savedata/inside/file.txt", 2, chunk.data(), 3, got) == VfsError::ok);
+        CHECK(got == 3);
+        CHECK(std::string(chunk.data(), got) == "sid");
+    }
 
     // Desmontagem
     CHECK(vfs.unmount("/app0"));

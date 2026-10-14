@@ -7,6 +7,7 @@
 #include <chrono>
 #include <iostream>
 #include <cwctype>
+#include <limits>
 
 namespace bb {
 
@@ -349,6 +350,50 @@ VfsError VirtualFileSystem::read_file(const std::string &virtual_path, std::vect
         return VfsError::io_error;
     }
     return VfsError::ok;
+}
+
+VfsError VirtualFileSystem::read_at(const std::string &virtual_path, std::uint64_t offset,
+                                     void *dest, std::size_t bytes_to_read, std::size_t &out_bytes_read) const {
+    out_bytes_read = 0;
+    if (bytes_to_read && !dest) return VfsError::invalid_path;
+    const std::string norm = normalize_path(virtual_path);
+    if (contains_traversal(norm)) return VfsError::traversal_detected;
+
+    // This API reads local files only, rather than silently falling back to a
+    // host file beneath an archive mount with the same virtual path.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &pair : bhd5_mounts_) {
+            const auto &m = pair.first;
+            if (norm == m || norm.rfind(m + "/", 0) == 0) return VfsError::access_denied;
+        }
+        for (const auto &pair : bnd4_mounts_) {
+            const auto &m = pair.first;
+            if (norm == m || norm.rfind(m + "/", 0) == 0) return VfsError::access_denied;
+        }
+    }
+
+    std::string host_path;
+    bool readonly = false;
+    const auto err = resolve(virtual_path, host_path, readonly);
+    if (err != VfsError::ok) return err;
+
+    std::ifstream file(std::filesystem::u8path(host_path), std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return VfsError::not_found;
+    const auto end = file.tellg();
+    if (end < 0) return VfsError::io_error;
+    const auto size = static_cast<std::uint64_t>(end);
+    if (offset >= size || bytes_to_read == 0) return VfsError::ok;
+
+    const auto count = static_cast<std::streamsize>(std::min<std::uint64_t>(
+        {size - offset, static_cast<std::uint64_t>(bytes_to_read),
+         static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())}));
+    file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!file) return VfsError::io_error;
+    file.read(static_cast<char *>(dest), count);
+    out_bytes_read = static_cast<std::size_t>(file.gcount());
+    // EOF can occur when the file shrinks after tellg; report the short read.
+    return file.bad() || (file.fail() && !file.eof()) ? VfsError::io_error : VfsError::ok;
 }
 
 VfsError VirtualFileSystem::write_file(const std::string &virtual_path, const void *data, std::size_t size, bool atomic) {
