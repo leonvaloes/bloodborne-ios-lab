@@ -246,3 +246,7 @@ As 3 falhas pontuais ocorridas no iPhone no build `bd7bc24` foram identificadas 
 ## Marco Sprint 5: leitura de Documents no iPhone (14/10/2026)
 
 No build `9fc9c9852734e0157c9553c8802a786e6d05c388`, o diagnostico exportado no iPhone 15 Pro Max registrou `documents_test.status = ok`, `valid = true`, 42 bytes e o conteudo exato `Teste de transferencia BB Lab - Sprint 5\r\n`. `game_execution = false`. Detalhes, procedimento e limites: `docs/SPRINT5_DOCUMENTS_DEVICE.md` no laboratorio.
+
+## Marco Sprint 5: DCX real no iPhone (14/10/2026)
+
+Build `061e6be`: leitura via VFS e descompressao Deflate validadas no iPhone (1.024 -> 2.992 bytes; CRC32 compactado `2119878094`, descompactado `1284949640`, ambos conferidos com arquivo local). `game_execution = false`. Detalhes: `docs/SPRINT5_DCX_PROBE.md` no laboratorio.

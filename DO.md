@@ -106,3 +106,8 @@ Este documento descreve o planejamento técnico dividido em entregas progressiva
 
 - [x] BB Lab `9fc9c98` leu `teste-bblab.txt` de Documents no iPhone e exportou `status: ok`, 42 bytes e o texto UTF-8. Evidencia: `docs/SPRINT5_DOCUMENTS_DEVICE.md` no laboratorio.
 - [ ] A atividade 5.1 de ingestao dos assets do jogo continua pendente; este teste usa apenas um arquivo de texto.
+
+## Marco intermediario Sprint 5: DCX no aparelho
+
+- [x] Ler `m29_00_00_00_408010.flver.dcx` pelo VFS e descomprimir no iPhone; 1.024 -> 2.992 bytes e CRC32 conferidos.
+- [ ] Interpretar a geometria FLVER desse asset no aparelho e demonstrar a renderizacao especifica; ainda nao e execucao do jogo.
