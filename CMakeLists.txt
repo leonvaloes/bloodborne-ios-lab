@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.24)
-project(BloodborneIOSLab VERSION 0.1.0 LANGUAGES CXX)
+project(BloodborneIOSLab VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -66,6 +66,9 @@ set(CORE_SOURCES
     core/guest_loader.cpp
     core/input.cpp
     core/vfs.cpp
+    core/binder.cpp
+    core/miniz/miniz_tinfl.c
+    core/miniz/miniz_common.c
     core/audio.cpp
     core/stability.cpp
     core/engine_loop.cpp)
@@ -97,7 +100,7 @@ else()
     target_link_libraries(bb-smoke PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs audio stability engine)
+        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder audio stability engine)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
@@ -109,6 +112,6 @@ else()
             "-DAOT=$<TARGET_FILE:bb-aot>" "-DSMOKE=$<TARGET_FILE:bb-smoke>"
             "-DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/add.hex"
             "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake")
-        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs audio stability engine aot_rejection cli_integration PROPERTIES TIMEOUT 60)
+        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder audio stability engine aot_rejection cli_integration PROPERTIES TIMEOUT 60)
     endif()
 endif()

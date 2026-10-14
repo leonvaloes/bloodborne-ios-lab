@@ -1,4 +1,5 @@
 ﻿#include "vfs.h"
+#include "binder.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -8,6 +9,22 @@
 namespace bb {
 
 VirtualFileSystem::VirtualFileSystem() = default;
+
+bool VirtualFileSystem::mount_bhd5(const std::string &mount_point, std::shared_ptr<Bhd5Reader> reader) {
+    if (mount_point.empty() || !reader) return false;
+    std::string norm_mount = normalize_path(mount_point);
+    std::lock_guard<std::mutex> lock(mutex_);
+    bhd5_mounts_[norm_mount] = std::move(reader);
+    return true;
+}
+
+bool VirtualFileSystem::mount_bnd4(const std::string &mount_point, std::shared_ptr<Bnd4Reader> reader) {
+    if (mount_point.empty() || !reader) return false;
+    std::string norm_mount = normalize_path(mount_point);
+    std::lock_guard<std::mutex> lock(mutex_);
+    bnd4_mounts_[norm_mount] = std::move(reader);
+    return true;
+}
 
 std::string VirtualFileSystem::normalize_path(const std::string &path) {
     if (path.empty()) return "/";
@@ -80,13 +97,18 @@ bool VirtualFileSystem::mount(const std::string &mount_point, const std::string 
 bool VirtualFileSystem::unmount(const std::string &mount_point) {
     std::string norm_mount = normalize_path(mount_point);
     std::lock_guard<std::mutex> lock(mutex_);
-    return mounts_.erase(norm_mount) > 0;
+    bool erased = mounts_.erase(norm_mount) > 0;
+    erased = (bhd5_mounts_.erase(norm_mount) > 0) || erased;
+    erased = (bnd4_mounts_.erase(norm_mount) > 0) || erased;
+    return erased;
 }
 
 bool VirtualFileSystem::is_mounted(const std::string &mount_point) const {
     std::string norm_mount = normalize_path(mount_point);
     std::lock_guard<std::mutex> lock(mutex_);
-    return mounts_.find(norm_mount) != mounts_.end();
+    return mounts_.find(norm_mount) != mounts_.end() ||
+           bhd5_mounts_.find(norm_mount) != bhd5_mounts_.end() ||
+           bnd4_mounts_.find(norm_mount) != bnd4_mounts_.end();
 }
 
 VfsError VirtualFileSystem::resolve(const std::string &virtual_path, std::string &out_host_path, bool &out_readonly) const {
@@ -129,6 +151,29 @@ VfsError VirtualFileSystem::resolve(const std::string &virtual_path, std::string
 }
 
 bool VirtualFileSystem::exists(const std::string &virtual_path) const {
+    std::string norm = normalize_path(virtual_path);
+    if (contains_traversal(norm)) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &pair : bhd5_mounts_) {
+            const std::string &m = pair.first;
+            if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                std::string rel = norm.substr(m.size());
+                if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+                if (pair.second && pair.second->has_file(rel)) return true;
+            }
+        }
+        for (const auto &pair : bnd4_mounts_) {
+            const std::string &m = pair.first;
+            if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                std::string rel = norm.substr(m.size());
+                if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+                if (pair.second && pair.second->has_file(rel)) return true;
+            }
+        }
+    }
+
     std::string host_path;
     bool ro = false;
     if (resolve(virtual_path, host_path, ro) != VfsError::ok) return false;
@@ -137,6 +182,45 @@ bool VirtualFileSystem::exists(const std::string &virtual_path) const {
 }
 
 VfsError VirtualFileSystem::stat(const std::string &virtual_path, VfsStat &out_stat) const {
+    std::string norm = normalize_path(virtual_path);
+    if (contains_traversal(norm)) return VfsError::traversal_detected;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &pair : bhd5_mounts_) {
+            const std::string &m = pair.first;
+            if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                std::string rel = norm.substr(m.size());
+                if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+                if (pair.second) {
+                    const auto *entry = pair.second->get_entry(rel);
+                    if (entry) {
+                        out_stat.size = entry->file_size;
+                        out_stat.is_directory = false;
+                        out_stat.is_readonly = true;
+                        return VfsError::ok;
+                    }
+                }
+            }
+        }
+        for (const auto &pair : bnd4_mounts_) {
+            const std::string &m = pair.first;
+            if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                std::string rel = norm.substr(m.size());
+                if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+                if (pair.second) {
+                    const auto *entry = pair.second->get_entry(rel);
+                    if (entry) {
+                        out_stat.size = entry->compressed_size;
+                        out_stat.is_directory = false;
+                        out_stat.is_readonly = true;
+                        return VfsError::ok;
+                    }
+                }
+            }
+        }
+    }
+
     std::string host_path;
     bool ro = false;
     VfsError err = resolve(virtual_path, host_path, ro);
@@ -158,6 +242,37 @@ VfsError VirtualFileSystem::stat(const std::string &virtual_path, VfsStat &out_s
 }
 
 VfsError VirtualFileSystem::read_file(const std::string &virtual_path, std::vector<std::uint8_t> &out_data) const {
+    std::string norm = normalize_path(virtual_path);
+    if (contains_traversal(norm)) return VfsError::traversal_detected;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &pair : bhd5_mounts_) {
+            const std::string &m = pair.first;
+            if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                std::string rel = norm.substr(m.size());
+                if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+                if (pair.second && pair.second->has_file(rel)) {
+                    BinderError b_err = pair.second->read_file(rel, out_data);
+                    if (b_err == BinderError::ok) return VfsError::ok;
+                    return VfsError::io_error;
+                }
+            }
+        }
+        for (const auto &pair : bnd4_mounts_) {
+            const std::string &m = pair.first;
+            if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                std::string rel = norm.substr(m.size());
+                if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+                if (pair.second && pair.second->has_file(rel)) {
+                    BinderError b_err = pair.second->read_file(rel, out_data);
+                    if (b_err == BinderError::ok) return VfsError::ok;
+                    return VfsError::io_error;
+                }
+            }
+        }
+    }
+
     std::string host_path;
     bool ro = false;
     VfsError err = resolve(virtual_path, host_path, ro);

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
+#include <memory>
 
 namespace bb {
 
@@ -26,6 +27,9 @@ struct VfsStat {
     bool is_readonly{false};
 };
 
+class Bhd5Reader;
+class Bnd4Reader;
+
 class VirtualFileSystem {
 public:
     VirtualFileSystem();
@@ -34,6 +38,10 @@ public:
     bool mount(const std::string &mount_point, const std::string &host_dir, bool read_only = true);
     bool unmount(const std::string &mount_point);
     bool is_mounted(const std::string &mount_point) const;
+
+    // Montagem direta de pacotes FromSoftware BHD5/BDT e BND4 no VFS
+    bool mount_bhd5(const std::string &mount_point, std::shared_ptr<Bhd5Reader> reader);
+    bool mount_bnd4(const std::string &mount_point, std::shared_ptr<Bnd4Reader> reader);
 
     // Normaliza e resolve um caminho virtual para caminho f?sico host
     VfsError resolve(const std::string &virtual_path, std::string &out_host_path, bool &out_readonly) const;
@@ -58,6 +66,8 @@ private:
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, MountPoint> mounts_;
+    std::unordered_map<std::string, std::shared_ptr<Bhd5Reader>> bhd5_mounts_;
+    std::unordered_map<std::string, std::shared_ptr<Bnd4Reader>> bnd4_mounts_;
 };
 
 } // namespace bb
