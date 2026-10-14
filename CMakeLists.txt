@@ -124,6 +124,7 @@ set(CORE_SOURCES
     core/gcn_isa.cpp
     core/gcn_ir.cpp
     core/gcn_msl.cpp
+    core/gnm_metal_bridge.cpp
     core/save_data.cpp
     core/app_content.cpp
     core/game_boot_coordinator.cpp
@@ -164,7 +165,7 @@ else()
     target_link_libraries(bb-run-eboot PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-foreach(name guest_scheduler memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls dialog_hle vfs binder game_package game_asset_probe boot_probe audio audio_out ngs2_hle ngs2_atrac9 stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 gnm_context video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle)
+foreach(name guest_scheduler memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls dialog_hle vfs binder game_package game_asset_probe boot_probe audio audio_out ngs2_hle ngs2_atrac9 stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 gnm_context gnm_metal_bridge video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
@@ -182,6 +183,6 @@ foreach(name guest_scheduler memory threads alu integration simd dispatcher hle 
             "-DAOT=$<TARGET_FILE:bb-aot>" "-DSMOKE=$<TARGET_FILE:bb-smoke>"
             "-DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/add.hex"
             "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake")
-set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls dialog_hle vfs binder game_package game_asset_probe dcx_probe audio audio_out ngs2_hle ngs2_atrac9 stability engine shader_translator metal_pipeline flver_parser gnm_pm4 gnm_context video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle aot_rejection cli_integration PROPERTIES TIMEOUT 60)
+set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls dialog_hle vfs binder game_package game_asset_probe dcx_probe audio audio_out ngs2_hle ngs2_atrac9 stability engine shader_translator metal_pipeline flver_parser gnm_pm4 gnm_context gnm_metal_bridge video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle aot_rejection cli_integration PROPERTIES TIMEOUT 60)
     endif()
 endif()

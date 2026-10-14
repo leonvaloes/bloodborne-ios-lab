@@ -14,7 +14,18 @@ enum class MetalPixelFormat {
     RG11B10Float,     // Compact HDR Render Target
     Depth32Float,     // 32-bit floating point depth buffer (Z-buffer)
     Depth32Float_Stencil8,
-    Invalid
+    Invalid,
+    RGBA8Unorm,
+    R8Unorm,
+    RG8Unorm,
+    R16Float,
+    RG16Float,
+    R32Float,
+    RG32Float,
+    RGBA32Float,
+    RGB10A2Unorm,
+    Depth16Unorm,
+    Stencil8
 };
 
 enum class MetalCompareFunction {

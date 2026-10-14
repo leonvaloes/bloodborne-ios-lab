@@ -198,11 +198,20 @@ bool Metal3ArgumentTable::validate() const {
 }
 
 bool MetalPipelineManager::is_hdr_format(MetalPixelFormat format) {
-    return format == MetalPixelFormat::RGBA16Float || format == MetalPixelFormat::RG11B10Float;
+    return format == MetalPixelFormat::RGBA16Float ||
+           format == MetalPixelFormat::RG11B10Float ||
+           format == MetalPixelFormat::R16Float ||
+           format == MetalPixelFormat::RG16Float ||
+           format == MetalPixelFormat::R32Float ||
+           format == MetalPixelFormat::RG32Float ||
+           format == MetalPixelFormat::RGBA32Float;
 }
 
 bool MetalPipelineManager::is_depth_format(MetalPixelFormat format) {
-    return format == MetalPixelFormat::Depth32Float || format == MetalPixelFormat::Depth32Float_Stencil8;
+    return format == MetalPixelFormat::Depth32Float ||
+           format == MetalPixelFormat::Depth32Float_Stencil8 ||
+           format == MetalPixelFormat::Depth16Unorm ||
+           format == MetalPixelFormat::Stencil8;
 }
 
 const char* MetalPipelineManager::format_to_string(MetalPixelFormat format) {
@@ -212,6 +221,17 @@ const char* MetalPipelineManager::format_to_string(MetalPixelFormat format) {
         case MetalPixelFormat::RG11B10Float: return "MTLPixelFormatRG11B10Float (Compact HDR)";
         case MetalPixelFormat::Depth32Float: return "MTLPixelFormatDepth32Float";
         case MetalPixelFormat::Depth32Float_Stencil8: return "MTLPixelFormatDepth32Float_Stencil8";
+        case MetalPixelFormat::RGBA8Unorm: return "MTLPixelFormatRGBA8Unorm";
+        case MetalPixelFormat::R8Unorm: return "MTLPixelFormatR8Unorm";
+        case MetalPixelFormat::RG8Unorm: return "MTLPixelFormatRG8Unorm";
+        case MetalPixelFormat::R16Float: return "MTLPixelFormatR16Float";
+        case MetalPixelFormat::RG16Float: return "MTLPixelFormatRG16Float";
+        case MetalPixelFormat::R32Float: return "MTLPixelFormatR32Float";
+        case MetalPixelFormat::RG32Float: return "MTLPixelFormatRG32Float";
+        case MetalPixelFormat::RGBA32Float: return "MTLPixelFormatRGBA32Float";
+        case MetalPixelFormat::RGB10A2Unorm: return "MTLPixelFormatRGB10A2Unorm";
+        case MetalPixelFormat::Depth16Unorm: return "MTLPixelFormatDepth16Unorm";
+        case MetalPixelFormat::Stencil8: return "MTLPixelFormatStencil8";
         default: return "Invalid";
     }
 }
