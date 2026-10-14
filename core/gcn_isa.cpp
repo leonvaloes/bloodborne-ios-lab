@@ -32,6 +32,43 @@ Format format(uint32_t w) {
     if ((w & 0x80000000u) == 0) return Format::VOP2;
     return Format::Unknown; // includes VINTRP and VOP3P: not silently misdecoded
 }
+// Deliberately narrow opcode allowlist: unknown/reserved values must not become IR.
+// A listed opcode only validates the opcode slot, not its full semantics.
+bool known(Format f, uint32_t op) {
+    switch (f) {
+    case Format::SOP1: return op <= 7 || (op >= 32 && op <= 39);
+    case Format::SOP2: return op <= 44;
+    case Format::SOPK: return op <= 21;
+    case Format::SOPC: return op <= 15;
+    case Format::SOPP: return op <= 12 || (op >= 16 && op <= 26);
+    case Format::SMRD: return op <= 4 || (op >= 8 && op <= 12);
+    case Format::VOP1: return op <= 17 || (op >= 32 && op <= 69);
+    case Format::VOP2: return op <= 36;
+    case Format::VOPC: return op <= 247;
+    case Format::VOP3: return op <= 511; // opcode families beyond this require separate validation
+    case Format::DS: return op <= 127;
+    case Format::MUBUF: return op <= 113;
+    case Format::MTBUF: return op <= 7;
+    case Format::MIMG: return op <= 111;
+    case Format::EXP: return op <= 63; // target, not opcode
+    case Format::Unknown: return false;
+    }
+    return false;
+}
+bool valid_fields(const Instruction& i) {
+    // A scalar destination is a register selector, never an inline/literal value.
+    for (unsigned n = 0; n < i.destination_count; ++n)
+        if (i.destinations[n].kind == OperandKind::Special && i.format != Format::VOPC)
+            return false;
+    if (i.format == Format::SMRD && i.sources[1].kind == OperandKind::Special) return false;
+    // VOP3 src modifiers are not yet modelled. Refuse them rather than dropping bits.
+    if (i.format == Format::VOP3 && ((i.raw[0] & 0x0000ff00u) != 0 ||
+                                      (i.raw[1] & 0xf8000000u) != 0)) return false;
+    // EXP requires at least one enabled component and cannot use both done and valid_mask
+    // to imply anything about scheduling; those flags are carried in raw words.
+    if (i.format == Format::EXP && ((i.raw[0] >> 12) & 15u) == 0) return false;
+    return true;
+}
 bool wide(Format f) {
     return f == Format::VOP3 || f == Format::DS || f == Format::MUBUF ||
            f == Format::MTBUF || f == Format::MIMG || f == Format::EXP;
@@ -113,7 +150,12 @@ Program decode(const uint32_t* words, size_t count) {
             dst(i, vector(bits(hi, 24, 255))); break;
         case Format::MUBUF: case Format::MTBUF:
             i.opcode = i.format == Format::MUBUF ? bits(w, 18, 127) : bits(w, 16, 7);
-            src(i, vector(bits(hi, 0, 255))); src(i, vector(bits(hi, 8, 255)));
+            src(i, vector(bits(hi, 0, 255)));
+            // vdata is a destination for loads, a source for stores/atomics.
+            if ((i.format == Format::MUBUF && i.opcode < 4) ||
+                (i.format == Format::MTBUF && i.opcode < 4))
+                dst(i, vector(bits(hi, 8, 255)));
+            else src(i, vector(bits(hi, 8, 255)));
             src(i, scalar(bits(hi, 16, 31) * 4)); src(i, scalar(bits(hi, 24, 255)));
             break;
         case Format::MIMG:
@@ -154,14 +196,10 @@ Program decode(const uint32_t* words, size_t count) {
             for (unsigned n = 0; n < i.source_count; ++n)
                 if (i.sources[n].kind == OperandKind::Literal) i.sources[n].value = i.literal;
         }
-        // Conservative ranges: holes inside a range still require a semantic opcode table.
-        // Never present an out-of-range opcode as supported.
-        if (i.diagnostic == Diagnostic::None &&
-            ((i.format == Format::SOP2 && i.opcode > 44) ||
-             (i.format == Format::SOPK && i.opcode > 21) ||
-             (i.format == Format::SOPP && i.opcode > 26) ||
-             (i.format == Format::VOP2 && i.opcode > 36)))
+        if (i.diagnostic == Diagnostic::None && !known(i.format, i.opcode))
             i.diagnostic = Diagnostic::UnverifiedOpcode;
+        if (i.diagnostic == Diagnostic::None && !valid_fields(i))
+            i.diagnostic = Diagnostic::InvalidField;
         pos += length;
         program.instructions.push_back(i);
     }

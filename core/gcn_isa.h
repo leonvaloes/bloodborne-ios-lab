@@ -11,7 +11,7 @@ namespace bb::gcn {
 enum class Format { Unknown, SOP1, SOP2, SOPK, SOPC, SOPP, SMRD, VOP1, VOP2,
                     VOP3, VOPC, DS, MUBUF, MTBUF, MIMG, EXP };
 enum class Diagnostic { None, UnknownEncoding, UnverifiedOpcode, Truncated, UnsupportedExtension,
-                        BranchOutOfBounds };
+                        BranchOutOfBounds, InvalidField };
 enum class OperandKind { Scalar, Vector, InlineConstant, Special, Literal, Immediate };
 struct Operand {
     OperandKind kind = OperandKind::Special;
