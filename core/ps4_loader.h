@@ -13,6 +13,7 @@ struct Ps4Tls {
     std::uint32_t module_id = 0; // eboot=1, libc=2
 };
 struct Ps4Module {
+    std::string name;
     std::uint64_t base = 0, size = 0, init = 0;
     Ps4Tls tls;
 };
@@ -39,6 +40,14 @@ public:
     static Ps4Image load(GuestMemory& memory,
                          const std::vector<std::uint8_t>& eboot,
                          const std::vector<std::uint8_t>& libc = {},
+                         std::uint64_t image_base = 0x10000000,
+                         std::uint64_t code_traps = 0x7f000000,
+                         std::uint64_t data_traps = 0x7e000000);
+    // Only DT_NEEDED dependencies are loaded; keys are exact sce_module filenames.
+    // Missing dependencies and cycles fail closed. Legacy overload retains optional libc.
+    static Ps4Image load(GuestMemory& memory,
+                         const std::vector<std::uint8_t>& eboot,
+                         const std::map<std::string, std::vector<std::uint8_t>>& modules,
                          std::uint64_t image_base = 0x10000000,
                          std::uint64_t code_traps = 0x7f000000,
                          std::uint64_t data_traps = 0x7e000000);

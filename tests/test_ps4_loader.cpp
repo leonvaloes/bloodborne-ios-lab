@@ -100,6 +100,34 @@ int main() { return run([] {
     GuestMemory mem4(1<<20);auto tls_image=Ps4Loader::load(mem4,main,tls);
     CHECK(tls_image.modules[0].tls.module_id==2);
     CHECK(mem4.load(0x10010620,&value,8)==MemoryError::ok && value==2);
+    // Synthetic dependency graph: B before A before eboot, with cross-module export.
+    auto dependent=main, a=lib, b=lib;
+    std::memcpy(dependent.data()+0x800+32,"A.prx",6);
+    std::size_t dt=0x700+10*16;tag(dependent,dt,1,32);
+    std::memcpy(a.data()+0x800+32,"B.prx",6);
+    dt=0x700+11*16;tag(a,dt,1,32);
+    // A imports B's export, and has a distinct non-colliding export identity.
+    put(a,0x800+64+30,0,2);
+    GuestMemory graphmem(32u<<20);
+    auto graph=Ps4Loader::load(graphmem,dependent,std::map<std::string,B>{{"A.prx",a},{"B.prx",b}});
+    CHECK(graph.modules.size()==2 && graph.modules[0].name=="B.prx" && graph.modules[1].name=="A.prx");
+    CHECK(graph.modules[0].tls.module_id==2 && graph.modules[1].tls.module_id==3);
+    CHECK(graphmem.load(graph.modules[1].base+0x620,&value,8)==MemoryError::ok && value==graph.modules[0].base+0x410);
+    CpuState graphcpu;
+    auto graphtcb=Ps4Bootstrap::prepare(graphmem,graphcpu,graph);
+    CHECK(graphcpu.fs_base==graphtcb);
+    CHECK(graphmem.load(graphtcb+64+16,&value,8)==MemoryError::ok && value!=0); // module 2 (B.prx)
+    CHECK(graphmem.load(graphtcb+64+24,&value,8)==MemoryError::ok && value!=0); // module 3 (A.prx)
+    bool missing_root=false;try { GuestMemory m(32u<<20);Ps4Loader::load(m,dependent,std::map<std::string,B>{}); }
+        catch (const std::runtime_error&) { missing_root=true; } CHECK(missing_root);
+    bool missing_dep=false;try { GuestMemory m(32u<<20);Ps4Loader::load(m,dependent,std::map<std::string,B>{{"A.prx",a}}); }
+        catch (const std::runtime_error&) { missing_dep=true; } CHECK(missing_dep);
+    auto cycle=b;std::memcpy(cycle.data()+0x800+32,"A.prx",6);
+    dt=0x700+11*16;tag(cycle,dt,1,32);
+    bool cyclic=false;try { GuestMemory m(32u<<20);Ps4Loader::load(m,dependent,std::map<std::string,B>{{"A.prx",a},{"B.prx",cycle}}); }
+        catch (const std::runtime_error&) { cyclic=true; } CHECK(cyclic);
+    bool limited=false;try { GuestMemory m(1u<<20);Ps4Loader::load(m,dependent,std::map<std::string,B>{{"A.prx",a},{"B.prx",b}},0x7dff0000); }
+        catch (const std::runtime_error&) { limited=true; } CHECK(limited);
     auto broken=main; put(broken,0x800+112,0x720);
     bool rejected=false;try { GuestMemory m(1<<20);Ps4Loader::load(m,broken); } catch (const std::runtime_error&) { rejected=true; }
     CHECK(rejected);

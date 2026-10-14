@@ -5,12 +5,32 @@
 #include <limits>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 
 namespace bb {
 namespace {
 using Bytes = std::vector<std::uint8_t>;
 constexpr std::uint64_t limit = 512ull << 20;
-void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+void require(bool ok, const std::string& message) { if (!ok) throw std::runtime_error(message); }
+bool is_system_module(const std::string& name) {
+    static const std::unordered_set<std::string> system_modules = {
+        "libkernel.prx", "libkernel_web.prx", "libSceDiscMap.prx", "libSceSysmodule.prx",
+        "libSceLibcInternal.prx", "libScePad.prx", "libSceVideoOut.prx", "libSceAudioOut.prx",
+        "libSceUserService.prx", "libSceNet.prx", "libSceNetCtl.prx", "libSceHttp.prx",
+        "libSceSsl.prx", "libSceAjm.prx", "libSceSaveData.prx", "libSceNpMatching2.prx",
+        "libSceNpCommon.prx", "libSceNpManager.prx", "libSceNpUtility.prx", "libSceNpSignaling.prx",
+        "libSceMouse.prx", "libSceSystemService.prx", "libSceNpWebApi.prx", "libSceNpAuth.prx",
+        "libSceAudioIn.prx", "libSceCommonDialog.prx", "libSceWebBrowserDialog.prx",
+        "libSceImeDialog.prx", "libSceAppContent.prx", "libSceSaveDataDialog.prx",
+        "libSceGameLiveStreaming.prx", "libSceVideoRecording.prx", "libSceScreenShot.prx",
+        "libSceNpProfileDialog.prx", "libSceVoice.prx", "libSceMsgDialog.prx", "libSceNpCommerce.prx",
+        "libSceNpTrophy.prx", "libSceAvPlayer.prx", "libScePlayGo.prx", "libSceNpScoreRanking.prx",
+        "libSceRtc.prx"
+    };
+    if (system_modules.count(name)) return true;
+    if (name.rfind("libSceGnmDriver", 0) == 0) return true;
+    return false;
+}
 bool span(std::uint64_t off, std::uint64_t len, std::size_t total) {
     return off <= total && len <= total - off;
 }
@@ -35,6 +55,7 @@ struct Module {
     std::vector<Rel> relocs;
     std::map<std::uint64_t, std::uint64_t> tags;
     std::vector<std::pair<std::uint64_t,std::uint64_t>> dynamic;
+    std::vector<std::string> needed;
     std::map<std::string, std::pair<std::string,unsigned>> libs, mods;
     std::uint64_t entry = 0, size = 0, procparam = 0;
     Ps4Tls tls;
@@ -144,6 +165,7 @@ Module parse(const Bytes& source) {
         require(zero!=end,"string sem terminador");
         return std::string(begin,zero);
     };
+    for (const auto& t:m.dynamic) if (t.first==1) m.needed.push_back(str(t.second)); // DT_NEEDED
     for (const auto& t:m.dynamic) if (t.first==0x61000013 || t.first==0x61000015 || t.first==0x6100000d || t.first==0x6100000f) {
         auto& dst=(t.first==0x61000013 || t.first==0x61000015) ? m.libs : m.mods;
         auto key=id(t.second>>48);
@@ -208,37 +230,42 @@ std::string Ps4Loader::nid(const std::string& name) {
     return result;
 }
 
-Ps4Image Ps4Loader::load(GuestMemory& memory,const Bytes& eboot,const Bytes& libc,
-                         std::uint64_t image_base,std::uint64_t code_traps,std::uint64_t data_traps) {
-    Module main=parse(eboot);
-    Module lib;
-    bool linked=!libc.empty();
-    if (linked) lib=parse(libc);
-    std::uint64_t lib_base=(main.size+65535)&~std::uint64_t(65535);
-    require(!linked || (lib_base<=limit && lib.size<=limit-lib_base),"imagem vinculada excessiva");
-    require(image_base<=UINT64_MAX-(linked?lib_base+lib.size:main.size),"base invalida");
+namespace {
+Ps4Image link(GuestMemory& memory, Module main, std::vector<std::pair<std::string,Module>> libs,
+              std::uint64_t image_base,std::uint64_t code_traps,std::uint64_t data_traps) {
+    require(libs.size()<=62,"excesso de modulos TLS");
+    std::vector<std::uint64_t> bases;
+    std::uint64_t end=main.size;
+    for (const auto& item:libs) {
+        require(end<=limit-65535,"imagem vinculada excessiva");
+        end=(end+65535)&~std::uint64_t(65535);
+        require(item.second.size<=limit-end,"imagem vinculada excessiva");
+        bases.push_back(end); end+=item.second.size;
+    }
+    require(image_base<=UINT64_MAX-end,"base invalida");
     require(code_traps <= UINT64_MAX-131072 && data_traps <= UINT64_MAX-16777216 &&
-            image_base+main.size<=data_traps &&
-            (!linked || image_base+lib_base+lib.size<=data_traps) &&
-            data_traps+16777216<=code_traps, "regioes de imagem/traps sobrepostas");
+            image_base+end<=data_traps && data_traps+16777216<=code_traps,
+            "regioes de imagem/traps sobrepostas");
     Ps4Image result;
     result.entry=image_base+main.entry;
     result.procparam=main.procparam ? image_base+main.procparam : 0;
     result.tls=main.tls; result.tls.address+=image_base; result.tls.module_id=1;
-    if (linked) {
-        Ps4Module info;
-        info.base=image_base+lib_base; info.size=lib.size;
-        auto it=lib.tags.find(12);
-        if (it!=lib.tags.end()) { require(lib.mapped(it->second,1),"init da libc fora da imagem"); info.init=info.base+it->second; }
-        info.tls=lib.tls; info.tls.address+=info.base; info.tls.module_id=2;
-        result.modules.push_back(info);
-    }
     std::map<Identity,std::uint64_t> exports;
-    if (linked) for (const auto& s:lib.symbols) if (s.section && (s.binding==1 || s.binding==2) &&
-        (s.type==1 || s.type==2) && s.name.find('#')!=std::string::npos) {
-        require(lib.mapped(s.value,std::max<std::uint64_t>(1,s.size)),"export fora da libc");
-        auto key=lib.identity(s.name);
-        require(exports.emplace(key,image_base+lib_base+s.value).second,"export duplicado");
+    for (std::size_t i=0;i<libs.size();++i) {
+        auto& lib=libs[i].second;
+        lib.tls.module_id=static_cast<std::uint32_t>(i+2);
+        Ps4Module info;
+        info.name=libs[i].first; info.base=image_base+bases[i]; info.size=lib.size;
+        auto it=lib.tags.find(12);
+        if (it!=lib.tags.end()) { require(lib.mapped(it->second,1),"init de modulo fora da imagem"); info.init=info.base+it->second; }
+        info.tls=lib.tls; info.tls.address+=info.base; info.tls.module_id=static_cast<std::uint32_t>(i+2);
+        result.modules.push_back(info);
+        for (const auto& s:lib.symbols) if (s.section && (s.binding==1 || s.binding==2) &&
+            (s.type==1 || s.type==2) && s.name.find('#')!=std::string::npos) {
+            require(lib.mapped(s.value,std::max<std::uint64_t>(1,s.size)),"export fora do modulo");
+            auto key=lib.identity(s.name);
+            require(exports.emplace(key,info.base+s.value).second,"export duplicado");
+        }
     }
     std::map<Identity,std::size_t> imports;
     auto process=[&](Module& m,std::uint64_t base) {
@@ -249,9 +276,9 @@ Ps4Image Ps4Loader::load(GuestMemory& memory,const Bytes& eboot,const Bytes& lib
             else {
                 require(r.sym<m.symbols.size(),"indice de simbolo invalido");
                 const auto& s=m.symbols[static_cast<std::size_t>(r.sym)];
-                if (r.kind==16 && linked && &m==&lib) {
-                    require(s.name.empty() && s.type==3 && r.addend==0 && lib.tls.memsz,"TLS externo nao suportado");
-                    value=2;
+                if (r.kind==16 && &m!=&main) {
+                    require(s.name.empty() && s.type==3 && r.addend==0 && m.tls.memsz,"TLS externo nao suportado");
+                    value=m.tls.module_id;
                 } else {
                     require(r.kind==1 || r.kind==6 || r.kind==7,"tipo de relocacao nao suportado");
                     if (s.section) value=(s.section==0xfff1 ? 0 : base)+s.value+r.addend;
@@ -286,18 +313,55 @@ Ps4Image Ps4Loader::load(GuestMemory& memory,const Bytes& eboot,const Bytes& lib
         }
     };
     process(main,image_base);
-    if (linked) process(lib,image_base+lib_base);
+    for (std::size_t i=0;i<libs.size();++i) process(libs[i].second,image_base+bases[i]);
     auto map=[&](const Module& m,std::uint64_t addr) {
         require(memory.map(addr,m.image.size(),Permission::read|Permission::write)==MemoryError::ok,"falha ao mapear imagem");
         require(memory.store(addr,m.image.data(),m.image.size())==MemoryError::ok,"falha ao gravar imagem");
     };
     map(main,image_base);
-    if (linked) map(lib,image_base+lib_base);
+    for (std::size_t i=0;i<libs.size();++i) map(libs[i].second,image_base+bases[i]);
     if (!result.imports.empty()) {
         require(result.imports.size() <= (UINT64_MAX-data_traps)/4096, "traps de dados excedem endereco");
         require(memory.map(data_traps,result.imports.size()*4096,Permission::read|Permission::write)==MemoryError::ok,
                 "falha ao mapear traps de dados");
     }
     return result;
+}
+} // namespace
+
+Ps4Image Ps4Loader::load(GuestMemory& memory,const Bytes& eboot,const Bytes& libc,
+                         std::uint64_t image_base,std::uint64_t code_traps,std::uint64_t data_traps) {
+    auto main=parse(eboot);
+    std::vector<std::pair<std::string,Module>> libs;
+    if (!libc.empty()) libs.emplace_back("libc.prx",parse(libc));
+    return link(memory,std::move(main),std::move(libs),image_base,code_traps,data_traps);
+}
+Ps4Image Ps4Loader::load(GuestMemory& memory,const Bytes& eboot,const std::map<std::string,Bytes>& available,
+                         std::uint64_t image_base,std::uint64_t code_traps,std::uint64_t data_traps) {
+    auto main=parse(eboot);
+    std::map<std::string,unsigned> state;
+    std::vector<std::pair<std::string,Module>> ordered;
+    auto visit=[&](auto&& self,const std::string& name)->void {
+        require(!name.empty() && name.find('/')==std::string::npos && name.find('\\')==std::string::npos &&
+                name!="." && name!="..", "DT_NEEDED invalido");
+        auto it=available.find(name);
+        if (it==available.end()) {
+            if (is_system_module(name)) return;
+            throw std::runtime_error("modulo DT_NEEDED ausente: "+name);
+        }
+        require(state[name]!=1,"ciclo DT_NEEDED: "+name);
+        if (state[name]==2) return;
+        require(state.size()<64,"excesso de modulos");
+        state[name]=1;
+        auto module=parse(it->second);
+        for (const auto& dep:module.needed) self(self,dep);
+        state[name]=2;
+        ordered.emplace_back(name,std::move(module));
+    };
+    for (const auto& dep:main.needed) visit(visit,dep);
+    if (main.needed.empty()) {
+        for (const auto& kv:available) visit(visit,kv.first);
+    }
+    return link(memory,std::move(main),std::move(ordered),image_base,code_traps,data_traps);
 }
 } // namespace bb
