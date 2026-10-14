@@ -6,13 +6,13 @@
 namespace bb {
 
 AudioRingBuffer::AudioRingBuffer(std::size_t capacity_frames, std::uint32_t channels)
-    : capacity_frames_(capacity_frames), channels_(channels), buffer_(capacity_frames * channels, 0) {}
+    : capacity_frames_(capacity_frames), channels_(channels), buffer_(capacity_frames * channels, static_cast<std::int16_t>(0)) {}
 
 void AudioRingBuffer::reconfigure(std::size_t capacity_frames, std::uint32_t channels) {
     std::lock_guard<std::mutex> lock(mutex_);
     capacity_frames_ = capacity_frames;
     channels_ = channels;
-    buffer_.assign(capacity_frames * channels, 0);
+    buffer_.assign(capacity_frames * channels, static_cast<std::int16_t>(0));
     read_pos_ = 0;
     write_pos_ = 0;
     count_frames_ = 0;
@@ -33,7 +33,7 @@ void AudioRingBuffer::reset() {
     read_pos_ = 0;
     write_pos_ = 0;
     count_frames_ = 0;
-    std::fill(buffer_.begin(), buffer_.end(), 0);
+    std::fill(buffer_.begin(), buffer_.end(), static_cast<std::int16_t>(0));
 }
 
 AudioStats AudioRingBuffer::get_stats() const {
@@ -143,7 +143,7 @@ std::size_t AudioManager::submit_pcm16(const std::int16_t *interleaved_samples, 
     }
 
     if (is_mute || vol <= 0.0001f) {
-        std::vector<std::int16_t> silence(frames * ch, 0);
+        std::vector<std::int16_t> silence(frames * ch, static_cast<std::int16_t>(0));
         return ring_buffer_.write(silence.data(), frames);
     }
 
