@@ -258,6 +258,17 @@
     bool loadedFromDisk = false;
     NSString *modelSource = @"synthetic_saw_cleaver";
     _report[@"small_flver_render_status"] = @"not_found";
+    _report[@"map_flver_selection_status"] = @"not_attempted";
+    _report[@"metal_mesh_status"] = @"not_ready";
+    auto validMesh = [](const bb::MetalMeshBuffer& candidate) {
+        if (!candidate.vertex_count || !candidate.index_count || candidate.index_count % 3 ||
+            candidate.vertex_data.size() != static_cast<size_t>(candidate.vertex_count) * 12 ||
+            candidate.index_data.size() != candidate.index_count) return false;
+        for (uint32_t index : candidate.index_data) {
+            if (index >= candidate.vertex_count) return false;
+        }
+        return true;
+    };
     NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
         inDomains:NSUserDomainMask] firstObject];
     if (documents) {
@@ -268,13 +279,8 @@
             if (probe.geometry_status == "ok" &&
                 bb::FlverParser::parse_file(path.UTF8String, model, parseErr)) {
                 const auto candidate = bb::FlverParser::convert_to_metal_buffers(model);
-                bool indicesValid = candidate.vertex_count == probe.vertex_count &&
-                    candidate.index_count == probe.triangle_count * 3 &&
-                    candidate.vertex_count > 0 && candidate.index_count > 0;
-                for (uint32_t index : candidate.index_data) {
-                    if (index >= candidate.vertex_count) { indicesValid = false; break; }
-                }
-                if (indicesValid) {
+                if (validMesh(candidate) && candidate.vertex_count == probe.vertex_count &&
+                    candidate.index_count / 3 == probe.triangle_count) {
                     loadedFromDisk = true;
                     modelSource = @"documents_small_flver_dcx";
                     _report[@"small_flver_render_status"] = @"mesh_ready";
@@ -289,19 +295,35 @@
 
     if (!loadedFromDisk && documents) {
         NSString *mapPath = [documents.path stringByAppendingPathComponent:@"dvdroot_ps4/map/m24_00_00_00/m24_00_00_00_900091.flver.dcx"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:mapPath] &&
-            bb::FlverParser::parse_file(mapPath.UTF8String, model, parseErr)) {
+        if (![[NSFileManager defaultManager] fileExistsAtPath:mapPath]) {
+            _report[@"map_flver_selection_status"] = @"not_found";
+        } else if (!bb::FlverParser::parse_file(mapPath.UTF8String, model, parseErr)) {
+            _report[@"map_flver_selection_status"] = @"parse_failed";
+        } else if (!validMesh(bb::FlverParser::convert_to_metal_buffers(model))) {
+            _report[@"map_flver_selection_status"] = @"invalid_mesh";
+        } else {
             loadedFromDisk = true;
             modelSource = @"documents_map_flver_dcx";
+            _report[@"map_flver_selection_status"] = @"mesh_ready";
         }
     }
     if (!loadedFromDisk) {
         model = bb::FlverModel{};
         auto cleaverBytes = bb::FlverParser::create_synthetic_flver_saw_cleaver();
-        bb::FlverParser::parse(cleaverBytes.data(), cleaverBytes.size(), model, parseErr);
+        if (!bb::FlverParser::parse(cleaverBytes.data(), cleaverBytes.size(), model, parseErr)) {
+            [self gpuError:@"Falha ao analisar malha sintética FLVER"];
+            return;
+        }
     }
 
     bb::MetalMeshBuffer mesh = bb::FlverParser::convert_to_metal_buffers(model);
+    if (!validMesh(mesh)) {
+        [self gpuError:@"Malha FLVER selecionada inválida"];
+        return;
+    }
+    _report[@"model_source"] = modelSource;
+    _report[@"model_rendered"] = @"not_verified"; // A seleção da malha não comprova apresentação visual.
+    _report[@"metal_mesh_status"] = @"validated_cpu";
     _modelVertexCount = mesh.vertex_count;
     _modelTriangleCount = mesh.index_count / 3;
     _indexCount = mesh.index_count;
@@ -319,6 +341,13 @@
 
     _lightingBuffer = [device newBufferWithLength:sizeof(bb::LightingUniforms)
                                           options:MTLResourceStorageModeShared];
+
+    if (!_vertexBuffer || !_indexBuffer || !_mvpBuffer || !_lightingBuffer) {
+        _report[@"metal_mesh_status"] = @"buffer_allocation_failed";
+        [self gpuError:@"Falha ao alocar buffers Metal para malha/uniformes"];
+        return;
+    }
+    _report[@"metal_mesh_status"] = @"buffers_allocated";
 
     bb::LightingUniforms lighting{};
     lighting.dir_light_direction[0] = 0.577f;
@@ -368,8 +397,6 @@
     _report[@"metal_flver_triangles"] = @(_modelTriangleCount);
     _report[@"metal_depth_buffer"] = @"Depth32Float";
     _report[@"metal_shader_msl_version"] = @"3.0";
-    _report[@"model_source"] = modelSource;
-    _report[@"model_rendered"] = loadedFromDisk ? @"Documents FLVER (laboratory)" : @"Saw Cleaver (synthetic FLVER)";
 
     // Registra suporte a controles externos Apple GameController
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onControllerConnected:)
