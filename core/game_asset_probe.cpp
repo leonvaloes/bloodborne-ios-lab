@@ -68,6 +68,14 @@ DcxProbeResult probe_dcx_in_documents(const std::string& documents_dir) {
     result.decoded_crc32 = VirtualFileSystem::compute_crc32(decoded.data(), decoded.size());
     result.valid = true;
     result.status = "ok";
+    FlverModel model;
+    if (!FlverParser::parse(decoded.data(), decoded.size(), model, error)) {
+        result.geometry_status = "parse_failed";
+    } else {
+        result.vertex_count = model.total_vertex_count();
+        result.triangle_count = model.total_triangle_count();
+        result.geometry_status = result.vertex_count && result.triangle_count ? "ok" : "empty_geometry";
+    }
     return result;
 }
 

@@ -21,6 +21,10 @@ struct DcxProbeResult {
     std::uint64_t decoded_bytes{0};
     std::uint32_t crc32{0};
     std::uint32_t decoded_crc32{0};
+  // Geometry parsing is a separate stage; a valid DCX is not necessarily a supported model.
+  std::string geometry_status{"not_attempted"};
+  std::uint32_t vertex_count{0};
+  std::uint32_t triangle_count{0};
 };
 
 DcxProbeResult probe_dcx_in_documents(const std::string& documents_dir);

@@ -41,6 +41,8 @@ int main() { return run([] {
     CHECK(report.status == "ok" && report.valid);
     CHECK(report.decoded_bytes == raw.size());
     CHECK(report.decoded_crc32 == bb::VirtualFileSystem::compute_crc32(raw.data(), raw.size()));
+    CHECK(report.geometry_status == "parse_failed" || report.geometry_status == "empty_geometry"); // Magic alone proves no geometry.
+    CHECK(report.vertex_count == 0 && report.triangle_count == 0);
     dcx[31] = 0;
     write(dcx);
     CHECK(bb::probe_dcx_in_documents(dir.string()).status == "invalid_decoded_size");

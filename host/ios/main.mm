@@ -10,6 +10,7 @@
 #include "flver_parser.h"
 #include "game_asset_probe.h"
 #include "boot_probe.h"
+#include "vfs.h"
 #include <exception>
 #include <sys/utsname.h>
 #include <simd/simd.h>
@@ -475,6 +476,8 @@
         @"status": status, @"valid": @(probe.valid),
         @"size_bytes": @(probe.size_bytes), @"decoded_bytes": @(probe.decoded_bytes),
         @"crc32": @(probe.crc32), @"decoded_crc32": @(probe.decoded_crc32),
+        @"geometry_status": [NSString stringWithUTF8String:probe.geometry_status.c_str()],
+        @"geometry_vertices": @(probe.vertex_count), @"geometry_triangles": @(probe.triangle_count),
         @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]};
     _dcxStatus.text = [NSString stringWithFormat:@"DCX via VFS: %@ (%llu -> %llu bytes).",
         status, probe.size_bytes, probe.decoded_bytes];
@@ -587,7 +590,55 @@
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size { (void)view; (void)size; }
 
+- (void)checkDocumentsInventory {
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    NSFileManager *manager = [NSFileManager defaultManager];
+    NSMutableDictionary *inventory = [NSMutableDictionary dictionary];
+    inventory[@"directory_available"] = @(documents != nil);
+    NSError *directoryError = nil;
+    NSDictionary *directoryAttributes = documents ? [manager attributesOfItemAtPath:documents.path error:&directoryError] : nil;
+    inventory[@"directory_status"] = directoryAttributes ?
+        ([[directoryAttributes fileType] isEqualToString:NSFileTypeDirectory] ? @"ok" : @"not_directory") : @"unavailable";
+    if (directoryError) {
+        inventory[@"directory_error_domain"] = directoryError.domain;
+        inventory[@"directory_error_code"] = @(directoryError.code);
+    }
+    bb::VirtualFileSystem vfs;
+    const bool mounted = documents && vfs.mount("/app0", documents.path.UTF8String, true);
+    inventory[@"vfs_mounted"] = @(mounted);
+    NSMutableDictionary *files = [NSMutableDictionary dictionary];
+    for (NSString *name in @[@"teste-bblab.txt", @"param.sfo", @"m29_00_00_00_408010.flver.dcx", @"eboot.elf"]) {
+        NSError *error = nil;
+        NSDictionary *attributes = documents ? [manager attributesOfItemAtPath:
+            [documents.path stringByAppendingPathComponent:name] error:&error] : nil;
+        NSMutableDictionary *item = [NSMutableDictionary dictionary];
+        item[@"foundation_status"] = attributes ?
+            ([[attributes fileType] isEqualToString:NSFileTypeRegular] ? @"regular_file" : @"not_regular_file") :
+            (error && [error.domain isEqualToString:NSCocoaErrorDomain] &&
+             (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) ? @"not_found" : @"stat_error");
+        if (attributes) item[@"size_bytes"] = @([attributes fileSize]);
+        if (error && ![item[@"foundation_status"] isEqualToString:@"not_found"]) {
+            item[@"error_domain"] = error.domain;
+            item[@"error_code"] = @(error.code);
+        }
+        bb::VfsStat stat{};
+        if (mounted) {
+            const auto result = vfs.stat(std::string("/app0/") + name.UTF8String, stat);
+            item[@"vfs_status"] = result == bb::VfsError::ok ? @"ok" :
+                (result == bb::VfsError::not_found ? @"not_found" : @"stat_error");
+        } else {
+            item[@"vfs_status"] = @"not_mounted";
+        }
+        files[name] = item;
+    }
+    inventory[@"files"] = files;
+    inventory[@"checked_at"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
+    _report[@"documents_inventory"] = inventory;
+}
+
 - (void)exportReport:(UIButton *)sender {
+    [self checkDocumentsInventory];
     [self checkDocument];
     [self checkGameAsset];
     [self checkDcx];
