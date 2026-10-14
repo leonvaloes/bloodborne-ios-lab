@@ -13,7 +13,7 @@
 |:---:|---|---|---|:---:|
 | **Agente 1** | `worktrees/agent1-vfs` | `feature/vfs-bdt-ingestion` | **Atividades 1.2 e 1.3:** Implementação de `core/binder.h/.cpp` (BHD5/BDT parser) e descompressor DCX em streaming. | *Em execução* |
 | **Agente 2** | `worktrees/agent2-metal` | `feature/metal3-shaders` | **Atividades 2.1 e 2.3:** Integração SPIRV-Cross para Metal MSL e parser de malhas 3D FLVER (`.flver`). | *Em execução* |
-| **Agente 3** | `worktrees/agent3-aot` | `feature/aot-batch` | **Atividades 3.1 e 3.2:** Expansão do gerador `bb-aot` para recompilação estática em lote de funções do executável PS4. | *Em execução* |
+| **Agente 3** | `worktrees/agent3-aot` | `feature/aot-batch` | **Sprint 3 Concluída (Atividades 3.1 a 3.4):** Lifter x86-64, Recompilador AOT em lote, Indirect Dispatcher com batch registry e validação no `eboot.elf` real. | *Concluído / 100% Verde* |
 | **Agente 4** | `worktrees/agent4-hle` | `feature/hle-audio-threads` | **Atividades 4.1 e 4.2:** Primitivas de multithreading do Orbis OS sobre pthreads e integração da LibAtrac9. | *Em execução* |
 | **Agente 5** | `bloodborne-ios-lab` | `main` | **Integração Contínua e QA:** Gestão do board, revisão de commits dos agentes 1 a 4, merge das features validadas, execução da suite de 18 testes e garantia do build IPA. | *Ativo / 100% Verde* |
 

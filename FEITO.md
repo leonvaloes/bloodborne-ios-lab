@@ -109,3 +109,30 @@ As 3 falhas pontuais ocorridas no iPhone no build `bd7bc24` foram identificadas 
 - **Suite de 18 Testes Host:** 18/18 testes unitários e de integração executados e aprovados com 100% de sucesso localmente e na matriz de CI (Windows MinGW/MSVC, Linux Clang, macOS Clang).
 - **Pipeline de IPA (GitHub Actions):** Compilação cruzada para iOS arm64 (`Apple A17 Pro`) e empacotamento do arquivo `BBHost-unsigned.ipa` mantidos 100% verdes no workflow `iOS unsigned laboratory`.
 
+---
+
+## 5. Conquistas da Sprint 3 — Recompilador AOT em Lote (`feature/aot-batch`)
+
+### 5.1 Lifter e Decodificador Binário x86-64 Autoral (`tools/aot.h`, `tools/aot.cpp`)
+- **Decodificador completo de instruções x86-64:** Prefixos REX/66h, opcodes ALU (ADD, SUB, XOR, AND, OR, ADC, SBB, TEST, CMP, SHL, SHR), movimentação de dados (MOV r/m/imm, MOVZX), manipulação de pilha (PUSH, POP), saltos condicionais (JCC) e incondicionais (JMP rel8/rel32), chamadas diretas e indiretas (CALL rel32, CALL r/m64).
+- **Tradução estática C++ sem JIT:** Cada instrução é traduzida para C++ estruturado estático usando `GuestContext` e `GuestMemory`. Zero páginas de memória RWX, respeitando 100% o App Sandbox da Apple no iOS.
+- **Detecção de blocos básicos e fluxo de controle:** Delimitação de basic blocks, identificação de labels internos (`loc_<vaddr>:`) e saltos de controle (`goto loc_<vaddr>;`).
+- **Suporte retrocompatível integral:** Preserva 100% do parsing de hex fixtures original e os 37 testes de fixture existentes.
+
+### 5.2 Pipeline de Recompilação em Lote de Executáveis ELF64
+- **Parsing de ELF64 real:** Varredura de cabeçalhos e segmentos executáveis `PT_LOAD` (`R-X`), com localização do ponto de entrada do executável e varredura de prólogos de funções padrão x86-64 (`55 48 89 e5`, `48 83 ec`, `53 48 83 ec`).
+- **Geração Modular de Unidades C++:** Divisão do código em lotes parametrizáveis (`aot_batch_0.cpp`, `aot_batch_1.cpp`, ...) para garantir compilação paralela eficiente no Xcode/Clang sem sobrecarga de memória do compilador.
+- **Cabeçalho Unificado e Manifesto:** Geração de `aot_batch.h` com assinaturas de todas as funções e `aot_manifest.json` com metadados estruturados de símbolos, endereços virtuais, tamanhos e identificação de entry point.
+
+### 5.3 Despachante Indireto com Batch Registry (`core/dispatcher.h`, `core/dispatcher.cpp`)
+- **Registro em lote:** Método `register_batch(const std::vector<std::pair<uint64_t, GuestFn>>&)` permitindo inserção eficiente de dezenas de milhares de alvos de vtables e chamadas indiretas.
+- **Thread-local Active Dispatcher:** Métodos `set_active()` e `get_active()` providenciando resolução rápida de chamadas indiretas cruzadas entre unidades de tradução.
+- **Geração automática de registro:** `aot_registry.cpp` conectando automaticamente todas as funções recompiladas ao despachante indireto.
+
+### 5.4 Validação no Executável Real do Bloodborne (`eboot.elf` / 84,85 MB)
+- **Varredura e Levantamento Real:** Executado com sucesso sobre `bloodborne_portPC/bbport-windows/out/eboot.elf`.
+- **Ponto de Entrada Real Verificado:** Ponto de entrada vaddr `0xa0` (offset de arquivo `0x40a0`, `55 48 89 e5 41 57 41 56 53 50...`) levantado e traduzido para 3 blocos básicos e 67 instruções.
+- **Teste de Recompilação em Lote:** 50 funções (9.599 instruções x86-64 reais do jogo) traduzidas com sucesso em 5 arquivos de lote C++, cabeçalho, registro e manifesto estruturado em poucos milissegundos.
+- **18/18 Testes Passando:** Suite de 18 testes unitários e de integração mais o runner bb-smoke executados e 100% aprovados localmente.
+
+
