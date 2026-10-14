@@ -582,6 +582,16 @@ DecodedInstruction decode_instruction(const std::uint8_t* code, std::size_t max_
         return modrm;
     };
 
+    // Incomplete relative control flow must not invent a zero displacement or
+    // a branch target. Consume only the supplied bytes and leave it unknown.
+    const auto truncated_branch = [&]() -> DecodedInstruction {
+        inst.opcode = Opcode::UNKNOWN;
+        inst.mnemonic = "truncated";
+        inst.length = max_len;
+        return inst;
+    };
+    const auto has_bytes = [&](std::size_t count) { return count <= max_len - cursor; };
+
     // 2. Opcode dispatch
     // Push reg (0x50 - 0x57)
     if (op >= 0x50 && op <= 0x57) {
@@ -635,6 +645,7 @@ DecodedInstruction decode_instruction(const std::uint8_t* code, std::size_t max_
 
     // Call rel32 (0xE8)
     if (op == 0xE8) {
+        if (!has_bytes(4)) return truncated_branch();
         inst.opcode = Opcode::CALL;
         inst.is_call = true;
         std::int32_t disp = static_cast<std::int32_t>(read_u32());
@@ -648,6 +659,7 @@ DecodedInstruction decode_instruction(const std::uint8_t* code, std::size_t max_
 
     // Jmp rel32 (0xE9)
     if (op == 0xE9) {
+        if (!has_bytes(4)) return truncated_branch();
         inst.opcode = Opcode::JMP;
         inst.is_terminator = true;
         std::int32_t disp = static_cast<std::int32_t>(read_u32());
@@ -661,6 +673,7 @@ DecodedInstruction decode_instruction(const std::uint8_t* code, std::size_t max_
 
     // Jmp rel8 (0xEB)
     if (op == 0xEB) {
+        if (!has_bytes(1)) return truncated_branch();
         inst.opcode = Opcode::JMP;
         inst.is_terminator = true;
         std::int8_t disp = static_cast<std::int8_t>(read_u8());
@@ -674,6 +687,7 @@ DecodedInstruction decode_instruction(const std::uint8_t* code, std::size_t max_
 
     // Jcc rel8 (0x70 - 0x7F)
     if (op >= 0x70 && op <= 0x7F) {
+        if (!has_bytes(1)) return truncated_branch();
         inst.opcode = Opcode::JCC;
         inst.condition = static_cast<ConditionCode>(op - 0x70);
         std::int8_t disp = static_cast<std::int8_t>(read_u8());
@@ -851,6 +865,7 @@ DecodedInstruction decode_instruction(const std::uint8_t* code, std::size_t max_
 
     // 0x0F Multi-byte escape
     if (op == 0x0F) {
+        if (!has_bytes(1)) return truncated_branch();
         std::uint8_t op2 = read_u8();
 
         // Syscall (0x0F 0x05)
@@ -873,6 +888,7 @@ DecodedInstruction decode_instruction(const std::uint8_t* code, std::size_t max_
 
         // Jcc rel32 (0x0F 0x80 - 0x8F)
         if (op2 >= 0x80 && op2 <= 0x8F) {
+            if (!has_bytes(4)) return truncated_branch();
             inst.opcode = Opcode::JCC;
             inst.condition = static_cast<ConditionCode>(op2 - 0x80);
             std::int32_t disp = static_cast<std::int32_t>(read_u32());

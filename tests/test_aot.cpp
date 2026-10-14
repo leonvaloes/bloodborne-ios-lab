@@ -79,6 +79,55 @@ int main() { return run([] {
     CHECK(i_ret.is_terminator);
     CHECK(i_ret.length == 1);
 
+    // Relative control flow: signed displacements, exact next-IP targets,
+    // condition mapping and bounded decoding of every incomplete encoding.
+    const auto check_branch = [](const std::vector<std::uint8_t>& bytes,
+                                 Opcode opcode, std::uint64_t target) {
+        auto inst = decode_instruction(bytes.data(), bytes.size(), 0x1000);
+        CHECK(inst.opcode == opcode);
+        CHECK(inst.length == bytes.size());
+        CHECK(inst.target_vaddr == target);
+        CHECK(inst.op1.type == OperandType::REL_BRANCH);
+        CHECK(inst.op1.rip_target == target);
+        CHECK(inst.is_call == (opcode == Opcode::CALL));
+        CHECK(inst.is_terminator == (opcode == Opcode::JMP));
+        for (std::size_t n = 1; n < bytes.size(); ++n) {
+            auto partial = decode_instruction(bytes.data(), n, 0x1000);
+            CHECK(partial.opcode == Opcode::UNKNOWN);
+            CHECK(partial.length == n);
+            CHECK(partial.target_vaddr == 0);
+            CHECK(partial.op1.type == OperandType::NONE);
+            CHECK(!partial.is_call && !partial.is_terminator);
+        }
+    };
+    check_branch({0xE8, 0xF9, 0xFF, 0xFF, 0xFF}, Opcode::CALL, 0xFFE);
+    check_branch({0xE9, 0xF9, 0xFF, 0xFF, 0xFF}, Opcode::JMP, 0xFFE);
+    check_branch({0xEB, 0xFE}, Opcode::JMP, 0x1000);
+    check_branch({0xEB, 0x7F}, Opcode::JMP, 0x1081);
+    check_branch({0xE8, 0x01, 0x00, 0x00, 0x00}, Opcode::CALL, 0x1006);
+    for (unsigned cc = 0; cc < 16; ++cc) {
+        for (bool near : {false, true}) {
+            std::vector<std::uint8_t> bytes = near
+                ? std::vector<std::uint8_t>{0x0F, static_cast<std::uint8_t>(0x80 + cc), 0xFA, 0xFF, 0xFF, 0xFF}
+                : std::vector<std::uint8_t>{static_cast<std::uint8_t>(0x70 + cc), 0xFE};
+            check_branch(bytes, Opcode::JCC, 0x1000);
+            auto inst = decode_instruction(bytes.data(), bytes.size(), 0x1000);
+            CHECK(inst.condition == static_cast<ConditionCode>(cc));
+            CHECK(inst.mnemonic == "j" + condition_code_name(static_cast<ConditionCode>(cc)));
+        }
+    }
+    const std::uint8_t prefixed_jcc[] = {0x66, 0x0F, 0x84, 0xFA, 0xFF, 0xFF, 0xFF};
+    auto prefixed = decode_instruction(prefixed_jcc, sizeof(prefixed_jcc), 0x1000);
+    CHECK(prefixed.opcode == Opcode::JCC);
+    CHECK(prefixed.length == sizeof(prefixed_jcc));
+    CHECK(prefixed.target_vaddr == 0x1001);
+    for (std::size_t n = 2; n < sizeof(prefixed_jcc); ++n) {
+        auto partial = decode_instruction(prefixed_jcc, n, 0x1000);
+        CHECK(partial.opcode == Opcode::UNKNOWN);
+        CHECK(partial.length == n);
+        CHECK(partial.target_vaddr == 0);
+    }
+
     // ========================================================================
     // 3. Function Lifting & Control Flow Analysis
     // ========================================================================
