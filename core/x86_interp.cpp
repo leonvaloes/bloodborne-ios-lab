@@ -286,9 +286,72 @@ struct Exec {
     }
 
     void step();
+    void avx(bool three);
     void two_byte(int opsz);
     void sse(std::uint8_t op2, int opsz);
 };
+
+void Exec::avx(bool three) {
+    const std::uint8_t v1 = u8();
+    const std::uint8_t v2 = three ? u8() : v1;
+    const std::uint8_t op = u8();
+    const int map = three ? (v1 & 31) : 1;
+    const int pp = v2 & 3, len = (v2 & 4) ? 4 : 2;
+    const int src1 = (~(v2 >> 3)) & 15;
+    if (map != 1 || (three && (v2 & 0x80)) || p66 || rep || repne || rex) throw Unsupported{};
+    rr = !(v1 & 0x80); rx = three && !(v1 & 0x40); rb = three && !(v1 & 0x20);
+    if (op == 0x77 && pp == 0 && len == 2 && src1 == 0) {
+        for (int i = 0; i < 16; ++i) s.ymm_hi[i][0] = s.ymm_hi[i][1] = 0;
+        return;
+    }
+    const bool mov = op == 0x10 || op == 0x11 || op == 0x28 || op == 0x29;
+    const bool logic = op == 0x57 || (pp == 1 && (op == 0xEF || op == 0xDB || op == 0xEB));
+    const bool arith = op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E;
+    if ((!mov && !logic && !arith) || (pp > 1 && !arith) ||
+        (pp > 1 && len != 2) || (logic && op != 0x57 && pp != 1))
+        throw Unsupported{};
+    if (mov && src1 != 0) throw Unsupported{}; // reserved vvvv=1111
+    if ((op == 0x28 || op == 0x29) && pp != 0 && pp != 1) throw Unsupported{};
+    if (op == 0x57 && pp != 0 && pp != 1) throw Unsupported{};
+    int rg = 0;
+    const Rm rm = decode_rm(rg, 0);
+    std::uint64_t source[4] = {}, dest[4] = {};
+    const bool scalar = pp >= 2;
+    const int width = (pp == 1 || pp == 3) ? 8 : 4;
+    const int bytes = scalar ? width : len * 8;
+    if (mov && (op == 0x11 || op == 0x29)) {
+        for (int i = 0; i < len; ++i) source[i] = i < 2 ? s.xmm[rg][i] : s.ymm_hi[rg][i - 2];
+        if (rm.reg) {
+            for (int i = 0; i < len; ++i) (i < 2 ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2]) = source[i];
+            if (len == 2) s.ymm_hi[rm.r][0] = s.ymm_hi[rm.r][1] = 0;
+        } else for (int i = 0; i < len; ++i) wr_mem(rm.addr + i * 8, 8, source[i]);
+        return;
+    }
+    if (rm.reg) for (int i = 0; i < len; ++i) source[i] = i < 2 ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2];
+    else for (int i = 0; i < (bytes + 7) / 8; ++i) source[i] = rd_mem(rm.addr + i * 8, scalar ? width : 8);
+    if (mov) {
+        for (int i = 0; i < len; ++i) dest[i] = source[i];
+    } else {
+        for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+        for (int i = 0; i < bytes / width; ++i) {
+            const int word = i * width / 8, shift = (i * width % 8) * 8;
+            const std::uint64_t mask = mask_of(width);
+            const std::uint64_t a = (dest[word] >> shift) & mask, b = (source[word] >> shift) & mask;
+            std::uint64_t value = 0;
+            if (logic) value = op == 0xDB ? a & b : op == 0xEB ? a | b : a ^ b;
+            else if (width == 8) {
+                const double x = f64(a), y = f64(b);
+                value = bits64(op == 0x58 ? x + y : op == 0x59 ? x * y : op == 0x5C ? x - y : x / y);
+            } else {
+                const float x = f32(a), y = f32(b);
+                value = bits32(op == 0x58 ? x + y : op == 0x59 ? x * y : op == 0x5C ? x - y : x / y);
+            }
+            dest[word] = (dest[word] & ~(mask << shift)) | ((value & mask) << shift);
+        }
+    }
+    for (int i = 0; i < 2; ++i) s.xmm[rg][i] = dest[i];
+    for (int i = 0; i < 2; ++i) s.ymm_hi[rg][i] = len == 4 ? dest[i + 2] : 0;
+}
 
 void Exec::two_byte(int opsz) {
     const std::uint8_t op2 = u8();
@@ -724,6 +787,10 @@ void Exec::step() {
     const std::uint8_t op = u8();
     int rg = 0;
 
+    if (op == 0xC5) { avx(false); s.rip = start + pos; return; }
+    if (op == 0xC4 && pos + 2 < n && ((buf[pos] & 31) != 2 || buf[pos + 2] != 0xF3)) {
+        avx(true); s.rip = start + pos; return;
+    }
     if (op == 0xC4) {  // VEX3: BMI1 F3 uses VEX.vvvv as destination, ModRM.reg as opcode extension.
         const std::uint8_t v1 = u8(), v2 = u8(), opcode = u8();
         if ((v1 & 31) != 2 || opcode != 0xF3 || (v2 & 3) != 0 || (v2 & 4) != 0 ||
@@ -1095,16 +1162,17 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
     d.opcode = (vex ? 0x100000u : 0) | (map << 16) | (pp << 8) | op;
     bool modrm = false;
     unsigned imm = 0;
+    const bool opsz16 = p66 && !w;
     if (map == 0) {
         modrm = (op < 0x40 && (op & 7) < 4) || op == 0x63 || op == 0x69 || op == 0x6B ||
             (op >= 0x80 && op <= 0x8F) || op == 0x8D || (op >= 0xC0 && op <= 0xC1) ||
             (op >= 0xC6 && op <= 0xC7) || (op >= 0xD0 && op <= 0xD3) ||
             (op >= 0xF6 && op <= 0xF7) || (op >= 0xFE);
-        if (op >= 0xB0 && op <= 0xBF) imm = op < 0xB8 ? 1 : w ? 8 : p66 ? 2 : 4;
-        if (op < 0x40 && (op & 7) >= 4 && (op & 7) <= 5) imm = (op & 7) == 4 ? 1 : p66 ? 2 : 4;
+        if (op >= 0xB0 && op <= 0xBF) imm = op < 0xB8 ? 1 : w ? 8 : opsz16 ? 2 : 4;
+        if (op < 0x40 && (op & 7) >= 4 && (op & 7) <= 5) imm = (op & 7) == 4 ? 1 : opsz16 ? 2 : 4;
         if (op == 0x68 || op == 0xE8 || op == 0xE9 || op == 0xA9) imm = 4;
         if (op == 0x6A || op == 0xEB || op == 0xA8 || op == 0xCD || op == 0xC0 || op == 0xC1 || op == 0x6B || op == 0x80 || op == 0x83 || op == 0xC6) imm = 1;
-        if (op == 0x69 || op == 0x81 || op == 0xC7) imm = p66 ? 2 : 4;
+        if (op == 0x69 || op == 0x81 || op == 0xC7) imm = opsz16 ? 2 : 4;
         if (op == 0xC2 || op == 0xC8) imm = 2 + (op == 0xC8);
         if (op >= 0x70 && op <= 0x7F) imm = 1;
         if (op >= 0xA0 && op <= 0xA3) imm = 8;
@@ -1115,7 +1183,8 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
             (op >= 0xC0 && op <= 0xC3) || op == 0xC6 || op == 0xC7 || op == 0xC9 || op == 0xCC ||
             op == 0xE8 || op == 0xE9 || op == 0xEB || op == 0xF4 || op == 0xF6 || op == 0xF7 || op == 0xFE || op == 0xFF || op == 0x63 || op == 0x68 || op == 0x69 || op == 0x6A;
     } else {
-        modrm = !(map == 1 && (op == 0x05 || op == 0x0B || op == 0x31 || op == 0xA2 || (op >= 0x80 && op <= 0x8F) || (op >= 0xC8 && op <= 0xCF)));
+        modrm = !(vex && map == 1 && op == 0x77) &&
+                !(map == 1 && (op == 0x05 || op == 0x0B || op == 0x31 || op == 0xA2 || (op >= 0x80 && op <= 0x8F) || (op >= 0xC8 && op <= 0xCF)));
         if (map == 1 && op >= 0x80 && op <= 0x8F) imm = 4;
         if (map == 3 || (map == 1 && (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73 || op == 0xBA || op == 0xC2 || op == 0xC4 || op == 0xC5 || op == 0xC6))) imm = 1;
         d.supported = !vex && map == 1 && ((op >= 0x80 && op <= 0x9F) ||
@@ -1132,6 +1201,13 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
             op == 0x70 || op == 0xC6 || (op >= 0x2A && op <= 0x2F));
         if (vex3 && map == 2 && pp == 0 && op == 0xF3 &&
             !(b[p - 2] & 4) && !legacy_prefix && !rex_prefix) d.supported = true;
+        if (vex && map == 1 && !legacy_prefix && !rex_prefix &&
+            ((op == 0x77 && pp == 0 && !(b[p - 2] & 4)) ||
+             ((op == 0x10 || op == 0x11 || op == 0x28 || op == 0x29 ||
+               op == 0x57 || op == 0x58 || op == 0x59 || op == 0x5C ||
+               op == 0x5E || op == 0xEF || op == 0xDB || op == 0xEB) &&
+              (pp <= 1 || ((op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E) &&
+                           !(b[p - 2] & 4)))))) d.supported = true;
         if (!vex && map == 2 && pp == 1 && (op == 0x00 || op == 0x40)) d.supported = true;
         if (!vex && map == 3 && pp == 1 && op == 0x0F) d.supported = true;
     }
@@ -1140,7 +1216,7 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
         const unsigned m = b[p++], mode = m >> 6, rm = m & 7;
         if (vex3 && map == 2 && op == 0xF3 && ((m >> 3) & 7) != 1 &&
             ((m >> 3) & 7) != 2 && ((m >> 3) & 7) != 3) d.supported = false;
-        if (map == 0 && (op == 0xF6 || op == 0xF7) && ((m >> 3) & 7) < 2) imm = op == 0xF6 ? 1 : p66 ? 2 : 4;
+        if (map == 0 && (op == 0xF6 || op == 0xF7) && ((m >> 3) & 7) < 2) imm = op == 0xF6 ? 1 : opsz16 ? 2 : 4;
         if (mode != 3) {
             if (rm == 4) { if (p >= n) return X86Decoded{}; const unsigned sib = b[p++]; if (mode == 0 && (sib & 7) == 5) p += 4; }
             else if (mode == 0 && rm == 5) p += 4;

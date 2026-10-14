@@ -319,6 +319,69 @@ int main() {
                       0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x90};
             CHECK(m.run().stop == CpuStop::undefined);
         }
+        {   // VEX.128 vxorps uses two independent sources and clears upper YMM.
+            Machine m{0xC5, 0xF0, 0x57, 0xC2, 0xC3};
+            m.cpu.state.xmm[1][0] = 0xAAAAAAAAAAAAAAAAULL;
+            m.cpu.state.xmm[2][0] = 0xFFFF0000FFFF0000ULL;
+            m.cpu.state.ymm_hi[0][0] = ~0ULL;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.xmm[0][0] == 0x5555AAAA5555AAAAULL);
+            CHECK(m.cpu.state.ymm_hi[0][0] == 0);
+            const std::uint8_t b[] = {0xC5, 0xF0, 0x57, 0xC2};
+            CHECK(decode_x86(b, sizeof(b)).length == 4);
+        }
+        {   // VEX.256 vaddps adds all eight lanes; vzeroupper preserves XMM.
+            Machine m{0xC5, 0xF4, 0x58, 0xC2, 0xC5, 0xF8, 0x77, 0xC3};
+            for (int i = 0; i < 2; ++i) {
+                m.cpu.state.xmm[1][i] = m.cpu.state.ymm_hi[1][i] = 0x3F8000003F800000ULL;
+                m.cpu.state.xmm[2][i] = m.cpu.state.ymm_hi[2][i] = 0x4000000040000000ULL;
+            }
+            CHECK(m.run(1).stop == CpuStop::step_limit);
+            CHECK(m.cpu.state.xmm[0][0] == 0x4040000040400000ULL);
+            CHECK(m.cpu.state.ymm_hi[0][1] == 0x4040000040400000ULL);
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.xmm[0][0] == 0x4040000040400000ULL);
+            CHECK(m.cpu.state.ymm_hi[0][1] == 0);
+        }
+        {   // Reserved vvvv on VMOV and unsupported AVX map must not execute.
+            for (auto bytes : {std::initializer_list<std::uint8_t>{0xC5, 0xF0, 0x10, 0xC1},
+                               {0xC4, 0xE2, 0x78, 0x58, 0xC1}}) {
+                Machine m(bytes);
+                CHECK(m.run().stop == CpuStop::unsupported_opcode);
+            }
+        }
+        {   // Deterministic differential check: scanner length vs executed next RIP.
+            // These are generated synthetic single instructions, not linear code coverage.
+            std::uint32_t seed = 0x51A0B1C2;
+            for (int i = 0; i < 512; ++i) {
+                seed = seed * 1664525u + 1013904223u;
+                std::vector<std::uint8_t> code;
+                const bool has_p66 = (seed & 1) != 0;
+                if (has_p66) code.push_back(0x66);
+                const bool has_rex = (seed & 2) != 0;
+                const uint8_t rex_byte = static_cast<std::uint8_t>(0x40 | ((seed >> 4) & 15));
+                if (has_rex) code.push_back(rex_byte);
+                const bool is_w = has_rex && ((rex_byte & 8) != 0);
+                const bool imm16 = has_p66 && !is_w;
+                switch ((seed >> 8) % 5) {
+                case 0: code.insert(code.end(), {0x83, static_cast<std::uint8_t>(0xC0 | ((seed >> 16) & 7)), 3}); break;
+                case 1: code.insert(code.end(), {0x89, static_cast<std::uint8_t>(0xC0 | ((seed >> 16) & 63))}); break;
+                case 2:
+                    code.insert(code.end(), {0xC7, static_cast<std::uint8_t>(0xC0 | ((seed >> 16) & 7)), 1, 0});
+                    if (!imm16) code.insert(code.end(), {0, 0});
+                    break;
+                case 3: code.insert(code.end(), {0x0F, 0x57, static_cast<std::uint8_t>(0xC0 | ((seed >> 16) & 63))}); break;
+                default: code.insert(code.end(), {0x0F, 0xAF, static_cast<std::uint8_t>(0xC0 | ((seed >> 16) & 63))}); break;
+                }
+                const auto d = decode_x86(code.data(), code.size());
+                CHECK(d.length == code.size());
+                Machine m{0x90};
+                CHECK(m.mem.store(CODE, code.data(), code.size()) == MemoryError::ok);
+                const auto r = m.run(1);
+                CHECK(r.stop == CpuStop::step_limit);
+                CHECK(m.cpu.state.rip == CODE + d.length);
+            }
+        }
         {   // ud2
             Machine m{0x0F, 0x0B};
             CHECK(m.run().stop == CpuStop::undefined);
