@@ -5,8 +5,10 @@
 #include "dispatcher.h"
 #include "hle.h"
 #include "manifest.h"
+#include "elf_parser.h"
 #include <limits>
 #include <cmath>
+#include <cstring>
 
 namespace bb {
 SmokeReport smoke() {
@@ -138,6 +140,43 @@ SmokeReport smoke() {
         {{"0x1000", 64, "bb_entry", true, "verified"}}};
     check(manifest.validate());
     check(manifest.to_json().find("bb_entry") != std::string::npos);
+
+    // S7: Safe Game Parser validation (3 checks)
+    std::vector<std::uint8_t> sfo_min(64, 0);
+    sfo_min[0] = 0; sfo_min[1] = 'P'; sfo_min[2] = 'S'; sfo_min[3] = 'F';
+    std::uint32_t s_keys = 36, s_vals = 48, s_cnt = 1;
+    std::memcpy(sfo_min.data() + 8, &s_keys, 4);
+    std::memcpy(sfo_min.data() + 12, &s_vals, 4);
+    std::memcpy(sfo_min.data() + 16, &s_cnt, 4);
+    std::uint16_t s_koff = 0, s_fmt = 0x0204;
+    std::uint32_t s_len = 11, s_max = 16, s_doff = 0;
+    std::memcpy(sfo_min.data() + 20, &s_koff, 2);
+    std::memcpy(sfo_min.data() + 22, &s_fmt, 2);
+    std::memcpy(sfo_min.data() + 24, &s_len, 4);
+    std::memcpy(sfo_min.data() + 28, &s_max, 4);
+    std::memcpy(sfo_min.data() + 32, &s_doff, 4);
+    std::memcpy(sfo_min.data() + 36, "TITLE\0", 6);
+    std::memcpy(sfo_min.data() + 48, "Bloodborne\0", 11);
+    auto meta = SafeGameParser::parse_sfo(sfo_min.data(), sfo_min.size());
+    check(meta.title == "Bloodborne");
+
+    std::vector<std::uint8_t> elf_min(128, 0);
+    elf_min[0] = 0x7f; elf_min[1] = 'E'; elf_min[2] = 'L'; elf_min[3] = 'F';
+    std::uint16_t emach = EM_X86_64, ephsize = 56, ephnum = 1;
+    std::uint64_t ephent = 64;
+    std::memcpy(elf_min.data() + 18, &emach, 2);
+    std::memcpy(elf_min.data() + 32, &ephent, 8);
+    std::memcpy(elf_min.data() + 54, &ephsize, 2);
+    std::memcpy(elf_min.data() + 56, &ephnum, 2);
+    std::uint32_t ptype = 1, pflags = 5;
+    std::uint64_t psz = 0x1000;
+    std::memcpy(elf_min.data() + 64, &ptype, 4);
+    std::memcpy(elf_min.data() + 68, &pflags, 4);
+    std::memcpy(elf_min.data() + 96, &psz, 8);
+    std::memcpy(elf_min.data() + 104, &psz, 8);
+    auto insp = SafeGameParser::inspect_executable(elf_min.data(), elf_min.size());
+    check(insp.is_valid && insp.machine == EM_X86_64);
+    check(insp.code_size == 0x1000);
 
     // Cleanup
     check(memory.unmap(0x500000) == MemoryError::ok);

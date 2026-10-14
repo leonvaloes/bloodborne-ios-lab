@@ -5,6 +5,21 @@
 
 ---
 
+## Resultados do CI no GitHub Actions
+
+| Pipeline | Run ID | Status | Detalhes |
+|---|---|---|---|
+| **Host tests** (Ubuntu, Windows MSVC, macOS Clang, Sanitizers) | [38501142468](https://github.com/leonvaloes/bloodborne-ios-lab/actions/runs/38501142468) | ? Sucesso (Verde) | Ubuntu, Windows, macOS, ASan/UBSan (1m09s) |
+| **iOS unsigned laboratory** (Xcode arm64) | [38501142474](https://github.com/leonvaloes/bloodborne-ios-lab/actions/runs/38501142474) | ? Sucesso (Verde) | Build arm64 com SDK iOS 26.5 conclu?do em 47s |
+
+### Artefatos de Build Produzidos (Run 38501142474)
+
+| Arquivo | Verifica??o |
+|---|---|
+| `BBHost-unsigned.ipa` | SHA-256: `976ad2fc7b8ac8fc15a10b2c358752304611ffbc485651076420a7c65359fbf5` |
+| `revision.txt` | `f8d4bc955d73650e273f15143ebaf06cf837ba12` |
+
+
 ## Objetivo do Marco (conforme ESCOPO)
 
 > **S5**: demonstrar suporte a saltos indiretos, fun??es externas (HLE imports), ABI, mem?ria virtual e threading para uma carga representativa; sem JIT; atendendo aos crit?rios de GO 2 e GO 3.
