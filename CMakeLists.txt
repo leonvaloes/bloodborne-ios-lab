@@ -93,6 +93,7 @@ set(CORE_SOURCES
     core/game_asset_probe.cpp
     core/guest_loader.cpp
     core/boot_probe.cpp
+    core/x86_interp.cpp
     core/input.cpp
     core/vfs.cpp
     core/binder.cpp
@@ -132,9 +133,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 else()
     add_executable(bb-smoke host/main.cpp)
     target_link_libraries(bb-smoke PRIVATE bb_core)
+    add_executable(bb-run-boot tools/bb_run_boot.cpp)
+    target_link_libraries(bb-run-boot PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe boot_probe audio stability engine shader_translator metal_pipeline flver_parser)
+        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe boot_probe audio stability engine shader_translator metal_pipeline flver_parser x86_interp)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
