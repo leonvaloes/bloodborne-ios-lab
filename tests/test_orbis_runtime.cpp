@@ -1,12 +1,16 @@
 #include "../core/orbis_runtime.h"
-#include <stdexcept>
-#define assert(condition) do { if (!(condition)) throw std::runtime_error("falha: " #condition); } while (false)
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
+#define assert(condition) do { if (!(condition)) throw std::runtime_error("falha: " #condition); } while (false)
 
 using namespace bb;
 int main() {
+    try {
     assert(orbis_nid("_init_env")=="bzQExy189ZI");
     assert(orbis_nid("sceKernelMapDirectMemory")=="L-Q3LEjIbgA");
     GuestMemory m(256*1024);
@@ -19,10 +23,13 @@ int main() {
     X86Interpreter cpu(m);
     cpu.add_trap_range(0x3000,32);
     auto call=[&](const std::string& name, std::uint64_t x=0, std::uint64_t y=0, std::uint64_t z=0,
-                  std::uint64_t w=0, std::uint64_t v=0, std::uint64_t sixth=0) {
+                  std::uint64_t w=0, std::uint64_t v=0, std::uint64_t sixth=0,
+                  std::uint64_t seventh=0, std::uint64_t eighth=0) {
         std::uint64_t trap=0x3000;
         assert(m.store(0x1002,&trap,8)==MemoryError::ok);
         cpu.state={}; cpu.state.rip=0x1000; cpu.state.gpr[4]=0x2ff0;
+        assert(m.store(0x2ff0, &seventh, 8) == MemoryError::ok);
+        assert(m.store(0x2ff8, &eighth, 8) == MemoryError::ok);
         cpu.state.gpr[7]=x; cpu.state.gpr[6]=y; cpu.state.gpr[2]=z;
         cpu.state.gpr[1]=w; cpu.state.gpr[8]=v; cpu.state.gpr[9]=sixth;
         auto r=cpu.run(10); assert(r.stop==CpuStop::trap && r.rip==0x3000);
@@ -100,6 +107,198 @@ int main() {
         failed=std::string(e.what()).find("import não implementado")!=std::string::npos;
     }
     assert(failed);
+
+    // =========================================================================
+    // Testes de subsistemas HLE: libSceUserService, libScePad, libSceSaveData,
+    // libSceAudioOut, Math, Conversões, Ordenação e snprintf
+    // =========================================================================
+    assert(m.map(0x5000, 0xb000, read | write) == MemoryError::ok);
+
+    // 1. libSceUserService & libScePad
+    assert(call("sceUserServiceInitialize", 0) == 0);
+    assert(call("sceUserServiceGetInitialUser", 0x5000) == 0);
+    SceUserServiceUserId uid = -1;
+    assert(m.load(0x5000, &uid, sizeof(uid)) == MemoryError::ok && uid == SCE_USER_SERVICE_INITIAL_USER_ID);
+
+    assert(call("sceUserServiceGetUserName", uid, 0x5020, 16) == 0);
+    char uname[16]{};
+    assert(m.load(0x5020, uname, sizeof(uname)) == MemoryError::ok && std::string(uname) == "Hunter");
+
+    auto pad_h = call("scePadOpen", uid, 0, 0, 0);
+    assert(static_cast<std::int32_t>(pad_h) > 0);
+
+    assert(call("scePadReadState", pad_h, 0x5100) == 0);
+    ScePadData pdata{};
+    assert(m.load(0x5100, &pdata, sizeof(pdata)) == MemoryError::ok);
+    assert(pdata.connected == 1);
+    assert(pdata.left_stick_x == 128 && pdata.left_stick_y == 128);
+    assert(pdata.right_stick_x == 128 && pdata.right_stick_y == 128);
+
+    ScePadVibrationParam vib{80, 120};
+    assert(m.store(0x5200, &vib, sizeof(vib)) == MemoryError::ok);
+    assert(call("scePadSetVibration", pad_h, 0x5200) == 0);
+    assert(rt.pad_manager().get_vibration(static_cast<std::int32_t>(pad_h)).large_motor == 80);
+
+    ScePadColor col{0, 255, 0, 0};
+    assert(m.store(0x5220, &col, sizeof(col)) == MemoryError::ok);
+    assert(call("scePadSetLightBar", pad_h, 0x5220) == 0);
+    assert(rt.pad_manager().get_lightbar(static_cast<std::int32_t>(pad_h)).g == 255);
+    assert(call("scePadClose", pad_h) == 0);
+
+    // 2. libSceSaveData & libSceAudioOut
+    SceSaveDataInitParams save_params{};
+    save_params.max_quota_per_slot = 32768;
+    assert(m.store(0x5300, &save_params, sizeof(save_params)) == MemoryError::ok);
+    assert(call("sceSaveDataInitialize3", 0x5300) == 0);
+    assert(rt.save_data_manager().is_initialized());
+    assert(rt.save_data_manager().get_max_quota_per_slot() == 32768);
+
+    SceSaveDataDirName sdir{};
+    std::strncpy(sdir.data, "SAVE_TEST", sizeof(sdir.data));
+    assert(m.store(0x5400, &sdir, sizeof(sdir)) == MemoryError::ok);
+    SceSaveDataMount smount{};
+    smount.user = 0;
+    smount.dir = reinterpret_cast<const SceSaveDataDirName*>(0x5400);
+    smount.mode = SCE_SAVEDATA_MOUNT_MODE_CREATE;
+    smount.blocks = 64;
+    assert(m.store(0x5440, &smount, sizeof(smount)) == MemoryError::ok);
+    assert(call("sceSaveDataMount", 0x5440, 0x5500) == 0);
+    SceSaveDataMountResult sres{};
+    assert(m.load(0x5500, &sres, sizeof(sres)) == MemoryError::ok);
+    assert(std::string(sres.point.data).find("/savedata") != std::string::npos);
+    assert(m.store(0x5600, &sres.point, sizeof(sres.point)) == MemoryError::ok);
+    assert(call("sceSaveDataUmount", 0x5600, 1) == 0);
+
+    auto audio_h = call("sceAudioOutOpen", uid, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 512, 48000, SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+    assert(static_cast<std::int32_t>(audio_h) > 0);
+    std::vector<std::int16_t> pcm_data(512 * 2, 500);
+    assert(m.store(0x5800, pcm_data.data(), pcm_data.size() * sizeof(std::int16_t)) == MemoryError::ok);
+    assert(call("sceAudioOutOutput", audio_h, 0x5800) == 0);
+    std::int32_t vol_data[2] = {16384, 16384};
+    assert(m.store(0x5900, vol_data, sizeof(vol_data)) == MemoryError::ok);
+    assert(call("sceAudioOutSetVolume", audio_h, SCE_AUDIO_OUT_VOLUME_FLAG_STEREO, 0x5900) == 0);
+    assert(call("sceAudioOutGetPortInfo", audio_h, 0x5700) == 0);
+    SceAudioOutPortInfo ainfo{};
+    assert(m.load(0x5700, &ainfo, sizeof(ainfo)) == MemoryError::ok);
+    assert(ainfo.status == 1 && ainfo.samples_per_block == 512 && ainfo.volume_left == 16384);
+    assert(call("sceAudioOutClose", audio_h) == 0);
+
+    // 3. Funções matemáticas (SysV / registradores XMM)
+    auto call_math = [&](const std::string& name, double x, double y = 0.0) -> double {
+        cpu.state = {};
+        std::memcpy(&cpu.state.xmm[0][0], &x, sizeof(x));
+        std::memcpy(&cpu.state.xmm[1][0], &y, sizeof(y));
+        rt.invoke(name, cpu.state);
+        double res = 0.0;
+        std::memcpy(&res, &cpu.state.xmm[0][0], sizeof(res));
+        return res;
+    };
+    auto call_math_f = [&](const std::string& name, float x, float y = 0.0f) -> float {
+        cpu.state = {};
+        std::uint32_t bx = 0, by = 0;
+        std::memcpy(&bx, &x, sizeof(bx));
+        std::memcpy(&by, &y, sizeof(by));
+        cpu.state.xmm[0][0] = bx;
+        cpu.state.xmm[1][0] = by;
+        rt.invoke(name, cpu.state);
+        std::uint32_t bres = static_cast<std::uint32_t>(cpu.state.xmm[0][0]);
+        float res = 0.0f;
+        std::memcpy(&res, &bres, sizeof(res));
+        return res;
+    };
+    assert(std::abs(call_math("sin", 0.0) - 0.0) < 1e-6);
+    assert(std::abs(call_math("sin", 1.5707963267948966) - 1.0) < 1e-6);
+    assert(std::abs(call_math("cos", 0.0) - 1.0) < 1e-6);
+    assert(std::abs(call_math("cos", 3.141592653589793) - (-1.0)) < 1e-6);
+    assert(std::abs(call_math("tan", 0.0) - 0.0) < 1e-6);
+    assert(std::abs(call_math("atan2", 1.0, 1.0) - 0.7853981633974483) < 1e-6);
+    assert(std::abs(call_math("pow", 2.0, 10.0) - 1024.0) < 1e-6);
+    assert(std::abs(call_math("exp", 1.0) - 2.718281828459045) < 1e-6);
+    assert(std::abs(call_math("log", 2.718281828459045) - 1.0) < 1e-6);
+    assert(std::abs(call_math("sqrt", 144.0) - 12.0) < 1e-6);
+    assert(std::abs(call_math("floor", 5.9) - 5.0) < 1e-6);
+    assert(std::abs(call_math("ceil", 5.1) - 6.0) < 1e-6);
+    assert(std::abs(call_math("fmod", 7.0, 3.0) - 1.0) < 1e-6);
+    assert(std::abs(call_math("round", 4.6) - 5.0) < 1e-6);
+    assert(std::abs(call_math("fabs", -123.456) - 123.456) < 1e-6);
+
+    assert(std::abs(call_math_f("sinf", 0.0f) - 0.0f) < 1e-5f);
+    assert(std::abs(call_math_f("cosf", 0.0f) - 1.0f) < 1e-5f);
+    assert(std::abs(call_math_f("sqrtf", 25.0f) - 5.0f) < 1e-5f);
+    assert(std::abs(call_math_f("fabsf", -99.5f) - 99.5f) < 1e-5f);
+
+    // 4. Conversões & Ordenação (strtol, strtoul, strtod, strtof, qsort, bsearch)
+    assert(m.store(0x5a00, " -98765xyz", 11) == MemoryError::ok);
+    auto st_res = call("strtol", 0x5a00, 0x5b00, 10);
+    assert(static_cast<std::int64_t>(st_res) == -98765);
+    std::uint64_t end_p = 0;
+    assert(m.load(0x5b00, &end_p, 8) == MemoryError::ok && end_p == 0x5a07);
+
+    assert(m.store(0x5a20, "0xDEADBEEF trailing", 20) == MemoryError::ok);
+    auto stu_res = call("strtoul", 0x5a20, 0x5b10, 16);
+    assert(stu_res == 0xDEADBEEFULL);
+
+    assert(m.store(0x5a40, "3.14159rest", 12) == MemoryError::ok);
+    call("strtod", 0x5a40, 0x5b20);
+    double dval = 0.0;
+    std::memcpy(&dval, &cpu.state.xmm[0][0], sizeof(dval));
+    assert(std::abs(dval - 3.14159) < 1e-5);
+
+    // qsort e bsearch com comparador em código de máquina guest
+    // mov eax, [rdi] (8b 07)
+    // sub eax, [rsi] (2b 06)
+    // ret (c3)
+    const std::uint8_t cmp_code[] = {0x8B, 0x07, 0x2B, 0x06, 0xC3};
+    assert(m.store(0x1500, cmp_code, sizeof(cmp_code)) == MemoryError::ok);
+    int unsorted_arr[5] = {50, 10, 40, 20, 30};
+    assert(m.store(0x5c00, unsorted_arr, sizeof(unsorted_arr)) == MemoryError::ok);
+    assert(call("qsort", 0x5c00, 5, sizeof(int), 0x1500) == 0);
+    int sorted_arr[5]{};
+    assert(m.load(0x5c00, sorted_arr, sizeof(sorted_arr)) == MemoryError::ok);
+    assert(sorted_arr[0] == 10 && sorted_arr[1] == 20 && sorted_arr[2] == 30 && sorted_arr[3] == 40 && sorted_arr[4] == 50);
+
+    int bkey = 40;
+    assert(m.store(0x5c40, &bkey, sizeof(bkey)) == MemoryError::ok);
+    auto bfound = call("bsearch", 0x5c40, 0x5c00, 5, sizeof(int), 0x1500);
+    assert(bfound == 0x5c00 + 3 * sizeof(int));
+
+    int bkey_none = 999;
+    assert(m.store(0x5c40, &bkey_none, sizeof(bkey_none)) == MemoryError::ok);
+    assert(call("bsearch", 0x5c40, 0x5c00, 5, sizeof(int), 0x1500) == 0);
+
+    // 5. snprintf
+    assert(m.store(0x5e00, "val=%d u=%u hex=%x s=%s", 25) == MemoryError::ok);
+    assert(m.store(0x5e40, "Hunter", 7) == MemoryError::ok);
+    auto sn_len = call("snprintf", 0x5d00, 64, 0x5e00, static_cast<std::uint64_t>(-42), 100, 0xFE, 0x5e40);
+    char sn_out[64]{};
+    assert(m.load(0x5d00, sn_out, sizeof(sn_out)) == MemoryError::ok);
+    assert(std::string(sn_out) == "val=-42 u=100 hex=fe s=Hunter");
+    assert(sn_len == std::string("val=-42 u=100 hex=fe s=Hunter").size());
+
+    // snprintf com float e ponteiro
+    assert(m.store(0x5e60, "pi=%.2f ptr=%p", 15) == MemoryError::ok);
+    cpu.state = {};
+    double pi_val = 3.14159;
+    std::memcpy(&cpu.state.xmm[0][0], &pi_val, sizeof(pi_val));
+    cpu.state.gpr[7] = 0x5d00;
+    cpu.state.gpr[6] = 64;
+    cpu.state.gpr[2] = 0x5e60;
+    cpu.state.gpr[1] = 0x1234;
+    rt.invoke("snprintf", cpu.state);
+    char sn_out2[64]{};
+    assert(m.load(0x5d00, sn_out2, sizeof(sn_out2)) == MemoryError::ok);
+    assert(std::string(sn_out2).find("pi=3.14") != std::string::npos);
+    assert(std::string(sn_out2).find("1234") != std::string::npos);
+
+    // Limite estrito de tamanho para evitar buffer overflows
+    call("snprintf", 0x5d00, 6, 0x5e00, static_cast<std::uint64_t>(-42), 100, 0xFE, 0x5e40);
+    char sn_trunc[16]{};
+    assert(m.load(0x5d00, sn_trunc, sizeof(sn_trunc)) == MemoryError::ok);
+    assert(std::string(sn_trunc) == "val=-");
+    assert(sn_trunc[5] == '\0');
+
+    // 6. _sceKernelRtldSetApplicationHeapAPI
+    assert(call("_sceKernelRtldSetApplicationHeapAPI", 0x9000) == 0);
 
     // =========================================================================
     // Testes de máquina guest com GuestScheduler e adaptador scheduler-traps
@@ -461,5 +660,9 @@ int main() {
             assert(gm.load(0x20080, &first_res, 8) == MemoryError::ok && first_res == 1);
             assert(gm.load(0x20088, &second_res, 8) == MemoryError::ok && second_res == 0);
         }
+    }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "FATAL: %s\n", e.what());
+        return 1;
     }
 }

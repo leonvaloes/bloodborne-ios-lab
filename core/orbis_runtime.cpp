@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <limits>
@@ -63,13 +65,36 @@ std::string orbis_nid(const std::string& symbol) {
     if (count) result+=alphabet[(buffer<<(6-count))&63];
     return result;
 }
-OrbisRuntime::OrbisRuntime(GuestMemory& memory) : mem_(memory) {
+OrbisRuntime::OrbisRuntime(GuestMemory& memory)
+    : mem_(memory), user_mgr_(), pad_mgr_(nullptr, &user_mgr_) {
     static const char* const symbols[] = {
 #include "orbis_import_names.h"
         "scePthreadMutexattrInit", "scePthreadMutexattrSettype", "scePthreadMutexattrDestroy",
         "scePthreadMutexInit", "scePthreadMutexLock", "scePthreadMutexUnlock", "scePthreadMutexDestroy",
         "scePthreadMutexTrylock", "sceKernelMmap", "sceKernelMunmap", "sceKernelVirtualQuery",
-        "__cxa_guard_abort"
+        "__cxa_guard_abort",
+        // libScePad
+        "scePadOpen", "scePadClose", "scePadReadState", "scePadSetVibration", "scePadSetLightBar", "scePadInit",
+        // libSceUserService
+        "sceUserServiceInitialize", "sceUserServiceGetInitialUser", "sceUserServiceGetLoginIdList",
+        "sceUserServiceGetLoginUserIdList", "sceUserServiceGetUserName", "sceUserServiceTerminate",
+        // libSceSaveData
+        "sceSaveDataInitialize", "sceSaveDataInitialize2", "sceSaveDataInitialize3",
+        "sceSaveDataMount", "sceSaveDataMount2", "sceSaveDataUmount", "sceSaveDataDelete",
+        "sceSaveDataDirNameSearch", "sceSaveDataTerminate",
+        // libSceAudioOut
+        "sceAudioOutOpen", "sceAudioOutClose", "sceAudioOutOutput", "sceAudioOutSetVolume",
+        "sceAudioOutGetPortInfo", "sceAudioOutGetPortState", "sceAudioOutInit",
+        // Heap & runtime
+        "_sceKernelRtldSetApplicationHeapAPI",
+        // Math double
+        "sin", "cos", "tan", "atan2", "pow", "exp", "log", "sqrt", "floor", "ceil", "fmod", "round", "fabs",
+        // Math float
+        "sinf", "cosf", "tanf", "atan2f", "powf", "expf", "logf", "sqrtf", "floorf", "ceilf", "fmodf", "roundf", "fabsf",
+        // Conversions & stdlib
+        "strtol", "strtoul", "strtoll", "strtoull", "strtod", "strtof", "qsort", "bsearch",
+        // Formatting
+        "snprintf", "vsnprintf"
     };
     for (const char* s : symbols) names_.emplace(orbis_nid(s), s);
 }
@@ -85,6 +110,10 @@ std::uint64_t OrbisRuntime::arg(const CpuState& c, unsigned i) const {
     return get<std::uint64_t>(mem_,c.gpr[4]+8*(i-5));
 }
 std::uint64_t OrbisRuntime::invoke(const std::string& import, const CpuState& cpu) {
+    CpuState copy = cpu;
+    return invoke(import, copy);
+}
+std::uint64_t OrbisRuntime::invoke(const std::string& import, CpuState& cpu) {
     const auto name=resolve(import);
     if (scheduler_ && (name=="scePthreadMutexLock" || name=="pthread_mutex_lock" ||
         name=="scePthreadCondWait" || name=="pthread_cond_wait" ||
@@ -399,10 +428,542 @@ OrbisRuntime::InvocationResult OrbisRuntime::complete_callback(CpuState& cpu, Gu
     callbacks_.erase(it);
     return {InvocationResult::Action::returned, static_cast<std::uint32_t>(status), 0, 0};
 }
-std::uint64_t OrbisRuntime::handle(const std::string& n, const CpuState& c) {
+std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     auto a=[&](unsigned i){return arg(c,i);};
     if (n=="_init_env" || n=="_sceKernelRtldSetApplicationHeapAPI") return 0;
     if (n=="sceKernelGetProcParam") return procparam_;
+
+    auto read_guest_string = [&](std::uint64_t addr, std::size_t max_len = 4096) -> std::string {
+        std::string s;
+        for (std::size_t i = 0; i < max_len; ++i) {
+            char ch = 0;
+            if (mem_.load(addr + i, &ch, 1) != MemoryError::ok || ch == '\0') break;
+            s.push_back(ch);
+        }
+        return s;
+    };
+    auto get_double = [&](unsigned xmm_idx, unsigned gpr_idx) -> double {
+        if (c.xmm[xmm_idx][0] != 0) {
+            double val = 0;
+            std::memcpy(&val, &c.xmm[xmm_idx][0], sizeof(val));
+            return val;
+        }
+        double val = 0;
+        std::uint64_t gpr_val = a(gpr_idx);
+        std::memcpy(&val, &gpr_val, sizeof(val));
+        return val;
+    };
+    auto put_double = [&](double val) -> std::uint64_t {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &val, sizeof(bits));
+        c.xmm[0][0] = bits;
+        return bits;
+    };
+    auto get_float = [&](unsigned xmm_idx, unsigned gpr_idx) -> float {
+        if ((c.xmm[xmm_idx][0] & 0xFFFFFFFFULL) != 0) {
+            std::uint32_t val = static_cast<std::uint32_t>(c.xmm[xmm_idx][0]);
+            float f = 0;
+            std::memcpy(&f, &val, sizeof(f));
+            return f;
+        }
+        std::uint32_t val = static_cast<std::uint32_t>(a(gpr_idx));
+        float f = 0;
+        std::memcpy(&f, &val, sizeof(f));
+        return f;
+    };
+    auto put_float = [&](float val) -> std::uint64_t {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &val, sizeof(bits));
+        c.xmm[0][0] = bits;
+        return static_cast<std::uint64_t>(bits);
+    };
+
+    // libScePad HLE
+    if (n == "scePadOpen") {
+        return static_cast<std::uint32_t>(pad_mgr_.scePadOpen(
+            mem_, static_cast<std::uint32_t>(a(0)), static_cast<std::int32_t>(a(1)),
+            static_cast<std::int32_t>(a(2)), a(3)));
+    }
+    if (n == "scePadClose") {
+        return static_cast<std::uint32_t>(pad_mgr_.scePadClose(static_cast<std::int32_t>(a(0))));
+    }
+    if (n == "scePadReadState") {
+        return static_cast<std::uint32_t>(pad_mgr_.scePadReadState(
+            mem_, static_cast<std::int32_t>(a(0)), a(1)));
+    }
+    if (n == "scePadSetVibration") {
+        return static_cast<std::uint32_t>(pad_mgr_.scePadSetVibration(
+            mem_, static_cast<std::int32_t>(a(0)), a(1)));
+    }
+    if (n == "scePadSetLightBar") {
+        return static_cast<std::uint32_t>(pad_mgr_.scePadSetLightBar(
+            mem_, static_cast<std::int32_t>(a(0)), a(1)));
+    }
+    if (n == "scePadInit") return 0;
+
+    // libSceUserService HLE
+    if (n == "sceUserServiceInitialize") {
+        return static_cast<std::uint32_t>(user_mgr_.sceUserServiceInitialize(mem_, a(0)));
+    }
+    if (n == "sceUserServiceGetInitialUser") {
+        return static_cast<std::uint32_t>(user_mgr_.sceUserServiceGetInitialUser(mem_, a(0)));
+    }
+    if (n == "sceUserServiceGetLoginIdList" || n == "sceUserServiceGetLoginUserIdList") {
+        return static_cast<std::uint32_t>(user_mgr_.sceUserServiceGetLoginIdList(mem_, a(0)));
+    }
+    if (n == "sceUserServiceGetUserName") {
+        return static_cast<std::uint32_t>(user_mgr_.sceUserServiceGetUserName(
+            mem_, static_cast<SceUserServiceUserId>(a(0)), a(1), static_cast<std::size_t>(a(2))));
+    }
+    if (n == "sceUserServiceTerminate") {
+        return static_cast<std::uint32_t>(user_mgr_.sceUserServiceTerminate());
+    }
+
+    // libSceSaveData HLE
+    if (n == "sceSaveDataInitialize" || n == "sceSaveDataInitialize2" || n == "sceSaveDataInitialize3") {
+        std::size_t quota = SCE_SAVEDATA_DEFAULT_QUOTA;
+        if (a(0)) {
+            SceSaveDataInitParams p{};
+            if (mem_.load(a(0), &p, sizeof(p)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            if (p.max_quota_per_slot > 0) quota = static_cast<std::size_t>(p.max_quota_per_slot);
+        }
+        std::string base = save_mgr_.get_base_directory();
+        if (base.empty()) base = "savedata";
+        bool ok = save_mgr_.initialize(base, quota, save_mgr_.get_vfs());
+        return static_cast<std::uint32_t>(ok ? SCE_SAVEDATA_OK : SCE_SAVEDATA_ERROR_INTERNAL);
+    }
+    if (n == "sceSaveDataMount" || n == "sceSaveDataMount2") {
+        if (!a(0) || !a(1)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        const bool is_mount2 = (n == "sceSaveDataMount2");
+        int32_t user = 0;
+        uint64_t title_ptr = 0;
+        uint64_t dir_ptr = 0;
+        uint64_t blocks = 0;
+        uint32_t mode = 0;
+        if (is_mount2) {
+            SceSaveDataMount2 m2{};
+            if (mem_.load(a(0), &m2, sizeof(m2)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            user = m2.user;
+            dir_ptr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(m2.dir));
+            blocks = m2.blocks;
+            mode = m2.mode;
+        } else {
+            SceSaveDataMount m1{};
+            if (mem_.load(a(0), &m1, sizeof(m1)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            user = m1.user;
+            title_ptr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(m1.title));
+            dir_ptr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(m1.dir));
+            blocks = m1.blocks;
+            mode = m1.mode;
+        }
+        SceSaveDataTitleId title_obj{};
+        const char* title_str = nullptr;
+        if (title_ptr) {
+            if (mem_.load(title_ptr, &title_obj, sizeof(title_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            title_str = title_obj.data;
+        }
+        SceSaveDataDirName dir_obj{};
+        const char* dir_str = nullptr;
+        if (dir_ptr) {
+            if (mem_.load(dir_ptr, &dir_obj, sizeof(dir_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            dir_str = dir_obj.data;
+        }
+        std::string mount_pt;
+        uint32_t status = 0;
+        int32_t res = save_mgr_.mount(user, title_str, dir_str, mode, blocks, mount_pt, status);
+        if (res == SCE_SAVEDATA_OK) {
+            SceSaveDataMountResult result{};
+            std::strncpy(result.point.data, mount_pt.c_str(), sizeof(result.point.data) - 1);
+            result.status = status;
+            result.required_blocks = blocks;
+            if (mem_.store(a(1), &result, sizeof(result)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        }
+        return static_cast<std::uint32_t>(res);
+    }
+    if (n == "sceSaveDataUmount") {
+        if (!a(0)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        SceSaveDataMountPoint pt{};
+        if (mem_.load(a(0), &pt, sizeof(pt)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        bool commit = (a(1) & SCE_SAVEDATA_UMOUNT_FLAG_COMMIT) != 0;
+        return static_cast<std::uint32_t>(save_mgr_.umount(pt.data, commit));
+    }
+    if (n == "sceSaveDataDelete") {
+        if (!a(0)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        SceSaveDataDelete d{};
+        if (mem_.load(a(0), &d, sizeof(d)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        uint64_t title_ptr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(d.title));
+        uint64_t dir_ptr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(d.dir));
+        if (!dir_ptr) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        SceSaveDataTitleId title_obj{};
+        const char* title_str = nullptr;
+        if (title_ptr) {
+            if (mem_.load(title_ptr, &title_obj, sizeof(title_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            title_str = title_obj.data;
+        }
+        SceSaveDataDirName dir_obj{};
+        if (mem_.load(dir_ptr, &dir_obj, sizeof(dir_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        return static_cast<std::uint32_t>(save_mgr_.delete_save(d.user, title_str, dir_obj.data));
+    }
+    if (n == "sceSaveDataDirNameSearch") {
+        if (!a(0) || !a(1)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        SceSaveDataSearchCond cond{};
+        if (mem_.load(a(0), &cond, sizeof(cond)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        SceSaveDataSearchResult result{};
+        if (mem_.load(a(1), &result, sizeof(result)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        uint64_t title_ptr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cond.title));
+        uint64_t dir_ptr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cond.dir));
+        SceSaveDataTitleId title_obj{};
+        const char* title_str = nullptr;
+        if (title_ptr) {
+            if (mem_.load(title_ptr, &title_obj, sizeof(title_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            title_str = title_obj.data;
+        }
+        SceSaveDataDirName dir_obj{};
+        const char* dir_pattern = nullptr;
+        if (dir_ptr) {
+            if (mem_.load(dir_ptr, &dir_obj, sizeof(dir_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            dir_pattern = dir_obj.data;
+        }
+        std::vector<SaveSearchEntry> entries;
+        int32_t res = save_mgr_.dir_name_search(cond.user, title_str, dir_pattern, cond.key, cond.order, entries);
+        if (res != SCE_SAVEDATA_OK) return static_cast<std::uint32_t>(res);
+
+        result.hits = static_cast<uint32_t>(entries.size());
+        uint32_t set = static_cast<uint32_t>(std::min<std::size_t>(entries.size(), result.names_capacity));
+        result.set_count = set;
+        uint64_t names_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result.names));
+        uint64_t params_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result.params));
+        uint64_t infos_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result.infos));
+        for (uint32_t i = 0; i < set; ++i) {
+            if (names_addr) {
+                SceSaveDataDirName name{};
+                std::strncpy(name.data, entries[i].dir_name.c_str(), sizeof(name.data) - 1);
+                mem_.store(names_addr + i * sizeof(SceSaveDataDirName), &name, sizeof(name));
+            }
+            if (params_addr) {
+                mem_.store(params_addr + i * sizeof(SceSaveDataParam), &entries[i].param, sizeof(SceSaveDataParam));
+            }
+            if (infos_addr) {
+                SceSaveDataSearchInfo info{};
+                info.blocks = entries[i].blocks;
+                info.free_blocks = entries[i].free_blocks;
+                mem_.store(infos_addr + i * sizeof(SceSaveDataSearchInfo), &info, sizeof(info));
+            }
+        }
+        mem_.store(a(1), &result, sizeof(result));
+        return SCE_SAVEDATA_OK;
+    }
+    if (n == "sceSaveDataTerminate") {
+        save_mgr_.terminate();
+        return 0;
+    }
+
+    // libSceAudioOut HLE
+    if (n == "sceAudioOutOpen") {
+        return static_cast<std::uint32_t>(audio_mgr_.open_port(
+            static_cast<std::int32_t>(a(0)), static_cast<std::int32_t>(a(1)), static_cast<std::int32_t>(a(2)),
+            static_cast<std::uint32_t>(a(3)), static_cast<std::uint32_t>(a(4)), static_cast<std::uint32_t>(a(5))));
+    }
+    if (n == "sceAudioOutClose") {
+        return static_cast<std::uint32_t>(audio_mgr_.close_port(static_cast<std::int32_t>(a(0))));
+    }
+    if (n == "sceAudioOutOutput") {
+        return static_cast<std::uint32_t>(audio_mgr_.output_hle(static_cast<std::int32_t>(a(0)), mem_, a(1)));
+    }
+    if (n == "sceAudioOutSetVolume") {
+        if (!a(2)) return static_cast<std::uint32_t>(SCE_AUDIO_OUT_ERROR_INVALID_POINTER);
+        std::int32_t vols[2] = {0, 0};
+        if (mem_.load(a(2), vols, sizeof(vols)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_AUDIO_OUT_ERROR_INVALID_POINTER);
+        return static_cast<std::uint32_t>(audio_mgr_.set_volume(static_cast<std::int32_t>(a(0)), static_cast<std::int32_t>(a(1)), vols));
+    }
+    if (n == "sceAudioOutGetPortInfo" || n == "sceAudioOutGetPortState") {
+        if (!a(1)) return static_cast<std::uint32_t>(SCE_AUDIO_OUT_ERROR_INVALID_POINTER);
+        SceAudioOutPortInfo info{};
+        int32_t res = audio_mgr_.get_port_info(static_cast<std::int32_t>(a(0)), &info);
+        if (res == SCE_OK) {
+            if (mem_.store(a(1), &info, sizeof(info)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_AUDIO_OUT_ERROR_INVALID_POINTER);
+        }
+        return static_cast<std::uint32_t>(res);
+    }
+    if (n == "sceAudioOutInit") return 0;
+
+    // Math libc functions
+    if (n == "sin") return put_double(std::sin(get_double(0, 0)));
+    if (n == "cos") return put_double(std::cos(get_double(0, 0)));
+    if (n == "tan") return put_double(std::tan(get_double(0, 0)));
+    if (n == "atan2") return put_double(std::atan2(get_double(0, 0), get_double(1, 1)));
+    if (n == "pow") return put_double(std::pow(get_double(0, 0), get_double(1, 1)));
+    if (n == "exp") return put_double(std::exp(get_double(0, 0)));
+    if (n == "log") return put_double(std::log(get_double(0, 0)));
+    if (n == "sqrt") return put_double(std::sqrt(get_double(0, 0)));
+    if (n == "floor") return put_double(std::floor(get_double(0, 0)));
+    if (n == "ceil") return put_double(std::ceil(get_double(0, 0)));
+    if (n == "fmod") return put_double(std::fmod(get_double(0, 0), get_double(1, 1)));
+    if (n == "round") return put_double(std::round(get_double(0, 0)));
+    if (n == "fabs") return put_double(std::fabs(get_double(0, 0)));
+
+    if (n == "sinf") return put_float(std::sin(get_float(0, 0)));
+    if (n == "cosf") return put_float(std::cos(get_float(0, 0)));
+    if (n == "tanf") return put_float(std::tan(get_float(0, 0)));
+    if (n == "atan2f") return put_float(std::atan2(get_float(0, 0), get_float(1, 1)));
+    if (n == "powf") return put_float(std::pow(get_float(0, 0), get_float(1, 1)));
+    if (n == "expf") return put_float(std::exp(get_float(0, 0)));
+    if (n == "logf") return put_float(std::log(get_float(0, 0)));
+    if (n == "sqrtf") return put_float(std::sqrt(get_float(0, 0)));
+    if (n == "floorf") return put_float(std::floor(get_float(0, 0)));
+    if (n == "ceilf") return put_float(std::ceil(get_float(0, 0)));
+    if (n == "fmodf") return put_float(std::fmod(get_float(0, 0), get_float(1, 1)));
+    if (n == "roundf") return put_float(std::round(get_float(0, 0)));
+    if (n == "fabsf") return put_float(std::fabs(get_float(0, 0)));
+
+    // Conversions and Sorting
+    if (n == "strtol" || n == "strtoll") {
+        if (!a(0)) return 0;
+        std::string str = read_guest_string(a(0));
+        char* end = nullptr;
+        int base = static_cast<int>(a(2));
+        long long val = std::strtoll(str.c_str(), &end, base);
+        if (a(1)) {
+            std::uint64_t consumed = static_cast<std::uint64_t>(end - str.c_str());
+            put<std::uint64_t>(mem_, a(1), a(0) + consumed);
+        }
+        return static_cast<std::uint64_t>(val);
+    }
+    if (n == "strtoul" || n == "strtoull") {
+        if (!a(0)) return 0;
+        std::string str = read_guest_string(a(0));
+        char* end = nullptr;
+        int base = static_cast<int>(a(2));
+        unsigned long long val = std::strtoull(str.c_str(), &end, base);
+        if (a(1)) {
+            std::uint64_t consumed = static_cast<std::uint64_t>(end - str.c_str());
+            put<std::uint64_t>(mem_, a(1), a(0) + consumed);
+        }
+        return static_cast<std::uint64_t>(val);
+    }
+    if (n == "strtod") {
+        if (!a(0)) return put_double(0.0);
+        std::string str = read_guest_string(a(0));
+        char* end = nullptr;
+        double val = std::strtod(str.c_str(), &end);
+        if (a(1)) {
+            std::uint64_t consumed = static_cast<std::uint64_t>(end - str.c_str());
+            put<std::uint64_t>(mem_, a(1), a(0) + consumed);
+        }
+        return put_double(val);
+    }
+    if (n == "strtof") {
+        if (!a(0)) return put_float(0.0f);
+        std::string str = read_guest_string(a(0));
+        char* end = nullptr;
+        float val = std::strtof(str.c_str(), &end);
+        if (a(1)) {
+            std::uint64_t consumed = static_cast<std::uint64_t>(end - str.c_str());
+            put<std::uint64_t>(mem_, a(1), a(0) + consumed);
+        }
+        return put_float(val);
+    }
+    if (n == "qsort") {
+        std::uint64_t base = a(0);
+        std::size_t nmemb = static_cast<std::size_t>(a(1));
+        std::size_t size = static_cast<std::size_t>(a(2));
+        std::uint64_t compar = a(3);
+        if (!base || nmemb <= 1 || size == 0) return 0;
+        if (nmemb > 100000 || size > 65536) throw std::runtime_error("argumentos de qsort excessivos");
+
+        std::vector<std::vector<std::uint8_t>> items(nmemb);
+        for (std::size_t i = 0; i < nmemb; ++i) {
+            items[i].resize(size);
+            if (mem_.load(base + i * size, items[i].data(), size) != MemoryError::ok) {
+                throw std::runtime_error("memoria de qsort invalida");
+            }
+        }
+
+        auto do_compare = [&](const std::vector<std::uint8_t>& item_a,
+                              const std::vector<std::uint8_t>& item_b,
+                              std::uint64_t orig_addr_a,
+                              std::uint64_t orig_addr_b) -> int {
+            if (!compar) {
+                return std::memcmp(item_a.data(), item_b.data(), size);
+            }
+            X86Interpreter interp(mem_);
+            constexpr std::uint64_t trap_addr = 0x7FFFFFFF0000ULL;
+            interp.add_trap_range(trap_addr, 32);
+            std::uint64_t rsp = (c.gpr[4] > 256) ? (c.gpr[4] - 128) : 0x20000;
+            rsp = (rsp & ~15ULL) - 8;
+            mem_.store(rsp, &trap_addr, 8);
+            interp.state = c;
+            interp.state.rip = compar;
+            interp.state.gpr[4] = rsp;
+            interp.state.gpr[7] = orig_addr_a;
+            interp.state.gpr[6] = orig_addr_b;
+            auto r = interp.run(100000);
+            if (r.stop == CpuStop::trap && r.rip == trap_addr) {
+                return static_cast<std::int32_t>(interp.state.gpr[0]);
+            }
+            return std::memcmp(item_a.data(), item_b.data(), size);
+        };
+
+        std::vector<std::size_t> indices(nmemb);
+        for (std::size_t i = 0; i < nmemb; ++i) indices[i] = i;
+
+        std::stable_sort(indices.begin(), indices.end(), [&](std::size_t i1, std::size_t i2) {
+            return do_compare(items[i1], items[i2], base + i1 * size, base + i2 * size) < 0;
+        });
+
+        for (std::size_t i = 0; i < nmemb; ++i) {
+            mem_.store(base + i * size, items[indices[i]].data(), size);
+        }
+        return 0;
+    }
+    if (n == "bsearch") {
+        std::uint64_t key = a(0);
+        std::uint64_t base = a(1);
+        std::size_t nmemb = static_cast<std::size_t>(a(2));
+        std::size_t size = static_cast<std::size_t>(a(3));
+        std::uint64_t compar = a(4);
+        if (!key || !base || nmemb == 0 || size == 0) return 0;
+        if (nmemb > 100000 || size > 65536) throw std::runtime_error("argumentos de bsearch excessivos");
+
+        auto do_compare = [&](std::uint64_t key_addr, std::uint64_t elem_addr) -> int {
+            if (!compar) {
+                std::vector<std::uint8_t> ka(size), ea(size);
+                mem_.load(key_addr, ka.data(), size);
+                mem_.load(elem_addr, ea.data(), size);
+                return std::memcmp(ka.data(), ea.data(), size);
+            }
+            X86Interpreter interp(mem_);
+            constexpr std::uint64_t trap_addr = 0x7FFFFFFF0000ULL;
+            interp.add_trap_range(trap_addr, 32);
+            std::uint64_t rsp = (c.gpr[4] > 256) ? (c.gpr[4] - 128) : 0x20000;
+            rsp = (rsp & ~15ULL) - 8;
+            mem_.store(rsp, &trap_addr, 8);
+            interp.state = c;
+            interp.state.rip = compar;
+            interp.state.gpr[4] = rsp;
+            interp.state.gpr[7] = key_addr;
+            interp.state.gpr[6] = elem_addr;
+            auto r = interp.run(100000);
+            if (r.stop == CpuStop::trap && r.rip == trap_addr) {
+                return static_cast<std::int32_t>(interp.state.gpr[0]);
+            }
+            std::vector<std::uint8_t> ka(size), ea(size);
+            mem_.load(key_addr, ka.data(), size);
+            mem_.load(elem_addr, ea.data(), size);
+            return std::memcmp(ka.data(), ea.data(), size);
+        };
+
+        std::size_t low = 0, high = nmemb;
+        while (low < high) {
+            std::size_t mid = low + (high - low) / 2;
+            std::uint64_t mid_addr = base + mid * size;
+            int cmp = do_compare(key, mid_addr);
+            if (cmp < 0) {
+                high = mid;
+            } else if (cmp > 0) {
+                low = mid + 1;
+            } else {
+                return mid_addr;
+            }
+        }
+        return 0;
+    }
+
+    // snprintf
+    if (n == "snprintf") {
+        std::uint64_t dst = a(0);
+        std::uint64_t max_size = a(1);
+        std::uint64_t fmt_addr = a(2);
+        if (!fmt_addr) return 0;
+
+        std::string format = read_guest_string(fmt_addr, 4096);
+        std::string out;
+        unsigned int_arg_idx = 3;
+        unsigned float_arg_idx = 0;
+
+        for (std::size_t i = 0; i < format.size(); ) {
+            if (format[i] != '%') {
+                out.push_back(format[i++]);
+                continue;
+            }
+            if (i + 1 < format.size() && format[i + 1] == '%') {
+                out.push_back('%');
+                i += 2;
+                continue;
+            }
+            std::size_t spec_start = i;
+            ++i;
+            std::string flags_width_prec;
+            while (i < format.size() && (std::strchr("-+ #0123456789.", format[i]) != nullptr)) {
+                flags_width_prec.push_back(format[i++]);
+            }
+            while (i < format.size() && (format[i] == 'l' || format[i] == 'z' || format[i] == 'h')) {
+                ++i;
+            }
+            if (i >= format.size()) {
+                out.append(format.substr(spec_start));
+                break;
+            }
+            char spec = format[i++];
+            char piece[512] = {};
+            if (spec == 'd' || spec == 'i') {
+                std::int64_t val = static_cast<std::int64_t>(a(int_arg_idx++));
+                std::string subspec = "%" + flags_width_prec + "lld";
+                std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<long long>(val));
+                out.append(piece);
+            } else if (spec == 'u') {
+                std::uint64_t val = a(int_arg_idx++);
+                std::string subspec = "%" + flags_width_prec + "llu";
+                std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<unsigned long long>(val));
+                out.append(piece);
+            } else if (spec == 'x' || spec == 'X') {
+                std::uint64_t val = a(int_arg_idx++);
+                std::string subspec = "%" + flags_width_prec + (spec == 'x' ? "llx" : "llX");
+                std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<unsigned long long>(val));
+                out.append(piece);
+            } else if (spec == 's') {
+                std::uint64_t s_addr = a(int_arg_idx++);
+                std::string s_val = s_addr ? read_guest_string(s_addr, 4096) : "(null)";
+                std::string subspec = "%" + flags_width_prec + "s";
+                std::snprintf(piece, sizeof(piece), subspec.c_str(), s_val.c_str());
+                out.append(piece);
+            } else if (spec == 'f' || spec == 'F' || spec == 'g' || spec == 'G' || spec == 'e' || spec == 'E') {
+                double d = 0.0;
+                if (float_arg_idx < 8 && (c.xmm[float_arg_idx][0] != 0 || (c.gpr[0] > 0 && c.gpr[0] <= 8))) {
+                    std::memcpy(&d, &c.xmm[float_arg_idx][0], sizeof(d));
+                    float_arg_idx++;
+                } else if (float_arg_idx < 8 && c.xmm[float_arg_idx][0] == 0 && a(int_arg_idx) == 0 && float_arg_idx > 0) {
+                    std::memcpy(&d, &c.xmm[float_arg_idx][0], sizeof(d));
+                    float_arg_idx++;
+                } else {
+                    std::uint64_t gpr_val = a(int_arg_idx++);
+                    std::memcpy(&d, &gpr_val, sizeof(d));
+                }
+                std::string subspec = "%" + flags_width_prec + spec;
+                std::snprintf(piece, sizeof(piece), subspec.c_str(), d);
+                out.append(piece);
+            } else if (spec == 'p') {
+                std::uint64_t ptr_val = a(int_arg_idx++);
+                std::snprintf(piece, sizeof(piece), "%p", reinterpret_cast<void*>(static_cast<uintptr_t>(ptr_val)));
+                out.append(piece);
+            } else if (spec == 'c') {
+                char c_val = static_cast<char>(a(int_arg_idx++));
+                out.push_back(c_val);
+            } else {
+                out.append(format.substr(spec_start, i - spec_start));
+            }
+        }
+
+        if (dst && max_size > 0) {
+            std::size_t to_write = std::min<std::size_t>(out.size(), static_cast<std::size_t>(max_size - 1));
+            if (to_write > 0) {
+                mem_.store(dst, out.data(), to_write);
+            }
+            char null_byte = '\0';
+            mem_.store(dst + to_write, &null_byte, 1);
+        }
+        return static_cast<std::uint64_t>(out.size());
+    }
     if (n=="atexit" || n=="__cxa_atexit") {
         if (!a(0)) return invalid;
         exit_callbacks_.push_back(a(0)); // registrados, mas não executados sem trampoline guest
