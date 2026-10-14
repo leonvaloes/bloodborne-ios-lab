@@ -2,9 +2,9 @@
 
 **Fase:** Integração Total Multi-Agente Concluída e Transição para a Sprint 5  
 **Orquestrador:** AGENTE 5 (Integrador e Lead QA) — Pasta `bloodborne-ios-lab` (branch `main`)  
-**Status da Suite de Testes:** 25/25 testes host locais no commit `ce5941d`; CI desse commit ainda em fila na última consulta.
+**Status da Suite de Testes:** 25/25 testes host locais após integração das quatro frentes; CI dessa integração ainda pendente.
 **Status do Smoke Test:** 118 verificações de baixo nível aprovadas com 0 falhas (`game_execution=false`).
-**Status do Pipeline IPA:** build iOS de `ce5941d` aguardando runner; último IPA validado no CI é `bafe1c8` (sonda de geometria, não jogo).
+**Status do Pipeline IPA:** execução iOS de `ce5941d` foi cancelada sem iniciar o runner macOS; último IPA validado no CI é `bafe1c8` (sonda de geometria, não jogo).
 
 ---
 
@@ -46,6 +46,8 @@ As quatro worktrees foram encontradas limpas, porém suas branches antigas já f
 | 3 — CPU/AOT | Caracterização verificável dos limites da sonda de entrada | fixtures autorais e rejeição de opcode desconhecido; não chamar duas instruções de boot |
 | 4 — HLE | Lacuna pequena de HLE/threads com teste host | regressão sintética, sem alegar chamadas reais do jogo |
 | 5 — integração | Revisar alterações e CI, resolver conflitos, manter boards | Git limpo, testes Windows/CI separados e evidência física distinta |
+
+As quatro entregas foram integradas localmente nos commits `fc38a81` (sonda CPU com limite de segmento), `155810f` (confinamento de symlink VFS), `6161d1e` (validação de malha/telemetria Metal) e `ce02fe1` (ponteiros HLE). Testes Windows de integração: 25/25 e smoke 118/0. Ainda não houve push dessa integração nem build iOS novo; o último CI de `ce5941d` falhou por cancelamento de jobs macOS **antes de executar etapas**, não por erro de compilação. O CI de host Linux/Windows/sanitizers desse commit passou, mas o workflow geral ficou vermelho.
 
 O diagnóstico físico `bafe1c8` comprovou via VFS descompressão e parsing do pequeno DCX (1.024→2.992 bytes, 23 vértices/22 triângulos); Foundation e VFS concordaram que os outros três arquivos não estavam presentes naquela instalação. O commit `ce5941d` tenta selecionar essa malha no Metal ao abrir o app; ainda não foi validado no iPhone. `game_execution=false`. O critério para encerrar a Sprint 5 **não** é CI verde ou geometria isolada, mas menu, cena e controle derivados da execução da engine no iPhone, com evidências reproduzíveis.
 
