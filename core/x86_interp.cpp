@@ -715,6 +715,28 @@ void Exec::step() {
     const std::uint8_t op = u8();
     int rg = 0;
 
+    if (op == 0xC4) {  // VEX3: BMI1 F3 uses VEX.vvvv as destination, ModRM.reg as opcode extension.
+        const std::uint8_t v1 = u8(), v2 = u8(), opcode = u8();
+        if ((v1 & 31) != 2 || opcode != 0xF3 || (v2 & 3) != 0 || (v2 & 4) != 0 ||
+            p66 || rep || repne || rex) throw Unsupported{};
+        const unsigned sub = (pos < n) ? ((buf[pos] >> 3) & 7) : 0xff;
+        if (sub < 1 || sub > 3) throw Unsupported{};
+        rr = !(v1 & 0x80); rx = !(v1 & 0x40); rb = !(v1 & 0x20);
+        const int sz = (v2 & 0x80) ? 8 : 4;
+        const int dest = (~(v2 >> 3)) & 15;
+        const Rm rm = decode_rm(rg, 0);
+        const std::uint64_t src = rd_rm(rm, sz);
+        const std::uint64_t reduced = (src - 1) & mask_of(sz);
+        const std::uint64_t result = sub == 1 ? (src & reduced) : sub == 2 ? (src ^ reduced) : (src & -src);
+        // AF/PF undefined by ISA: retain their previous values; all defined flags updated.
+        s.rflags &= ~(FLAG_CF | FLAG_ZF | FLAG_SF | FLAG_OF);
+        if ((sub == 3) ? (src != 0) : (src == 0)) s.rflags |= FLAG_CF;
+        if (sub != 2 && result == 0) s.rflags |= FLAG_ZF;
+        if (msb_of(result, sz)) s.rflags |= FLAG_SF;
+        wr_reg(dest, sz, result);
+        s.rip = start + pos;
+        return;
+    }
     if (op == 0x0F) { two_byte(opsz); if (!branched) s.rip = start + pos; return; }
 
     if ((op & 0xC0) == 0 && (op & 7) < 6) {  // ALU group
@@ -1028,7 +1050,8 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
     if (!b || !n) return d;
     n = n < 15 ? n : 15;
     std::size_t p = 0;
-    bool p66 = false, f2 = false, f3 = false, w = false, vex = false;
+    bool p66 = false, f2 = false, f3 = false, w = false, vex = false, vex3 = false;
+    bool legacy_prefix = false, rex_prefix = false;
     while (p < n) {
         const unsigned x = b[p];
         if (x == 0x66) p66 = true;
@@ -1037,15 +1060,16 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
         else if (x == 0x67 || x == 0xF0 || x == 0x64 || x == 0x65 ||
                  x == 0x2E || x == 0x3E || x == 0x26 || x == 0x36) {}
         else break;
+        legacy_prefix = true;
         ++p;
     }
-    if (p < n && b[p] >= 0x40 && b[p] <= 0x4F) { w = (b[p] & 8) != 0; ++p; }
+    if (p < n && b[p] >= 0x40 && b[p] <= 0x4F) { w = (b[p] & 8) != 0; rex_prefix = true; ++p; }
     if (p >= n) return d;
     unsigned map = 0, op = b[p++], pp = p66 ? 1 : f3 ? 2 : f2 ? 3 : 0;
     if (op == 0xC5 || op == 0xC4) {
         vex = true;
         if (p + (op == 0xC4 ? 2u : 1u) >= n) return d;
-        if (op == 0xC4) { map = b[p++] & 31; const unsigned v = b[p++]; pp = v & 3; w = (v & 128) != 0; }
+        if (op == 0xC4) { vex3 = true; map = b[p++] & 31; const unsigned v = b[p++]; pp = v & 3; w = (v & 128) != 0; }
         else { map = 1; pp = b[p++] & 3; }
         op = b[p++];
     } else if (op == 0x0F) {
@@ -1091,12 +1115,16 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
             op == 0x68 || op == 0x69 || op == 0x6A || op == 0xDB || op == 0xDF || op == 0xEB ||
             (op >= 0xF8 && op <= 0xFE) || (op >= 0x74 && op <= 0x76) || op == 0xD4 || op == 0xD5 || op == 0xD7 ||
             op == 0x70 || op == 0xC6 || (op >= 0x2A && op <= 0x2F));
+        if (vex3 && map == 2 && pp == 0 && op == 0xF3 &&
+            !(b[p - 2] & 4) && !legacy_prefix && !rex_prefix) d.supported = true;
         if (!vex && map == 2 && pp == 1 && (op == 0x00 || op == 0x40)) d.supported = true;
         if (!vex && map == 3 && pp == 1 && op == 0x0F) d.supported = true;
     }
     if (modrm) {
         if (p >= n) return X86Decoded{};
         const unsigned m = b[p++], mode = m >> 6, rm = m & 7;
+        if (vex3 && map == 2 && op == 0xF3 && ((m >> 3) & 7) != 1 &&
+            ((m >> 3) & 7) != 2 && ((m >> 3) & 7) != 3) d.supported = false;
         if (map == 0 && (op == 0xF6 || op == 0xF7) && ((m >> 3) & 7) < 2) imm = op == 0xF6 ? 1 : p66 ? 2 : 4;
         if (mode != 3) {
             if (rm == 4) { if (p >= n) return X86Decoded{}; const unsigned sib = b[p++]; if (mode == 0 && (sib & 7) == 5) p += 4; }

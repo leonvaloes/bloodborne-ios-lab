@@ -202,6 +202,84 @@ int main() {
             const auto d = decode_x86(b, sizeof(b));
             CHECK(d.length == 5 && d.opcode == 0x10170 && d.supported);
         }
+        {   // BMI1: VEX.NDD destination comes from inverted vvvv, not ModRM.reg.
+            // Actual boot encoding: c4 e2 f0 f3 ca = blsr rcx, rdx.
+            Machine m{0xC4, 0xE2, 0xF0, 0xF3, 0xCA, 0xC3};
+            m.cpu.state.gpr[2] = 0x8000000000000010ULL;
+            m.cpu.state.gpr[1] = 0xDEAD;
+            m.cpu.state.rflags |= FLAG_OF | FLAG_CF | FLAG_ZF;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[1] == 0x8000000000000000ULL);
+            CHECK(m.cpu.state.gpr[2] == 0x8000000000000010ULL);
+            CHECK((m.cpu.state.rflags & (FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF)) == FLAG_SF);
+            const std::uint8_t b[] = {0xC4, 0xE2, 0xF0, 0xF3, 0xCA};
+            CHECK(decode_x86(b, sizeof(b)).length == 5);
+            CHECK(decode_x86(b, sizeof(b)).supported);
+        }
+        {   // BLSR 32 zeroes high half, sets CF and ZF on source zero.
+            Machine m{0xC4, 0xE2, 0x78, 0xF3, 0xC9, 0xC3};
+            m.cpu.state.gpr[1] = 0;
+            m.cpu.state.gpr[0] = ~0ULL;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[0] == 0);
+            CHECK((m.cpu.state.rflags & (FLAG_CF | FLAG_ZF | FLAG_SF | FLAG_OF)) == (FLAG_CF | FLAG_ZF));
+        }
+        {   // BLSMSK 64 via memory and extended destination r9.
+            Machine m{0xC4, 0xE2, 0xB0, 0xF3, 0x17, 0xC3};
+            m.cpu.state.gpr[7] = DATA;
+            const std::uint64_t v = 0x100;
+            CHECK(m.mem.store(DATA, &v, 8) == MemoryError::ok);
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[9] == 0x1FF);
+            CHECK((m.cpu.state.rflags & (FLAG_CF | FLAG_ZF | FLAG_SF | FLAG_OF)) == 0);
+        }
+        {   // VEX.X e VEX.B em SIB: [r8 + r9*2 + 8], destino r11.
+            Machine m{0xC4, 0x02, 0xA0, 0xF3, 0x4C, 0x48, 8, 0xC3};
+            m.cpu.state.gpr[8] = DATA;
+            m.cpu.state.gpr[9] = 4;
+            const std::uint64_t v = 0x8000000000000010ULL;
+            CHECK(m.mem.store(DATA + 16, &v, 8) == MemoryError::ok);
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[11] == 0x8000000000000000ULL);
+        }
+        {   // BLSMSK zero -> all bits one, CF and SF set, ZF always clear.
+            Machine m{0xC4, 0xE2, 0x78, 0xF3, 0xD1, 0xC3};
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[0] == 0xFFFFFFFFULL);
+            CHECK((m.cpu.state.rflags & (FLAG_CF | FLAG_ZF | FLAG_SF | FLAG_OF)) == (FLAG_CF | FLAG_SF));
+        }
+        {   // BLSI 32 via VEX.B extended r10 source: CF set for nonzero, SF at bit 31.
+            Machine m{0xC4, 0xC2, 0x78, 0xF3, 0xDA, 0xC3};
+            m.cpu.state.gpr[10] = 0x80000000ULL;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[0] == 0x80000000ULL);
+            CHECK((m.cpu.state.rflags & (FLAG_CF | FLAG_ZF | FLAG_SF | FLAG_OF)) == (FLAG_CF | FLAG_SF));
+        }
+        {   // BLSI zero: CF clear, ZF set.
+            Machine m{0xC4, 0xE2, 0xF0, 0xF3, 0xDA, 0xC3};
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[1] == 0);
+            CHECK((m.cpu.state.rflags & (FLAG_CF | FLAG_ZF | FLAG_SF | FLAG_OF)) == FLAG_ZF);
+        }
+        {   // Unrecognized opcode extensions, mandatory prefix and VEX.L must not silently execute.
+            for (auto bytes : {std::initializer_list<std::uint8_t>{0xC4, 0xE2, 0x78, 0xF3, 0xC0},
+                               {0xC4, 0xE2, 0x79, 0xF3, 0xC9},
+                               {0xC4, 0xE2, 0x7C, 0xF3, 0xC9},
+                               {0xC4, 0xE1, 0x78, 0xF3, 0xC9},
+                               {0x48, 0xC4, 0xE2, 0x78, 0xF3, 0xC9}}) {
+                Machine m(bytes);
+                CHECK(m.run().stop == CpuStop::unsupported_opcode);
+            }
+        }
+        {   // Truncated VEX prefix and memory displacement report fetch fault, not success.
+            Machine m{0xC4, 0xE2, 0xF0, 0xF3, 0x8A};
+            const std::uint8_t b[] = {0xC4, 0xE2, 0xF0, 0xF3, 0x8A};
+            CHECK(decode_x86(b, sizeof(b)).length == 0);
+            // The mapped code page is padded with zeroes; use a RIP at its last five bytes.
+            CHECK(m.mem.store(CODE + 0x1000 - sizeof(b), b, sizeof(b)) == MemoryError::ok);
+            m.cpu.state.rip = CODE + 0x1000 - sizeof(b);
+            CHECK(m.run().stop == CpuStop::memory_fault);
+        }
         {   // ud2
             Machine m{0x0F, 0x0B};
             CHECK(m.run().stop == CpuStop::undefined);
