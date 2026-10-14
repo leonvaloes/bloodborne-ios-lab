@@ -3,12 +3,14 @@
 
 #include "audio_out.h"
 #include "guest_memory.h"
+#include "atrac9_decoder.h"
 #include <cstdint>
 #include <cstddef>
 #include <memory>
 #include <mutex>
 #include <vector>
 #include <unordered_map>
+#include <array>
 
 namespace bb {
 
@@ -20,6 +22,10 @@ constexpr std::uint32_t SCE_NGS2_MAX_VOICES_PER_RACK = 64;
 constexpr std::size_t   SCE_NGS2_MAX_RACKS           = 16;
 constexpr std::uint32_t SCE_NGS2_DEFAULT_SAMPLE_RATE = 48000;
 constexpr std::uint32_t SCE_NGS2_MAX_BLOCK_SIZE      = 4096;
+
+constexpr std::size_t   SCE_NGS2_MAX_ATRAC9_STREAM_SIZE  = 16 * 1024 * 1024; // 16 MB por stream
+constexpr std::size_t   SCE_NGS2_MAX_ATRAC9_TOTAL_MEMORY = 64 * 1024 * 1024; // 64 MB limite global
+constexpr std::uint32_t SCE_NGS2_MAX_ATRAC9_DECODERS     = 64;               // Instâncias concorrentes limitadas
 
 // Códigos de erro PS4 SCE NGS2
 constexpr std::int32_t SCE_NGS2_OK                         = 0;
@@ -71,6 +77,7 @@ struct SceNgs2VoiceInfo {
     float max_distance{100.0f};
     float rolloff{1.0f};
     std::uint64_t frames_rendered{0};
+    bool is_atrac9{false};
 };
 
 // Informações de status de um Rack
@@ -154,6 +161,19 @@ public:
     std::int32_t voice_set_synthetic(SceNgs2RackHandle rack_handle, std::uint32_t voice_index,
                                      float freq_hz, float amplitude = 1.0f, bool loop = true);
 
+    // Controle de repetição e looping
+    std::int32_t voice_set_loop(SceNgs2RackHandle rack_handle, std::uint32_t voice_index, bool loop);
+    std::int32_t voice_get_loop(SceNgs2RackHandle rack_handle, std::uint32_t voice_index, bool *out_loop) const;
+
+    // Configuração de stream compactado Sony ATRAC9
+    std::int32_t voice_set_atrac9_buffer(SceNgs2RackHandle rack_handle, std::uint32_t voice_index,
+                                         const std::uint8_t *atrac9_stream, std::size_t stream_size,
+                                         const std::uint8_t config_data[4], bool loop = false);
+    std::int32_t voice_set_atrac9_buffer_hle(SceNgs2RackHandle rack_handle, std::uint32_t voice_index,
+                                             const GuestMemory &mem, std::uint64_t guest_addr,
+                                             std::size_t stream_size, const std::uint8_t config_data[4],
+                                             bool loop = false);
+
     // Síntese e Renderização do Rack
     // Processa vozes ativas, modula volume, pitch e pan, e submete o PCM resultante à porta AudioOut
     std::int32_t render_rack(SceNgs2RackHandle rack_handle,
@@ -167,7 +187,8 @@ private:
     enum class VoiceSourceType {
         None,
         SyntheticSine,
-        PcmBuffer
+        PcmBuffer,
+        Atrac9Stream
     };
 
     struct Voice {
@@ -195,6 +216,15 @@ private:
         float synthetic_amplitude{1.0f};
         double synthetic_phase{0.0};
 
+        // Estado do stream Sony ATRAC9
+        std::vector<std::uint8_t> atrac9_stream_data;
+        std::array<std::uint8_t, 4> atrac9_config{0, 0, 0, 0};
+        std::size_t atrac9_byte_offset{0};
+        std::unique_ptr<Atrac9Decoder> atrac9_decoder;
+        std::vector<float> atrac9_decoded_pcm; // buffer de amostras estéreo decodificadas a 48kHz
+        std::size_t atrac9_pcm_read_pos{0};
+        double atrac9_playback_frac{0.0};
+
         std::uint64_t frames_rendered{0};
     };
 
@@ -209,9 +239,16 @@ private:
 
     std::shared_ptr<Rack> get_rack(SceNgs2RackHandle handle) const;
 
+    std::unique_ptr<Atrac9Decoder> acquire_atrac9_decoder();
+    void release_atrac9_decoder(std::unique_ptr<Atrac9Decoder> decoder);
+    void free_voice_atrac9_resources(Voice &v);
+
     mutable std::mutex manager_mutex_;
     std::unordered_map<SceNgs2RackHandle, std::shared_ptr<Rack>> racks_;
     SceNgs2RackHandle next_rack_handle_{1};
+    std::size_t total_atrac9_memory_{0};
+    std::uint32_t active_atrac9_decoders_count_{0};
+    std::vector<std::unique_ptr<Atrac9Decoder>> atrac9_decoder_pool_;
 };
 
 // ============================================================================
@@ -283,6 +320,38 @@ std::int32_t sceNgs2VoiceSetSyntheticWaveform(SceNgs2RackHandle rackHandle, std:
                                               float freqHz, float amplitude = 1.0f, bool loop = true);
 std::int32_t sceNgs2VoiceSetSyntheticWaveform(SceNgs2VoiceHandle voiceHandle,
                                               float freqHz, float amplitude = 1.0f, bool loop = true);
+
+// Controle de repetição e looping
+std::int32_t sceNgs2VoiceSetLoop(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex, bool loop);
+std::int32_t sceNgs2VoiceSetLoop(SceNgs2VoiceHandle voiceHandle, bool loop);
+std::int32_t sceNgs2VoiceGetLoop(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex, bool *outLoop);
+std::int32_t sceNgs2VoiceGetLoop(SceNgs2VoiceHandle voiceHandle, bool *outLoop);
+
+// Suporte nativo ao formato ATRAC9
+std::int32_t sceNgs2VoiceSetAtrac9Buffer(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex,
+                                        const std::uint8_t *atrac9_stream, std::size_t stream_size,
+                                        const std::uint8_t config_data[4], bool loop = false);
+std::int32_t sceNgs2VoiceSetAtrac9Buffer(SceNgs2VoiceHandle voiceHandle,
+                                        const std::uint8_t *atrac9_stream, std::size_t stream_size,
+                                        const std::uint8_t config_data[4], bool loop = false);
+
+std::int32_t sceNgs2VoiceSetAtrac9Buffer(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex,
+                                        const GuestMemory &mem, std::uint64_t guest_addr,
+                                        std::size_t stream_size, const std::uint8_t config_data[4],
+                                        bool loop = false);
+std::int32_t sceNgs2VoiceSetAtrac9Buffer(SceNgs2VoiceHandle voiceHandle,
+                                        const GuestMemory &mem, std::uint64_t guest_addr,
+                                        std::size_t stream_size, const std::uint8_t config_data[4],
+                                        bool loop = false);
+
+std::int32_t sceNgs2VoiceSetAtrac9BufferHle(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex,
+                                           const GuestMemory &mem, std::uint64_t guest_addr,
+                                           std::size_t stream_size, const std::uint8_t config_data[4],
+                                           bool loop = false);
+std::int32_t sceNgs2VoiceSetAtrac9BufferHle(SceNgs2VoiceHandle voiceHandle,
+                                           const GuestMemory &mem, std::uint64_t guest_addr,
+                                           std::size_t stream_size, const std::uint8_t config_data[4],
+                                           bool loop = false);
 
 std::int32_t sceNgs2RackRender(SceNgs2RackHandle rackHandle);
 std::int32_t sceNgs2RackRender(SceNgs2RackHandle rackHandle, std::int32_t audioOutPort);

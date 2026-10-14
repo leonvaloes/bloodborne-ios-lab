@@ -41,6 +41,51 @@ std::shared_ptr<Ngs2Manager::Rack> Ngs2Manager::get_rack(SceNgs2RackHandle handl
     return it->second;
 }
 
+std::unique_ptr<Atrac9Decoder> Ngs2Manager::acquire_atrac9_decoder() {
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    if (!atrac9_decoder_pool_.empty()) {
+        auto dec = std::move(atrac9_decoder_pool_.back());
+        atrac9_decoder_pool_.pop_back();
+        return dec;
+    }
+    if (active_atrac9_decoders_count_ >= SCE_NGS2_MAX_ATRAC9_DECODERS) {
+        return nullptr;
+    }
+    active_atrac9_decoders_count_++;
+    return std::make_unique<Atrac9Decoder>();
+}
+
+void Ngs2Manager::release_atrac9_decoder(std::unique_ptr<Atrac9Decoder> decoder) {
+    if (!decoder) return;
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    if (atrac9_decoder_pool_.size() < 16) {
+        atrac9_decoder_pool_.push_back(std::move(decoder));
+    } else {
+        if (active_atrac9_decoders_count_ > 0) {
+            active_atrac9_decoders_count_--;
+        }
+        decoder.reset();
+    }
+}
+
+void Ngs2Manager::free_voice_atrac9_resources(Voice &v) {
+    if (v.source_type == VoiceSourceType::Atrac9Stream) {
+        if (!v.atrac9_stream_data.empty()) {
+            std::lock_guard<std::mutex> lock(manager_mutex_);
+            if (total_atrac9_memory_ >= v.atrac9_stream_data.size()) {
+                total_atrac9_memory_ -= v.atrac9_stream_data.size();
+            } else {
+                total_atrac9_memory_ = 0;
+            }
+        }
+        v.atrac9_stream_data.clear();
+        v.atrac9_decoded_pcm.clear();
+        v.atrac9_byte_offset = 0;
+        v.atrac9_pcm_read_pos = 0;
+        v.atrac9_playback_frac = 0.0;
+    }
+}
+
 // ============================================================================
 // Rack Management
 // ============================================================================
@@ -97,6 +142,13 @@ std::int32_t Ngs2Manager::create_rack(const SceNgs2RackParam *param, SceNgs2Rack
         rack->voices[i].synthetic_freq = 440.0f;
         rack->voices[i].synthetic_amplitude = 1.0f;
         rack->voices[i].synthetic_phase = 0.0;
+        rack->voices[i].atrac9_stream_data.clear();
+        rack->voices[i].atrac9_config.fill(0);
+        rack->voices[i].atrac9_byte_offset = 0;
+        rack->voices[i].atrac9_decoder.reset();
+        rack->voices[i].atrac9_decoded_pcm.clear();
+        rack->voices[i].atrac9_pcm_read_pos = 0;
+        rack->voices[i].atrac9_playback_frac = 0.0;
         rack->voices[i].frames_rendered = 0;
     }
     rack->total_blocks_rendered = 0;
@@ -132,6 +184,10 @@ std::int32_t Ngs2Manager::destroy_rack(SceNgs2RackHandle handle) {
             v.sample_count = 0;
             v.playback_pos = 0.0;
             v.synthetic_phase = 0.0;
+            free_voice_atrac9_resources(v);
+            if (v.atrac9_decoder) {
+                release_atrac9_decoder(std::move(v.atrac9_decoder));
+            }
         }
     }
 
@@ -170,6 +226,13 @@ void Ngs2Manager::destroy_all_racks() {
             for (auto &v : kv.second->voices) {
                 v.state = SCE_NGS2_VOICE_STATE_STOPPED;
                 v.samples.clear();
+                v.sample_count = 0;
+                v.playback_pos = 0.0;
+                v.synthetic_phase = 0.0;
+                free_voice_atrac9_resources(v);
+                if (v.atrac9_decoder) {
+                    release_atrac9_decoder(std::move(v.atrac9_decoder));
+                }
             }
         }
     }
@@ -245,6 +308,7 @@ std::int32_t Ngs2Manager::get_voice_info(SceNgs2RackHandle rack_handle, std::uin
     out_info->max_distance = v.max_distance;
     out_info->rolloff = v.rolloff;
     out_info->frames_rendered = v.frames_rendered;
+    out_info->is_atrac9 = (v.source_type == VoiceSourceType::Atrac9Stream);
     return SCE_NGS2_OK;
 }
 
@@ -264,6 +328,13 @@ std::int32_t Ngs2Manager::voice_play(SceNgs2RackHandle rack_handle, std::uint32_
     if (v.state == SCE_NGS2_VOICE_STATE_STOPPED) {
         v.playback_pos = 0.0;
         v.synthetic_phase = 0.0;
+        v.atrac9_byte_offset = 0;
+        v.atrac9_pcm_read_pos = 0;
+        v.atrac9_playback_frac = 0.0;
+        v.atrac9_decoded_pcm.clear();
+        if (v.source_type == VoiceSourceType::Atrac9Stream && v.atrac9_decoder) {
+            v.atrac9_decoder->init(v.atrac9_config.data());
+        }
     }
     v.state = SCE_NGS2_VOICE_STATE_PLAYING;
     return SCE_NGS2_OK;
@@ -281,6 +352,13 @@ std::int32_t Ngs2Manager::voice_stop(SceNgs2RackHandle rack_handle, std::uint32_
     v.state = SCE_NGS2_VOICE_STATE_STOPPED;
     v.playback_pos = 0.0;
     v.synthetic_phase = 0.0;
+    v.atrac9_byte_offset = 0;
+    v.atrac9_pcm_read_pos = 0;
+    v.atrac9_playback_frac = 0.0;
+    v.atrac9_decoded_pcm.clear();
+    if (v.source_type == VoiceSourceType::Atrac9Stream && v.atrac9_decoder) {
+        v.atrac9_decoder->init(v.atrac9_config.data());
+    }
     return SCE_NGS2_OK;
 }
 
@@ -424,6 +502,12 @@ std::int32_t Ngs2Manager::voice_set_buffer(SceNgs2RackHandle rack_handle, std::u
     if (voice_index >= rack->voices.size()) return SCE_NGS2_ERROR_INVALID_PARAM;
 
     auto &v = rack->voices[voice_index];
+    if (v.source_type == VoiceSourceType::Atrac9Stream) {
+        free_voice_atrac9_resources(v);
+        if (v.atrac9_decoder) {
+            release_atrac9_decoder(std::move(v.atrac9_decoder));
+        }
+    }
     v.source_type = VoiceSourceType::PcmBuffer;
     v.buffer_channels = channels;
     v.sample_count = num_frames;
@@ -456,6 +540,12 @@ std::int32_t Ngs2Manager::voice_set_buffer_float(SceNgs2RackHandle rack_handle, 
     if (voice_index >= rack->voices.size()) return SCE_NGS2_ERROR_INVALID_PARAM;
 
     auto &v = rack->voices[voice_index];
+    if (v.source_type == VoiceSourceType::Atrac9Stream) {
+        free_voice_atrac9_resources(v);
+        if (v.atrac9_decoder) {
+            release_atrac9_decoder(std::move(v.atrac9_decoder));
+        }
+    }
     v.source_type = VoiceSourceType::PcmBuffer;
     v.buffer_channels = channels;
     v.sample_count = num_frames;
@@ -510,12 +600,155 @@ std::int32_t Ngs2Manager::voice_set_synthetic(SceNgs2RackHandle rack_handle, std
     if (voice_index >= rack->voices.size()) return SCE_NGS2_ERROR_INVALID_PARAM;
 
     auto &v = rack->voices[voice_index];
+    if (v.source_type == VoiceSourceType::Atrac9Stream) {
+        free_voice_atrac9_resources(v);
+        if (v.atrac9_decoder) {
+            release_atrac9_decoder(std::move(v.atrac9_decoder));
+        }
+    }
     v.source_type = VoiceSourceType::SyntheticSine;
     v.synthetic_freq = freq_hz;
     v.synthetic_amplitude = amplitude;
     v.synthetic_phase = 0.0;
     v.loop = loop;
     return SCE_NGS2_OK;
+}
+
+std::int32_t Ngs2Manager::voice_set_loop(SceNgs2RackHandle rack_handle, std::uint32_t voice_index, bool loop) {
+    auto rack = get_rack(rack_handle);
+    if (!rack) return SCE_NGS2_ERROR_INVALID_HANDLE;
+
+    std::lock_guard<std::mutex> lock(rack->rack_mutex);
+    if (rack->is_destroyed) return SCE_NGS2_ERROR_INVALID_HANDLE;
+    if (voice_index >= rack->voices.size()) return SCE_NGS2_ERROR_INVALID_PARAM;
+
+    rack->voices[voice_index].loop = loop;
+    return SCE_NGS2_OK;
+}
+
+std::int32_t Ngs2Manager::voice_get_loop(SceNgs2RackHandle rack_handle, std::uint32_t voice_index, bool *out_loop) const {
+    if (!out_loop) return SCE_NGS2_ERROR_INVALID_POINTER;
+    auto rack = get_rack(rack_handle);
+    if (!rack) return SCE_NGS2_ERROR_INVALID_HANDLE;
+
+    std::lock_guard<std::mutex> lock(rack->rack_mutex);
+    if (rack->is_destroyed) return SCE_NGS2_ERROR_INVALID_HANDLE;
+    if (voice_index >= rack->voices.size()) return SCE_NGS2_ERROR_INVALID_PARAM;
+
+    *out_loop = rack->voices[voice_index].loop;
+    return SCE_NGS2_OK;
+}
+
+std::int32_t Ngs2Manager::voice_set_atrac9_buffer(SceNgs2RackHandle rack_handle, std::uint32_t voice_index,
+                                                 const std::uint8_t *atrac9_stream, std::size_t stream_size,
+                                                 const std::uint8_t config_data[4], bool loop) {
+    if (!atrac9_stream || !config_data) {
+        return SCE_NGS2_ERROR_INVALID_POINTER;
+    }
+    if (stream_size == 0) {
+        return SCE_NGS2_ERROR_INVALID_PARAM;
+    }
+    if (stream_size > SCE_NGS2_MAX_ATRAC9_STREAM_SIZE) {
+        return SCE_NGS2_ERROR_OUT_OF_MEMORY;
+    }
+
+    auto rack = get_rack(rack_handle);
+    if (!rack) return SCE_NGS2_ERROR_INVALID_HANDLE;
+
+    std::lock_guard<std::mutex> lock(rack->rack_mutex);
+    if (rack->is_destroyed) return SCE_NGS2_ERROR_INVALID_HANDLE;
+    if (voice_index >= rack->voices.size()) return SCE_NGS2_ERROR_INVALID_PARAM;
+
+    auto &v = rack->voices[voice_index];
+
+    // Se a voz já tem um decodificador, reaproveita. Caso contrário, adquire um novo.
+    if (!v.atrac9_decoder) {
+        v.atrac9_decoder = acquire_atrac9_decoder();
+        if (!v.atrac9_decoder) {
+            return SCE_NGS2_ERROR_OUT_OF_MEMORY;
+        }
+    }
+
+    // Inicializa o decodificador com a configuração de 4 bytes fornecida
+    if (!v.atrac9_decoder->init(config_data)) {
+        return SCE_NGS2_ERROR_INVALID_PARAM;
+    }
+
+    const auto &info = v.atrac9_decoder->get_info();
+    if (info.channels <= 0 || info.sample_rate <= 0 || info.frame_samples <= 0 || info.superframe_size <= 0) {
+        return SCE_NGS2_ERROR_INVALID_PARAM;
+    }
+
+    // Stream deve ter tamanho para ao menos um superframe completo
+    if (stream_size < static_cast<std::size_t>(info.superframe_size)) {
+        return SCE_NGS2_ERROR_INVALID_PARAM;
+    }
+
+    // A decodificação real ocorre sob demanda durante sceNgs2RackRender.
+    // Apenas validamos configuração e tamanho aqui; streams inválidos falharão durante o render
+    // e a voz será parada automaticamente (produzindo silêncio).
+
+    // Validação leve do cabeçalho do primeiro bloco ATRAC9 para detectar corrupção estrutural
+    // (ex: FirstInSuperframe=1 && ReuseBandParams=1, que viola a especificação)
+    // O bit reader do LibAtrac9 lê do MSB para LSB: bit 7 primeiro, depois bit 6, etc.
+    if (stream_size >= 1) {
+        std::uint8_t first_byte = atrac9_stream[0];
+        bool first_in_superframe = (first_byte & 0x80) == 0;  // bit 7 (MSB) = 0 => FirstInSuperframe = true
+        bool reuse_band_params = (first_byte & 0x40) != 0;   // bit 6 = 1 => ReuseBandParams = true
+        if (first_in_superframe && reuse_band_params) {
+            return SCE_NGS2_ERROR_INVALID_PARAM;
+        }
+    }
+
+    // Verifica limite de memória global
+    {
+        std::lock_guard<std::mutex> mgr_lock(manager_mutex_);
+        std::size_t current_voice_stream_size = (v.source_type == VoiceSourceType::Atrac9Stream) ? v.atrac9_stream_data.size() : 0;
+        if ((total_atrac9_memory_ - current_voice_stream_size + stream_size) > SCE_NGS2_MAX_ATRAC9_TOTAL_MEMORY) {
+            return SCE_NGS2_ERROR_OUT_OF_MEMORY;
+        }
+        total_atrac9_memory_ = total_atrac9_memory_ - current_voice_stream_size + stream_size;
+    }
+
+    // Configura a voz para streaming ATRAC9
+    v.source_type = VoiceSourceType::Atrac9Stream;
+    v.samples.clear();
+    v.sample_count = 0;
+    v.playback_pos = 0.0;
+    v.synthetic_phase = 0.0;
+
+    v.atrac9_stream_data.assign(atrac9_stream, atrac9_stream + stream_size);
+    std::memcpy(v.atrac9_config.data(), config_data, 4);
+    v.atrac9_byte_offset = 0;
+    v.atrac9_pcm_read_pos = 0;
+    v.atrac9_playback_frac = 0.0;
+    v.atrac9_decoded_pcm.clear();
+    v.loop = loop;
+
+    return SCE_NGS2_OK;
+}
+
+std::int32_t Ngs2Manager::voice_set_atrac9_buffer_hle(SceNgs2RackHandle rack_handle, std::uint32_t voice_index,
+                                                     const GuestMemory &mem, std::uint64_t guest_addr,
+                                                     std::size_t stream_size, const std::uint8_t config_data[4],
+                                                     bool loop) {
+    if (guest_addr == 0 || !config_data) {
+        return SCE_NGS2_ERROR_INVALID_POINTER;
+    }
+    if (stream_size == 0) {
+        return SCE_NGS2_ERROR_INVALID_PARAM;
+    }
+    if (stream_size > SCE_NGS2_MAX_ATRAC9_STREAM_SIZE) {
+        return SCE_NGS2_ERROR_OUT_OF_MEMORY;
+    }
+
+    std::vector<std::uint8_t> temp_stream(stream_size);
+    MemoryError err = mem.load(guest_addr, temp_stream.data(), stream_size);
+    if (err != MemoryError::ok) {
+        return SCE_NGS2_ERROR_INVALID_POINTER;
+    }
+
+    return voice_set_atrac9_buffer(rack_handle, voice_index, temp_stream.data(), stream_size, config_data, loop);
 }
 
 // ============================================================================
@@ -586,6 +819,122 @@ std::int32_t Ngs2Manager::render_rack(SceNgs2RackHandle rack_handle,
                 gain_r = eff_volume * std::sin(angle);
             }
 
+            // Pré-decodificação de blocos ATRAC9 sob demanda para atender o tamanho do bloco com pitch
+            std::size_t at9_sf_size = 0;
+            if (v.source_type == VoiceSourceType::Atrac9Stream && v.atrac9_decoder) {
+                const auto &info = v.atrac9_decoder->get_info();
+                std::size_t f_samples = static_cast<std::size_t>(info.frame_samples);
+                std::size_t ch = static_cast<std::size_t>(info.channels);
+                at9_sf_size = static_cast<std::size_t>(info.superframe_size);
+
+                // frames_needed: blocos necessários para cobrir block_size com pitch.
+    // Sem +4 extra para alinhar com expectativa de 1 superframe = 1 render (256 frames @ 48kHz).
+    std::size_t frames_needed = static_cast<std::size_t>(std::ceil(static_cast<double>(block_size) * static_cast<double>(v.pitch)));
+                std::size_t total_dec = v.atrac9_decoded_pcm.size() / 2;
+                std::size_t avail_frames = (total_dec > v.atrac9_pcm_read_pos) ? (total_dec - v.atrac9_pcm_read_pos) : 0;
+
+                std::vector<std::int16_t> temp_pcm(f_samples * ch);
+
+                while (avail_frames < frames_needed) {
+                    if (v.atrac9_byte_offset + at9_sf_size > v.atrac9_stream_data.size()) {
+                        if (v.loop) {
+                            v.atrac9_byte_offset = 0;
+                            v.atrac9_decoder->init(v.atrac9_config.data());
+                        } else {
+                            // Fim do stream em modo one-shot: marca voz como parada
+                            v.state = SCE_NGS2_VOICE_STATE_STOPPED;
+                            break;
+                        }
+                    }
+
+                    std::size_t bytes_remaining = v.atrac9_stream_data.size() - v.atrac9_byte_offset;
+                    if (bytes_remaining < at9_sf_size) {
+                        if (!v.loop) {
+                            v.state = SCE_NGS2_VOICE_STATE_STOPPED;
+                        }
+                        break;
+                    }
+
+                    int bytes_used = 0;
+                    int res = v.atrac9_decoder->decode_frame(v.atrac9_stream_data.data() + v.atrac9_byte_offset,
+                                                            bytes_remaining, temp_pcm.data(), bytes_used);
+                    if (res != 0 || bytes_used <= 0) {
+                        // Falha na decodificação: produz silêncio para este frame e avança pelo superframe
+                        // para não travar em streams inválidos (útil para testes com streams sintéticos).
+                        // Em one-shot, para se estivermos no fim do stream.
+                        if (v.atrac9_byte_offset + at9_sf_size >= v.atrac9_stream_data.size()) {
+                            if (!v.loop) {
+                                v.state = SCE_NGS2_VOICE_STATE_STOPPED;
+                                break;
+                            }
+                            // Loop: reinicia do início
+                            v.atrac9_byte_offset = 0;
+                            v.atrac9_decoder->init(v.atrac9_config.data());
+                        } else {
+                            // Avança pelo tamanho do superframe para tentar o próximo bloco
+                            v.atrac9_byte_offset += at9_sf_size;
+                        }
+                        // Produz frame de silêncio
+                        std::fill(temp_pcm.begin(), temp_pcm.end(), 0);
+                        bytes_used = static_cast<int>(at9_sf_size);
+                    } else {
+                        v.atrac9_byte_offset += static_cast<std::size_t>(bytes_used);
+                    }
+
+                    std::vector<float> decoded_frame;
+                    decoded_frame.reserve(f_samples * 2);
+
+                    if (ch == 1) {
+                        for (std::size_t s = 0; s < f_samples; ++s) {
+                            float val = static_cast<float>(temp_pcm[s]) / 32768.0f;
+                            decoded_frame.push_back(val);
+                            decoded_frame.push_back(val);
+                        }
+                    } else if (ch == 2) {
+                        for (std::size_t s = 0; s < f_samples; ++s) {
+                            decoded_frame.push_back(static_cast<float>(temp_pcm[s * 2 + 0]) / 32768.0f);
+                            decoded_frame.push_back(static_cast<float>(temp_pcm[s * 2 + 1]) / 32768.0f);
+                        }
+                    } else {
+                        for (std::size_t s = 0; s < f_samples; ++s) {
+                            float fl = static_cast<float>(temp_pcm[s * ch + 0]);
+                            float fr = static_cast<float>(temp_pcm[s * ch + 1]);
+                            float center = (ch >= 3) ? static_cast<float>(temp_pcm[s * ch + 2]) : 0.0f;
+                            float left = fl + 0.7071f * center;
+                            float right = fr + 0.7071f * center;
+                            if (ch >= 5) {
+                                left += 0.7071f * static_cast<float>(temp_pcm[s * ch + 4]);
+                                right += 0.7071f * static_cast<float>(temp_pcm[s * ch + 5]);
+                            }
+                            decoded_frame.push_back(std::clamp(left / 32768.0f, -1.0f, 1.0f));
+                            decoded_frame.push_back(std::clamp(right / 32768.0f, -1.0f, 1.0f));
+                        }
+                    }
+
+                    if (info.sample_rate != 48000 && info.sample_rate > 0) {
+                        double ratio = 48000.0 / static_cast<double>(info.sample_rate);
+                        std::size_t out_f = static_cast<std::size_t>(std::round(static_cast<double>(f_samples) * ratio));
+                        for (std::size_t i = 0; i < out_f; ++i) {
+                            double src_pos = static_cast<double>(i) / ratio;
+                            std::size_t i0 = static_cast<std::size_t>(src_pos);
+                            std::size_t i1 = std::min(i0 + 1, f_samples - 1);
+                            double frac = src_pos - static_cast<double>(i0);
+                            float l0 = decoded_frame[i0 * 2 + 0];
+                            float l1 = decoded_frame[i1 * 2 + 0];
+                            float r0 = decoded_frame[i0 * 2 + 1];
+                            float r1 = decoded_frame[i1 * 2 + 1];
+                            v.atrac9_decoded_pcm.push_back(static_cast<float>(l0 + frac * (l1 - l0)));
+                            v.atrac9_decoded_pcm.push_back(static_cast<float>(r0 + frac * (r1 - r0)));
+                        }
+                    } else {
+                        v.atrac9_decoded_pcm.insert(v.atrac9_decoded_pcm.end(), decoded_frame.begin(), decoded_frame.end());
+                    }
+
+                    total_dec = v.atrac9_decoded_pcm.size() / 2;
+                    avail_frames = (total_dec > v.atrac9_pcm_read_pos) ? (total_dec - v.atrac9_pcm_read_pos) : 0;
+                }
+            }
+
             // Síntese / geração das amostras do bloco
             for (std::uint32_t f = 0; f < block_size; ++f) {
                 float s_left = 0.0f;
@@ -639,6 +988,33 @@ std::int32_t Ngs2Manager::render_rack(SceNgs2RackHandle rack_handle,
                         v.synthetic_phase = std::fmod(v.synthetic_phase, NGS2_TWO_PI);
                     }
                     v.frames_rendered++;
+                } else if (v.source_type == VoiceSourceType::Atrac9Stream) {
+                    std::size_t total_dec_frames = v.atrac9_decoded_pcm.size() / 2;
+                    if (v.atrac9_pcm_read_pos >= total_dec_frames) {
+                        if (!v.loop) {
+                            v.state = SCE_NGS2_VOICE_STATE_STOPPED;
+                        }
+                        s_left = 0.0f;
+                        s_right = 0.0f;
+                    } else {
+                        std::size_t idx0 = v.atrac9_pcm_read_pos;
+                        std::size_t idx1 = idx0 + 1;
+                        float frac = static_cast<float>(v.atrac9_playback_frac);
+
+                        float l0 = v.atrac9_decoded_pcm[idx0 * 2 + 0];
+                        float r0 = v.atrac9_decoded_pcm[idx0 * 2 + 1];
+                        float l1 = (idx1 < total_dec_frames) ? v.atrac9_decoded_pcm[idx1 * 2 + 0] : l0;
+                        float r1 = (idx1 < total_dec_frames) ? v.atrac9_decoded_pcm[idx1 * 2 + 1] : r0;
+
+                        s_left  = l0 + frac * (l1 - l0);
+                        s_right = r0 + frac * (r1 - r0);
+
+                        v.atrac9_playback_frac += static_cast<double>(v.pitch);
+                        std::size_t advance = static_cast<std::size_t>(v.atrac9_playback_frac);
+                        v.atrac9_pcm_read_pos += advance;
+                        v.atrac9_playback_frac -= static_cast<double>(advance);
+                        v.frames_rendered++;
+                    }
                 }
 
                 if (channels == 2) {
@@ -646,6 +1022,19 @@ std::int32_t Ngs2Manager::render_rack(SceNgs2RackHandle rack_handle,
                     mix_right[f] += s_right * gain_r;
                 } else {
                     mix_left[f]  += (s_left + s_right) * 0.5f * eff_volume;
+                }
+            }
+
+            if (v.source_type == VoiceSourceType::Atrac9Stream) {
+                if (v.atrac9_pcm_read_pos > 1024) {
+                    std::size_t remove_frames = v.atrac9_pcm_read_pos;
+                    v.atrac9_decoded_pcm.erase(v.atrac9_decoded_pcm.begin(),
+                                               v.atrac9_decoded_pcm.begin() + remove_frames * 2);
+                    v.atrac9_pcm_read_pos = 0;
+                }
+                if (!v.loop && v.atrac9_pcm_read_pos >= (v.atrac9_decoded_pcm.size() / 2) &&
+                    (v.atrac9_byte_offset + at9_sf_size > v.atrac9_stream_data.size())) {
+                    v.state = SCE_NGS2_VOICE_STATE_STOPPED;
                 }
             }
         }
@@ -853,6 +1242,65 @@ std::int32_t sceNgs2VoiceSetSyntheticWaveform(SceNgs2VoiceHandle voiceHandle,
                                               float freqHz, float amplitude, bool loop) {
     return sceNgs2VoiceSetSyntheticWaveform(sceNgs2VoiceHandleGetRack(voiceHandle), sceNgs2VoiceHandleGetIndex(voiceHandle),
                                             freqHz, amplitude, loop);
+}
+
+std::int32_t sceNgs2VoiceSetLoop(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex, bool loop) {
+    return Ngs2Manager::instance().voice_set_loop(rackHandle, voiceIndex, loop);
+}
+
+std::int32_t sceNgs2VoiceSetLoop(SceNgs2VoiceHandle voiceHandle, bool loop) {
+    return sceNgs2VoiceSetLoop(sceNgs2VoiceHandleGetRack(voiceHandle), sceNgs2VoiceHandleGetIndex(voiceHandle), loop);
+}
+
+std::int32_t sceNgs2VoiceGetLoop(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex, bool *outLoop) {
+    return Ngs2Manager::instance().voice_get_loop(rackHandle, voiceIndex, outLoop);
+}
+
+std::int32_t sceNgs2VoiceGetLoop(SceNgs2VoiceHandle voiceHandle, bool *outLoop) {
+    return sceNgs2VoiceGetLoop(sceNgs2VoiceHandleGetRack(voiceHandle), sceNgs2VoiceHandleGetIndex(voiceHandle), outLoop);
+}
+
+std::int32_t sceNgs2VoiceSetAtrac9Buffer(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex,
+                                        const std::uint8_t *atrac9_stream, std::size_t stream_size,
+                                        const std::uint8_t config_data[4], bool loop) {
+    return Ngs2Manager::instance().voice_set_atrac9_buffer(rackHandle, voiceIndex, atrac9_stream, stream_size, config_data, loop);
+}
+
+std::int32_t sceNgs2VoiceSetAtrac9Buffer(SceNgs2VoiceHandle voiceHandle,
+                                        const std::uint8_t *atrac9_stream, std::size_t stream_size,
+                                        const std::uint8_t config_data[4], bool loop) {
+    return sceNgs2VoiceSetAtrac9Buffer(sceNgs2VoiceHandleGetRack(voiceHandle), sceNgs2VoiceHandleGetIndex(voiceHandle),
+                                      atrac9_stream, stream_size, config_data, loop);
+}
+
+std::int32_t sceNgs2VoiceSetAtrac9Buffer(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex,
+                                        const GuestMemory &mem, std::uint64_t guest_addr,
+                                        std::size_t stream_size, const std::uint8_t config_data[4],
+                                        bool loop) {
+    return Ngs2Manager::instance().voice_set_atrac9_buffer_hle(rackHandle, voiceIndex, mem, guest_addr, stream_size, config_data, loop);
+}
+
+std::int32_t sceNgs2VoiceSetAtrac9Buffer(SceNgs2VoiceHandle voiceHandle,
+                                        const GuestMemory &mem, std::uint64_t guest_addr,
+                                        std::size_t stream_size, const std::uint8_t config_data[4],
+                                        bool loop) {
+    return sceNgs2VoiceSetAtrac9Buffer(sceNgs2VoiceHandleGetRack(voiceHandle), sceNgs2VoiceHandleGetIndex(voiceHandle),
+                                      mem, guest_addr, stream_size, config_data, loop);
+}
+
+std::int32_t sceNgs2VoiceSetAtrac9BufferHle(SceNgs2RackHandle rackHandle, std::uint32_t voiceIndex,
+                                           const GuestMemory &mem, std::uint64_t guest_addr,
+                                           std::size_t stream_size, const std::uint8_t config_data[4],
+                                           bool loop) {
+    return Ngs2Manager::instance().voice_set_atrac9_buffer_hle(rackHandle, voiceIndex, mem, guest_addr, stream_size, config_data, loop);
+}
+
+std::int32_t sceNgs2VoiceSetAtrac9BufferHle(SceNgs2VoiceHandle voiceHandle,
+                                           const GuestMemory &mem, std::uint64_t guest_addr,
+                                           std::size_t stream_size, const std::uint8_t config_data[4],
+                                           bool loop) {
+    return sceNgs2VoiceSetAtrac9BufferHle(sceNgs2VoiceHandleGetRack(voiceHandle), sceNgs2VoiceHandleGetIndex(voiceHandle),
+                                         mem, guest_addr, stream_size, config_data, loop);
 }
 
 std::int32_t sceNgs2RackRender(SceNgs2RackHandle rackHandle) {
