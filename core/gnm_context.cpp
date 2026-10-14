@@ -11,6 +11,12 @@ inline float uint_as_float(std::uint32_t val) {
     std::memcpy(&f, &val, sizeof(float));
     return f;
 }
+
+inline std::uint32_t float_as_uint(float val) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &val, sizeof(std::uint32_t));
+    return u;
+}
 } // namespace
 
 GnmContext::GnmContext(const GuestMemory& memory)
@@ -655,6 +661,7 @@ bool GnmContext::read_buffer_from_table(std::uint64_t table_address, std::uint32
     out = BufferDescriptor{};
     if (table_address == 0) return false;
     constexpr std::uint64_t desc_size = 16;
+    if (slot > (UINT64_MAX - desc_size) / desc_size) return false;
     const std::uint64_t offset = static_cast<std::uint64_t>(slot) * desc_size;
     if (table_address > UINT64_MAX - offset) return false;
     return read_buffer_descriptor(table_address + offset, out);
@@ -664,6 +671,7 @@ bool GnmContext::read_texture_from_table(std::uint64_t table_address, std::uint3
     out = TextureDescriptor{};
     if (table_address == 0) return false;
     constexpr std::uint64_t desc_size = 32;
+    if (slot > (UINT64_MAX - desc_size) / desc_size) return false;
     const std::uint64_t offset = static_cast<std::uint64_t>(slot) * desc_size;
     if (table_address > UINT64_MAX - offset) return false;
     return read_texture_descriptor(table_address + offset, out);
@@ -673,6 +681,7 @@ bool GnmContext::read_sampler_from_table(std::uint64_t table_address, std::uint3
     out = SamplerDescriptor{};
     if (table_address == 0) return false;
     constexpr std::uint64_t desc_size = 16;
+    if (slot > (UINT64_MAX - desc_size) / desc_size) return false;
     const std::uint64_t offset = static_cast<std::uint64_t>(slot) * desc_size;
     if (table_address > UINT64_MAX - offset) return false;
     return read_sampler_descriptor(table_address + offset, out);
