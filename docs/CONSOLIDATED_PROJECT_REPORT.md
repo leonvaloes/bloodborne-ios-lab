@@ -21,7 +21,7 @@
 | **S6** | Pipeline gráfico Metal 3 com uniform buffers e shading dinâmico | ✅ **Concluído** | Shaders Metal com rotação dinâmica a 30 FPS, interpolação por vértice e queries de hardware Apple A17 Pro. |
 | **S7** | Parser e inspetor seguro de ELF64 e metadados SFO do jogo | ✅ **Concluído** | Extração segura de títulos e checagem de limites validada contra dump local (`param.sfo` e `eboot.elf`). |
 | **S8** | Carregamento de módulos guest, alinhamento de pilha e 1ª instrução | ✅ **Concluído** | Mapeamento `PT_LOAD` sem violação RWX, pilha de 64 KB alinhada a 16 bytes, execução com retorno `0xBB15`. |
-| **S9** | Jogabilidade, Entrada Dual, Áudio HLE, VFS Sandbox e Estabilidade | ✅ **Concluído** | 5 novos subsistemas completos: DualShock 4/GameController, VFS sandboxed, áudio 48kHz, frame pacing P50/95/99 e saves atômicos. |
+| **S9** | Jogabilidade, Entrada Dual, Áudio HLE, VFS Sandbox e Estabilidade | ✅ **Validado em Aparelho** | Executado no iPhone 15 Pro Max: 867 quadros Metal, 29.99 FPS, P50=33.34ms, P95=33.51ms, 55.9 MB RAM, 107 checks de CPU/subsistemas aprovados no aparelho. |
 
 ---
 
