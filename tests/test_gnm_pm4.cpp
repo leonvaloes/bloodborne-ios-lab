@@ -69,4 +69,6 @@ int main() { return run([] {
     CHECK(small.process(0x2000, 4) == bb::Pm4Status::limit);
     put(memory, 0x2000, {0x40000000});
     CHECK(parser.process(0x2000, 1) == bb::Pm4Status::unsupported);
+    put(memory, 0x2000, {header(0x7e, 1), 123}); // tipo 3 desconhecido nao pode passar despercebido
+    CHECK(parser.process(0x2000, 2) == bb::Pm4Status::unsupported);
 }); }

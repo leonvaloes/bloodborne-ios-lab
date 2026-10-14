@@ -92,7 +92,7 @@ Pm4Status GnmPm4::packet(std::uint32_t op, bool compute, std::uint64_t body,
     case 0x50: case 0x41: e.kind = Pm4Kind::dma_data; minimum = 6; break;
     case 0x3c: e.kind = Pm4Kind::wait_reg_mem; minimum = 6; break;
     case 0x58: e.kind = Pm4Kind::acquire_mem; minimum = 6; break;
-    default: return Pm4Status::ok; // opcode ainda não emulado; payload ignorado
+    default: return Pm4Status::unsupported; // nunca descartar um comando desconhecido silenciosamente
     }
     if (count < minimum) return Pm4Status::invalid;
     for (std::uint32_t i = 0; i < count && i < e.args.size(); ++i) e.args[i] = get(i);
