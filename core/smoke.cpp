@@ -225,7 +225,11 @@ SmokeReport smoke() {
     check(vfs.mount("/app0", ".", true));
     std::string resolved;
     bool ro = false;
-    check(vfs.resolve("/app0/file", resolved, ro) == VfsError::ok && ro);
+    auto res_err = vfs.resolve("/app0/file", resolved, ro);
+    if (res_err != VfsError::ok) {
+        std::cerr << "smoke: resolve /app0/file failed with err=" << static_cast<int>(res_err) << "\n";
+    }
+    check(res_err == VfsError::ok && ro);
 
     // S9: Audio HLE & Ring Buffer (6 checks)
     AudioRingBuffer ring(32, 2);

@@ -70,13 +70,15 @@ int main() { return run([] {
         CHECK(timeout == 0);
 
         // Multithreaded producer-consumer test with Semaphore
+        uint32_t pc_sem = 0;
+        CHECK(mgr.create_sema(&pc_sem, "prod_cons_sema", SCE_KERNEL_SEMA_ATTR_TH_FIFO, 0, 100) == ORBIS_OK);
         std::atomic<int> shared_counter{0};
         std::atomic<bool> producer_done{false};
 
         std::thread consumer([&] {
             while (!producer_done || shared_counter.load() < 50) {
                 uint32_t wait_timeout = 20000; // 20 ms
-                if (mgr.wait_sema(sem_id, 1, &wait_timeout) == ORBIS_OK) {
+                if (mgr.wait_sema(pc_sem, 1, &wait_timeout) == ORBIS_OK) {
                     shared_counter.fetch_add(1);
                 }
             }
@@ -85,7 +87,7 @@ int main() { return run([] {
         std::thread producer([&] {
             for (int i = 0; i < 50; ++i) {
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
-                CHECK(mgr.signal_sema(sem_id, 1) == ORBIS_OK);
+                CHECK(mgr.signal_sema(pc_sem, 1) == ORBIS_OK);
             }
             producer_done = true;
         });

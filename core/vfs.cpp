@@ -5,6 +5,7 @@
 #include <sstream>
 #include <algorithm>
 #include <chrono>
+#include <iostream>
 #include <cwctype>
 
 namespace bb {
@@ -149,10 +150,26 @@ VfsError VirtualFileSystem::resolve(const std::string &virtual_path, std::string
     // Resolve existing symlinks (including parent directories of a new file) so a
     // Documents mount cannot be used to access files outside its host directory.
     std::error_code ec;
-    const auto root = std::filesystem::weakly_canonical(best_point.host_path, ec);
-    if (ec) return VfsError::io_error;
-    const auto target = std::filesystem::weakly_canonical(host, ec);
-    if (ec) return VfsError::io_error;
+    const auto abs_root = std::filesystem::absolute(best_point.host_path, ec);
+    if (ec) {
+        std::cerr << "vfs: abs_root failed for '" << best_point.host_path << "': " << ec.message() << "\n";
+        return VfsError::io_error;
+    }
+    const auto abs_target = std::filesystem::absolute(host, ec);
+    if (ec) {
+        std::cerr << "vfs: abs_target failed for '" << host.string() << "': " << ec.message() << "\n";
+        return VfsError::io_error;
+    }
+    const auto root = std::filesystem::weakly_canonical(abs_root, ec);
+    if (ec) {
+        std::cerr << "vfs: weakly_canonical root failed: " << ec.message() << "\n";
+        return VfsError::io_error;
+    }
+    const auto target = std::filesystem::weakly_canonical(abs_target, ec);
+    if (ec) {
+        std::cerr << "vfs: weakly_canonical target failed: " << ec.message() << "\n";
+        return VfsError::io_error;
+    }
 
     // Windows paths are case-insensitive. Canonical existing parents can also
     // differ in case or trailing separators from user-supplied paths.
@@ -164,15 +181,20 @@ VfsError VirtualFileSystem::resolve(const std::string &virtual_path, std::string
     for (const auto &part : target) {
         if (!part.empty() && part != ".") target_parts.push_back(part);
     }
-    if (target_parts.size() < root_parts.size()) return VfsError::access_denied;
+    if (target_parts.size() < root_parts.size()) {
+        std::cerr << "vfs: target_parts.size() (" << target_parts.size() << ") < root_parts.size() (" << root_parts.size() << ")\n";
+        return VfsError::access_denied;
+    }
 
     for (std::size_t i = 0; i < root_parts.size(); ++i) {
 #ifdef _WIN32
         const auto a = root_parts[i].wstring();
         const auto b = target_parts[i].wstring();
         if (a.size() != b.size() || !std::equal(a.begin(), a.end(), b.begin(),
-            [](wchar_t x, wchar_t y) { return std::towlower(x) == std::towlower(y); }))
+            [](wchar_t x, wchar_t y) { return std::towlower(x) == std::towlower(y); })) {
+            std::cerr << "vfs: part mismatch at " << i << ": '" << root_parts[i].string() << "' vs '" << target_parts[i].string() << "'\n";
             return VfsError::access_denied;
+        }
 #else
         if (root_parts[i] != target_parts[i]) return VfsError::access_denied;
 #endif
