@@ -280,6 +280,45 @@ int main() {
             m.cpu.state.rip = CODE + 0x1000 - sizeof(b);
             CHECK(m.run().stop == CpuStop::memory_fault);
         }
+        {   // REX immediately before opcode selects SPL; legacy prefix cancels earlier REX.
+            Machine m{0x40, 0xB4, 0x12, 0x40, 0x66, 0xB4, 0x34, 0xC3};
+            m.cpu.state.gpr[4] = STACK + 0x1000 - 8;
+            CHECK(m.run(2).stop == CpuStop::step_limit);
+            CHECK((m.cpu.state.gpr[0] & 0xFF00) == 0x3400);
+            CHECK((m.cpu.state.gpr[4] & 0xFF) == 0x12);
+        }
+        {   // RIP-relative destination points beyond the trailing immediate.
+            Machine m{0xC7, 0x05, 0x10, 0, 0, 0, 0x78, 0x56, 0x34, 0x12, 0xC3};
+            CHECK(m.run().stop == CpuStop::trap);
+            std::uint32_t v = 0;
+            CHECK(m.mem.load(CODE + 10 + 0x10, &v, 4) == MemoryError::ok);
+            CHECK(v == 0x12345678);
+        }
+        {   // A REP fault leaves completed iterations committed and RIP at instruction start.
+            Machine m{0xF3, 0xAA};
+            m.cpu.state.gpr[7] = DATA + 0xFFE;
+            m.cpu.state.gpr[1] = 4;
+            m.cpu.state.gpr[0] = 0xA5;
+            const auto r = m.run();
+            CHECK(r.stop == CpuStop::memory_fault && r.rip == CODE && r.fault_address == DATA + 0x1000);
+            CHECK(m.cpu.state.gpr[1] == 2 && m.cpu.state.gpr[7] == DATA + 0x1000);
+            std::uint8_t b[2] = {};
+            CHECK(m.mem.load(DATA + 0xFFE, b, 2) == MemoryError::ok);
+            CHECK(b[0] == 0xA5 && b[1] == 0xA5);
+        }
+        {   // Signed 32-bit dividend -2^63 / -1 raises #DE without modifying operands.
+            Machine m{0xF7, 0xF9};
+            m.cpu.state.gpr[2] = 0x80000000;
+            m.cpu.state.gpr[0] = 0;
+            m.cpu.state.gpr[1] = 0xFFFFFFFF;
+            CHECK(m.run().stop == CpuStop::divide_error);
+            CHECK(m.cpu.state.gpr[0] == 0 && m.cpu.state.gpr[2] == 0x80000000);
+        }
+        {   // Fifteen prefix bytes cannot turn into an instruction by reading byte sixteen.
+            Machine m{0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+                      0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x90};
+            CHECK(m.run().stop == CpuStop::undefined);
+        }
         {   // ud2
             Machine m{0x0F, 0x0B};
             CHECK(m.run().stop == CpuStop::undefined);

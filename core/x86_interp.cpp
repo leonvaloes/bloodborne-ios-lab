@@ -83,7 +83,7 @@ struct Exec {
     Exec(CpuState& st, GuestMemory& mem) : s(st), m(mem) {}
 
     // ---- fetch ----
-    std::uint8_t u8() { if (pos >= n) throw Fault{start + pos}; return buf[pos++]; }
+    std::uint8_t u8() { if (pos >= 15) throw UdEx{}; if (pos >= n) throw Fault{start + pos}; return buf[pos++]; }
     std::uint16_t u16() { std::uint16_t a = u8(); a |= static_cast<std::uint16_t>(u8()) << 8; return a; }
     std::uint32_t u32() { std::uint32_t a = u16(); a |= static_cast<std::uint32_t>(u16()) << 16; return a; }
     std::uint64_t u64() { std::uint64_t a = u32(); a |= static_cast<std::uint64_t>(u32()) << 32; return a; }
@@ -197,7 +197,7 @@ struct Exec {
             const std::uint64_t c = (op == 3) ? carry : 0;
             const std::uint64_t t = (a - b) & msk;
             res = (t - c) & msk;
-            cf = a < b || t < c;
+            cf = a < b || (a == b && c != 0);
             of = msb_of((a ^ b) & (a ^ res), sz);
             af = ((a ^ b ^ res) & 0x10) != 0;
             break;
@@ -477,6 +477,12 @@ void Exec::two_byte(int opsz) {
 void Exec::sse(std::uint8_t op2, int opsz) {
     int rg = 0;
     const bool pd = p66;
+    // Mandatory prefixes select different instructions, not optional decorations.
+    if ((rep || repne) && pd) throw Unsupported{};
+    if ((rep || repne) && op2 != 0x10 && op2 != 0x11 && op2 != 0x6F &&
+        op2 != 0x7F && op2 != 0x7E && op2 != 0x2A && op2 != 0x2C &&
+        op2 != 0x2D && !(op2 >= 0x51 && op2 <= 0x5F)) throw Unsupported{};
+    if (repne && (op2 == 0x6F || op2 == 0x7F || op2 == 0x7E)) throw Unsupported{};
     switch (op2) {
     case 0x10: case 0x11: {
         const Rm rm = decode_rm(rg, 0);
@@ -695,21 +701,24 @@ void Exec::sse(std::uint8_t op2, int opsz) {
 void Exec::step() {
     // prefixes
     for (;;) {
+        if (pos >= 15) throw UdEx{};
         if (pos >= n) throw Fault{start + pos};
         const std::uint8_t b = buf[pos];
+        // A legacy prefix after REX cancels that REX, even if another REX follows.
+        if (b == 0x66 || b == 0xF3 || b == 0xF2 || b == 0xF0 || b == 0x64 || b == 0x65 ||
+            b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 || b == 0x67)
+            rex = rw = rr = rx = rb = false;
         if (b == 0x66) { p66 = true; ++pos; }
-        else if (b == 0xF3) { rep = true; ++pos; }
-        else if (b == 0xF2) { repne = true; ++pos; }
+        else if (b == 0xF3) { rep = true; repne = false; ++pos; }
+        else if (b == 0xF2) { repne = true; rep = false; ++pos; }
         else if (b == 0xF0) { ++pos; }
-        else if (b == 0x64) { fs = true; ++pos; }
-        else if (b == 0x65) { gs = true; ++pos; }
+        else if (b == 0x64) { fs = true; gs = false; ++pos; }
+        else if (b == 0x65) { gs = true; fs = false; ++pos; }
         else if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36) { ++pos; }
         else if (b == 0x67) { addr32 = true; ++pos; }
-        else break;
-    }
-    if (pos < n && buf[pos] >= 0x40 && buf[pos] <= 0x4F) {
-        const std::uint8_t r = buf[pos++];
-        rex = true; rw = r & 8; rr = r & 4; rx = r & 2; rb = r & 1;
+        else if (b >= 0x40 && b <= 0x4F) {
+            rex = true; rw = b & 8; rr = b & 4; rx = b & 2; rb = b & 1; ++pos;
+        } else break;
     }
     const int opsz = rw ? 8 : (p66 ? 2 : 4);
     const std::uint8_t op = u8();
@@ -944,6 +953,8 @@ void Exec::step() {
         const int sub = (pos < n) ? ((buf[pos] >> 3) & 7) : 0;
         const int ib = (sub < 2) ? (sz == 1 ? 1 : (sz == 2 ? 2 : 4)) : 0;
         const Rm rm = decode_rm(rg, ib);
+        // TEST has an immediate after ModRM; all other extensions do not.
+        // Resolve RIP-relative addressing before accessing the operand.
         const std::uint64_t v = rd_rm(rm, sz);
         switch (rg & 7) {
         case 0: case 1: alu(4, v, imm_of(sz == 8 ? 4 : sz), sz); break;
@@ -1010,6 +1021,7 @@ void Exec::step() {
                     if (q > mask_of(sz)) throw DivErr{};
                 } else {
                     const std::int64_t sd = sext(dividend, dsz), sv = sext(v, sz);
+                    if (sd == INT64_MIN && sv == -1) throw DivErr{};
                     const std::int64_t sq = sd / sv, sr = sd % sv;
                     if (sq != sext(static_cast<std::uint64_t>(sq) & mask_of(sz), sz)) throw DivErr{};
                     q = static_cast<std::uint64_t>(sq); r = static_cast<std::uint64_t>(sr);
@@ -1054,6 +1066,9 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
     bool legacy_prefix = false, rex_prefix = false;
     while (p < n) {
         const unsigned x = b[p];
+        if (x >= 0x40 && x <= 0x4F) {
+            w = (x & 8) != 0; rex_prefix = true; ++p; continue;
+        }
         if (x == 0x66) p66 = true;
         else if (x == 0xF2) f2 = true;
         else if (x == 0xF3) f3 = true;
@@ -1061,9 +1076,9 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
                  x == 0x2E || x == 0x3E || x == 0x26 || x == 0x36) {}
         else break;
         legacy_prefix = true;
+        w = false; rex_prefix = false;
         ++p;
     }
-    if (p < n && b[p] >= 0x40 && b[p] <= 0x4F) { w = (b[p] & 8) != 0; rex_prefix = true; ++p; }
     if (p >= n) return d;
     unsigned map = 0, op = b[p++], pp = p66 ? 1 : f3 ? 2 : f2 ? 3 : 0;
     if (op == 0xC5 || op == 0xC4) {
