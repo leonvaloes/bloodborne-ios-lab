@@ -727,7 +727,7 @@ void Exec::step() {
         const Rm rm = decode_rm(rg, 0);
         const std::uint64_t src = rd_rm(rm, sz);
         const std::uint64_t reduced = (src - 1) & mask_of(sz);
-        const std::uint64_t result = sub == 1 ? (src & reduced) : sub == 2 ? (src ^ reduced) : (src & -src);
+        const std::uint64_t result = sub == 1 ? (src & reduced) : sub == 2 ? (src ^ reduced) : (src & (~src + 1));
         // AF/PF undefined by ISA: retain their previous values; all defined flags updated.
         s.rflags &= ~(FLAG_CF | FLAG_ZF | FLAG_SF | FLAG_OF);
         if ((sub == 3) ? (src != 0) : (src == 0)) s.rflags |= FLAG_CF;
