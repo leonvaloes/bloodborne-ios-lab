@@ -145,6 +145,20 @@ VfsError VirtualFileSystem::resolve(const std::string &virtual_path, std::string
         host /= relative;
     }
 
+    // Resolve existing symlinks (including parent directories of a new file) so a
+    // Documents mount cannot be used to access files outside its host directory.
+    std::error_code ec;
+    const auto root = std::filesystem::weakly_canonical(best_point.host_path, ec);
+    if (ec) return VfsError::io_error;
+    const auto target = std::filesystem::weakly_canonical(host, ec);
+    if (ec) return VfsError::io_error;
+    auto root_part = root.begin();
+    auto target_part = target.begin();
+    for (; root_part != root.end(); ++root_part, ++target_part) {
+        if (target_part == target.end() || *root_part != *target_part)
+            return VfsError::access_denied;
+    }
+
     out_host_path = host.string();
     out_readonly = best_point.read_only;
     return VfsError::ok;
@@ -227,17 +241,19 @@ VfsError VirtualFileSystem::stat(const std::string &virtual_path, VfsStat &out_s
     if (err != VfsError::ok) return err;
 
     std::error_code ec;
-    if (!std::filesystem::exists(host_path, ec)) {
-        return VfsError::not_found;
-    }
+    const auto status = std::filesystem::status(host_path, ec);
+    if (ec == std::errc::no_such_file_or_directory) return VfsError::not_found;
+    if (ec) return VfsError::io_error;
+    if (!std::filesystem::exists(status)) return VfsError::not_found;
 
-    out_stat.is_directory = std::filesystem::is_directory(host_path, ec);
-    out_stat.is_readonly = ro;
-    if (!out_stat.is_directory) {
-        out_stat.size = std::filesystem::file_size(host_path, ec);
-    } else {
-        out_stat.size = 0;
+    VfsStat result{};
+    result.is_directory = std::filesystem::is_directory(status);
+    result.is_readonly = ro;
+    if (!result.is_directory) {
+        result.size = std::filesystem::file_size(host_path, ec);
+        if (ec) return VfsError::io_error;
     }
+    out_stat = result;
     return VfsError::ok;
 }
 

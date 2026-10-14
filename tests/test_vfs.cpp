@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <vector>
 #include <string>
+#include <fstream>
 
 int main() { return run([] {
     using namespace bb;
@@ -73,6 +74,31 @@ int main() { return run([] {
     // Remoção
     CHECK(vfs.remove_file("/user/home/savedata/save01.dat") == VfsError::ok);
     CHECK(!vfs.exists("/user/home/savedata/save01.dat"));
+
+    // Falha de stat preserva a saída do chamador.
+    VfsStat unchanged{42, true, true};
+    CHECK(vfs.stat("/user/home/savedata/missing", unchanged) == VfsError::not_found);
+    CHECK(unchanged.size == 42);
+    CHECK(unchanged.is_directory);
+
+    // Um symlink dentro de Documents não pode escapar da raiz, nem para leitura
+    // nem para criação de arquivos; symlinks internos continuam válidos.
+    const auto outside = test_dir / "outside";
+    std::filesystem::create_directories(outside, ec);
+    { std::ofstream file(outside / "secret.txt"); file << "secret"; }
+    std::filesystem::create_directory_symlink(outside, save_dir / "escape", ec);
+    if (!ec) {
+        CHECK(vfs.resolve("/user/home/savedata/escape/secret.txt", host_path, readonly) == VfsError::access_denied);
+        CHECK(!vfs.exists("/user/home/savedata/escape/secret.txt"));
+        CHECK(vfs.stat("/user/home/savedata/escape/secret.txt", st) == VfsError::access_denied);
+        CHECK(vfs.read_file("/user/home/savedata/escape/secret.txt", read_bytes) == VfsError::access_denied);
+        CHECK(vfs.write_file("/user/home/savedata/escape/new.txt", dummy_data, sizeof(dummy_data)) == VfsError::access_denied);
+        CHECK(!std::filesystem::exists(outside / "new.txt"));
+    }
+    ec.clear();
+    std::filesystem::create_directories(save_dir / "nested", ec);
+    std::filesystem::create_directory_symlink(save_dir / "nested", save_dir / "inside", ec);
+    if (!ec) CHECK(vfs.resolve("/user/home/savedata/inside/file.txt", host_path, readonly) == VfsError::ok);
 
     // Desmontagem
     CHECK(vfs.unmount("/app0"));
