@@ -118,7 +118,8 @@ set(CORE_SOURCES
     core/video_out.cpp
     core/gcn_isa.cpp
     core/gcn_ir.cpp
-    core/gcn_msl.cpp)
+    core/gcn_msl.cpp
+    core/save_data.cpp)
 foreach(name ${ALL_FIXTURES})
     list(APPEND CORE_SOURCES "${generated_dir}/${name}.cpp")
 endforeach()
@@ -155,7 +156,7 @@ else()
     target_link_libraries(bb-run-eboot PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-        foreach(name guest_scheduler memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle vfs binder game_asset_probe boot_probe audio audio_out stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 video_out gcn_isa gcn_ir gcn_msl ps4_loader)
+        foreach(name guest_scheduler memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle vfs binder game_asset_probe boot_probe audio audio_out stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
@@ -173,6 +174,6 @@ else()
             "-DAOT=$<TARGET_FILE:bb-aot>" "-DSMOKE=$<TARGET_FILE:bb-smoke>"
             "-DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/add.hex"
             "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake")
-        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle vfs binder game_asset_probe dcx_probe audio audio_out stability engine shader_translator metal_pipeline flver_parser gnm_pm4 video_out gcn_isa gcn_ir gcn_msl ps4_loader aot_rejection cli_integration PROPERTIES TIMEOUT 60)
+        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle vfs binder game_asset_probe dcx_probe audio audio_out stability engine shader_translator metal_pipeline flver_parser gnm_pm4 video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data aot_rejection cli_integration PROPERTIES TIMEOUT 60)
     endif()
 endif()
