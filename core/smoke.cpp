@@ -6,6 +6,7 @@
 #include "hle.h"
 #include "manifest.h"
 #include "elf_parser.h"
+#include "guest_loader.h"
 #include <limits>
 #include <cmath>
 #include <cstring>
@@ -163,20 +164,31 @@ SmokeReport smoke() {
     std::vector<std::uint8_t> elf_min(128, 0);
     elf_min[0] = 0x7f; elf_min[1] = 'E'; elf_min[2] = 'L'; elf_min[3] = 'F';
     std::uint16_t emach = EM_X86_64, ephsize = 56, ephnum = 1;
-    std::uint64_t ephent = 64;
+    std::uint64_t eentry = 0x400000, ephent = 64;
     std::memcpy(elf_min.data() + 18, &emach, 2);
+    std::memcpy(elf_min.data() + 24, &eentry, 8);
     std::memcpy(elf_min.data() + 32, &ephent, 8);
     std::memcpy(elf_min.data() + 54, &ephsize, 2);
     std::memcpy(elf_min.data() + 56, &ephnum, 2);
     std::uint32_t ptype = 1, pflags = 5;
-    std::uint64_t psz = 0x1000;
+    std::uint64_t pvaddr = 0x400000, psz = 0x1000;
     std::memcpy(elf_min.data() + 64, &ptype, 4);
     std::memcpy(elf_min.data() + 68, &pflags, 4);
+    std::memcpy(elf_min.data() + 80, &pvaddr, 8);
     std::memcpy(elf_min.data() + 96, &psz, 8);
     std::memcpy(elf_min.data() + 104, &psz, 8);
     auto insp = SafeGameParser::inspect_executable(elf_min.data(), elf_min.size());
     check(insp.is_valid && insp.machine == EM_X86_64);
     check(insp.code_size == 0x1000);
+
+
+    // S8: Guest Loader & First Instruction Execution (4 checks)
+    GuestMemory boot_mem(256 * 1024);
+    auto boot_rep = GuestLoader::load_and_boot(boot_mem, elf_min.data(), elf_min.size(), dispatcher, hle);
+    check(boot_rep.success);
+    check(boot_rep.first_instruction_executed);
+    check(boot_rep.entry_point == 0x400000);
+    check((boot_rep.stack_pointer & 0xF) == 0);
 
     // Cleanup
     check(memory.unmap(0x500000) == MemoryError::ok);

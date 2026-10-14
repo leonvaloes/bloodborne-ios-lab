@@ -61,7 +61,8 @@ set(CORE_SOURCES
     core/dispatcher.cpp
     core/hle.cpp
     core/manifest.cpp
-    core/elf_parser.cpp)
+    core/elf_parser.cpp
+    core/guest_loader.cpp)
 foreach(name ${ALL_FIXTURES})
     list(APPEND CORE_SOURCES "${generated_dir}/${name}.cpp")
 endforeach()
@@ -87,7 +88,7 @@ else()
     target_link_libraries(bb-smoke PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser)
+        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
@@ -99,6 +100,6 @@ else()
             "-DAOT=$<TARGET_FILE:bb-aot>" "-DSMOKE=$<TARGET_FILE:bb-smoke>"
             "-DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/add.hex"
             "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake")
-        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser aot_rejection cli_integration PROPERTIES TIMEOUT 60)
+        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot aot_rejection cli_integration PROPERTIES TIMEOUT 60)
     endif()
 endif()
