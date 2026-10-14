@@ -48,6 +48,26 @@ int main() { return run([] {
     CHECK(result.entry_reached && result.instructions_executed == 2);
     CHECK(result.entry_rip == 0xa0 && result.stop_rip == 0xa4);
     CHECK(result.stop_opcode == 0x41);
+    const auto full_filesz = filesz;
+    auto set_filesz = [&](std::uint64_t size) {
+        std::memcpy(elf.data() + 96, &size, 8);
+        std::memcpy(elf.data() + 104, &size, 8);
+    };
+    // Four prologue bytes alone do not license inspecting the byte beyond PT_LOAD.
+    set_filesz(entry + 4); write();
+    result = bb::probe_eboot_entry(dir.string());
+    CHECK(result.status == "entry_out_of_bounds");
+    CHECK(!result.entry_reached && result.instructions_executed == 0);
+    set_filesz(full_filesz);
+    // The file may end immediately after the inspected byte; no 16-byte tail required.
+    {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(elf.data()), offset + entry + 5);
+        CHECK(out.good());
+    }
+    result = bb::probe_eboot_entry(dir.string());
+    CHECK(result.status == "stopped_after_two_instructions");
+    CHECK(result.stop_opcode == 0x41);
     elf[offset + entry] = 0xcc; write();
     result = bb::probe_eboot_entry(dir.string());
     CHECK(result.status == "unsupported_entry_opcode");

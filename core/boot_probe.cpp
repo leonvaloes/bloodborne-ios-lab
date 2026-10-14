@@ -50,14 +50,24 @@ BootProbeResult probe_eboot_entry(const std::string& documents_dir) {
         return result;
     }
     const auto delta = result.entry_rip - entry->vaddr;
-    if (entry->offset > result.file_size || delta > result.file_size - entry->offset ||
-        result.file_size - entry->offset - delta < 4 ||
+    // Require all four interpreted bytes AND the following raw byte to belong to
+    // the executable file-backed segment. Never inspect adjacent file data.
+    constexpr std::uint64_t inspected_bytes = 5;
+    if (entry->filesz - delta < inspected_bytes ||
+        entry->offset > result.file_size || delta > result.file_size - entry->offset ||
+        result.file_size - entry->offset - delta < inspected_bytes ||
         entry->offset + delta > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
         result.status = "entry_out_of_bounds";
         return result;
     }
+    if (result.entry_rip > std::numeric_limits<std::uint64_t>::max() - 4) {
+        result.status = "entry_out_of_bounds";
+        return result;
+    }
+    // A short header read sets eofbit/failbit; reset before the bounded seek.
+    file.clear();
     file.seekg(static_cast<std::streamoff>(entry->offset + delta));
-    std::array<std::uint8_t, 16> code{};
+    std::array<std::uint8_t, inspected_bytes> code{};
     if (!file.read(reinterpret_cast<char*>(code.data()), code.size())) {
         result.status = "read_error";
         return result;

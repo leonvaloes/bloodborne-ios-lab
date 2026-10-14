@@ -8,11 +8,11 @@ Referencia no PC: `bloodborne_portPC/bbport-windows/out/eboot.elf`, 93.667.640 b
 
 ## Procedimento e criterio
 
-O app le somente 4 KiB de cabecalho ELF e 16 bytes do ponto de entrada, limite de arquivo de 128 MiB. Valida ELF64 x86-64 e segmento executavel, aloca pilha guest isolada e interpreta apenas `push rbp` e `mov rbp,rsp`, parando no proximo opcode sem chama-lo. Esperado para esta fonte local: `entry_rip=160` (`0xA0`), `instructions_executed=2`, `stop_rip=164` (`0xA4`), `stop_opcode=65` (`0x41`), `status=stopped_after_two_instructions`, `entry_reached=true`, `game_execution=false`.
+O app le no maximo 4 KiB de cabecalho ELF e exatamente 5 bytes do ponto de entrada, limite de arquivo de 128 MiB. Exige que os cinco bytes estejam no segmento executavel respaldado por arquivo (quatro bytes interpretados e um byte bruto de parada). Valida ELF64 x86-64 e segmento executavel, aloca pilha guest isolada e interpreta apenas `push rbp` e `mov rbp,rsp`, parando no proximo opcode sem chama-lo. Esperado para esta fonte local: `entry_rip=160` (`0xA0`), `instructions_executed=2`, `stop_rip=164` (`0xA4`), `stop_opcode=65` (`0x41`), `status=stopped_after_two_instructions`, `entry_reached=true`, `game_execution=false`.
 
 Tocar em **Testar entrada x86-64 (2 instrucoes)** e depois em **Exportar diagnostico de estabilidade**. O JSON contem `boot_probe`. A exportacao repete o teste. Falhas de formato, segmento, limites, arquivo ausente e opcode desconhecido param antes de qualquer chamada externa.
 
-Teste host sintetico cobre arquivo ausente, dois opcodes conhecidos, opcode desconhecido e ELF invalido. `BB_TEST_EBOOT_DIR` permite teste local opcional contra o executavel real sem copia para o repo; CI executa apenas fixtures sinteticas.
+Teste host sintetico cobre arquivo ausente, dois opcodes conhecidos, opcode desconhecido, ELF invalido, segmento que termina antes do byte de parada (rejeitado sem executar) e arquivo que termina exatamente apos o byte de parada (aceito). Nenhum byte do jogo esta nas fixtures. `BB_TEST_EBOOT_DIR` permite teste local opcional contra o executavel real sem copia para o repo; CI executa apenas fixtures sinteticas.
 
 ## Limites
 
