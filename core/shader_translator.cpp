@@ -461,7 +461,7 @@ TranslationResult ShaderTranslator::translate_spirv_to_msl(const std::vector<uin
 namespace {
 
 void emit_inst(std::vector<uint32_t>& spirv, uint32_t opcode, const std::vector<uint32_t>& operands) {
-    uint32_t word = ((operands.size() + 1) << 16) | (opcode & 0xFFFF);
+    uint32_t word = (static_cast<uint32_t>(operands.size() + 1) << 16) | (opcode & 0xFFFF);
     spirv.push_back(word);
     for (uint32_t op : operands) spirv.push_back(op);
 }
