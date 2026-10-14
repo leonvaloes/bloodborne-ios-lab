@@ -1,4 +1,5 @@
 #include "ps4_loader.h"
+#include "ps4_bootstrap.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -43,11 +44,7 @@ std::uint64_t get(const Bytes& b, std::uint64_t off, unsigned n) {
 struct Ph { std::uint64_t type, flags, off, vaddr, filesz, memsz, align; };
 struct Sym { std::string name; std::uint64_t value, size; unsigned type, binding, section; };
 struct Rel { std::uint64_t target, kind, sym, addend; };
-struct Identity {
-    std::string nid, lib, mod;
-    unsigned libver = 0, modver = 0;
-    bool operator<(const Identity& b) const { return std::tie(nid,lib,libver,mod,modver) < std::tie(b.nid,b.lib,b.libver,b.mod,b.modver); }
-};
+using Identity = Ps4SymbolId;
 struct Module {
     Bytes elf, image;
     std::vector<Ph> ph;
@@ -247,24 +244,47 @@ Ps4Image link(GuestMemory& memory, Module main, std::vector<std::pair<std::strin
             image_base+end<=data_traps && data_traps+16777216<=code_traps,
             "regioes de imagem/traps sobrepostas");
     Ps4Image result;
+    result.base=image_base;
+    result.size=main.size;
+    result.code_traps=code_traps;
+    result.data_traps=data_traps;
+    result.next_module_handle=0;
     result.entry=image_base+main.entry;
     result.procparam=main.procparam ? image_base+main.procparam : 0;
     result.tls=main.tls; result.tls.address+=image_base; result.tls.module_id=1;
-    std::map<Identity,std::uint64_t> exports;
     for (std::size_t i=0;i<libs.size();++i) {
         auto& lib=libs[i].second;
         lib.tls.module_id=static_cast<std::uint32_t>(i+2);
         Ps4Module info;
+        info.handle=++result.next_module_handle;
         info.name=libs[i].first; info.base=image_base+bases[i]; info.size=lib.size;
         auto it=lib.tags.find(12);
         if (it!=lib.tags.end()) { require(lib.mapped(it->second,1),"init de modulo fora da imagem"); info.init=info.base+it->second; }
+        auto it_fini=lib.tags.find(13);
+        if (it_fini!=lib.tags.end()) { require(lib.mapped(it_fini->second,1),"fini de modulo fora da imagem"); info.fini=info.base+it_fini->second; }
+        for (const auto& h:lib.ph) {
+            if (h.type==0x61000010) {
+                if (info.data_size==0) { info.data_base=info.base+h.vaddr; info.data_size=h.memsz; }
+            } else if (h.type==1) {
+                if ((h.flags&1) && info.code_size==0) { info.code_base=info.base+h.vaddr; info.code_size=h.memsz; }
+                else if (info.data_size==0) { info.data_base=info.base+h.vaddr; info.data_size=h.memsz; }
+            }
+        }
         info.tls=lib.tls; info.tls.address+=info.base; info.tls.module_id=static_cast<std::uint32_t>(i+2);
         result.modules.push_back(info);
         for (const auto& s:lib.symbols) if (s.section && (s.binding==1 || s.binding==2) &&
             (s.type==1 || s.type==2) && s.name.find('#')!=std::string::npos) {
             require(lib.mapped(s.value,std::max<std::uint64_t>(1,s.size)),"export fora do modulo");
             auto key=lib.identity(s.name);
-            require(exports.emplace(key,info.base+s.value).second,"export duplicado");
+            require(result.exports.emplace(key,info.base+s.value).second,"export duplicado");
+        }
+    }
+    result.next_tls_module_id=static_cast<std::uint32_t>(libs.size()+2);
+    for (const auto& s:main.symbols) if (s.section && (s.binding==1 || s.binding==2) &&
+        (s.type==1 || s.type==2) && s.name.find('#')!=std::string::npos) {
+        if (main.mapped(s.value,std::max<std::uint64_t>(1,s.size))) {
+            auto key=main.identity(s.name);
+            if (!key.nid.empty()) result.exports[key]=image_base+s.value;
         }
     }
     std::map<Identity,std::size_t> imports;
@@ -293,13 +313,13 @@ Ps4Image link(GuestMemory& memory, Module main, std::vector<std::pair<std::strin
                             Ps4Import imp; imp.name=s.name; imp.nid=key.nid; imp.data=s.type==1;
                             require(index<100000 && index<(UINT64_MAX-code_traps)/32 && index<(UINT64_MAX-data_traps)/4096,"excesso de imports");
                             imp.trap=(imp.data ? data_traps+4096*index : code_traps+32*index);
-                            auto ex=exports.find(key);
+                            auto ex=result.exports.find(key);
                             // libSceLibcInternal compartilha NIDs com libc, se não houver ambiguidade.
-                            if (ex==exports.end() && key.lib=="libSceLibcInternal") {
+                            if (ex==result.exports.end() && key.lib=="libSceLibcInternal") {
                                 Identity alias=key; alias.lib="libc";
-                                ex=exports.find(alias);
+                                ex=result.exports.find(alias);
                             }
-                            imp.address=ex==exports.end()?imp.trap:ex->second;
+                            imp.address=ex==result.exports.end()?imp.trap:ex->second;
                             result.import_traps.emplace(imp.name,imp.trap);
                             result.imports.push_back(imp);
                         } else index=found->second;
@@ -363,5 +383,247 @@ Ps4Image Ps4Loader::load(GuestMemory& memory,const Bytes& eboot,const std::map<s
         for (const auto& kv:available) visit(visit,kv.first);
     }
     return link(memory,std::move(main),std::move(ordered),image_base,code_traps,data_traps);
+}
+
+std::uint64_t Ps4Loader::load_dynamic_module(GuestMemory& mem,
+                                             Ps4Image& image,
+                                             const std::string& name,
+                                             const std::vector<std::uint8_t>& bytes,
+                                             std::uint64_t flags) {
+    (void)flags;
+    require(!name.empty(), "nome de modulo vazio");
+    require(!bytes.empty(), "bytes de modulo vazios");
+
+    Module m = parse(bytes);
+
+    std::uint64_t search_start = image.base + image.size;
+    for (const auto& mod : image.modules) {
+        search_start = std::max(search_start, mod.base + mod.size);
+    }
+
+    std::uint64_t align = 65536; // 64KB
+    for (const auto& h : m.ph) {
+        if ((h.type == 1 || h.type == 0x61000010) && h.align > align) {
+            align = h.align;
+        }
+    }
+
+    std::uint64_t candidate = (search_start + align - 1) & ~(align - 1);
+    constexpr std::uint64_t max_allowed = Ps4Bootstrap::tls_base;
+
+    if (candidate > max_allowed || m.size > max_allowed - candidate) {
+        throw std::runtime_error("espaco de enderecamento insuficiente para modulo dinamico");
+    }
+
+    MemoryError err = mem.map(candidate, static_cast<std::size_t>(m.size), Permission::read | Permission::write);
+    while (err == MemoryError::overlap) {
+        candidate += align;
+        if (candidate > max_allowed || m.size > max_allowed - candidate) {
+            throw std::runtime_error("colisao ou espaco insuficiente para modulo dinamico");
+        }
+        err = mem.map(candidate, static_cast<std::size_t>(m.size), Permission::read | Permission::write);
+    }
+    if (err == MemoryError::budget) {
+        throw std::runtime_error("orcamento de memoria insuficiente para modulo dinamico");
+    }
+    if (err != MemoryError::ok) {
+        throw std::runtime_error("falha ao mapear memoria para modulo dinamico");
+    }
+
+    try {
+        std::uint32_t mod_tls_id = 0;
+        if (m.tls.memsz > 0) {
+            mod_tls_id = image.next_tls_module_id++;
+            m.tls.module_id = mod_tls_id;
+        }
+
+        for (const auto& r : m.relocs) {
+            require(m.mapped(r.target, 8), "relocacao fora de PT_LOAD no modulo dinamico");
+            std::uint64_t value = 0;
+            if (r.kind == 8) { // R_X86_64_RELATIVE
+                value = candidate + r.addend;
+            } else if (r.kind == 16) { // R_X86_64_DTPMOD64
+                require(mod_tls_id != 0, "DTPMOD64 em modulo sem TLS");
+                value = mod_tls_id;
+            } else {
+                require(r.kind == 1 || r.kind == 6 || r.kind == 7, "tipo de relocacao nao suportado no modulo dinamico");
+                require(r.sym < m.symbols.size(), "indice de simbolo invalido no modulo dinamico");
+                const auto& s = m.symbols[static_cast<std::size_t>(r.sym)];
+                if (s.section) {
+                    value = (s.section == 0xfff1 ? 0 : candidate) + s.value + r.addend;
+                } else if (s.binding == 2 && s.name.find('#') == std::string::npos) {
+                    value = 0;
+                } else {
+                    auto key = m.identity(s.name);
+                    require(!key.nid.empty(), "import sem identidade no modulo dinamico");
+                    auto ex = image.exports.find(key);
+                    if (ex == image.exports.end() && key.lib == "libSceLibcInternal") {
+                        Ps4SymbolId alias = key;
+                        alias.lib = "libc";
+                        ex = image.exports.find(alias);
+                    }
+
+                    if (ex != image.exports.end()) {
+                        value = ex->second + r.addend;
+                    } else {
+                        auto trap_it = image.import_traps.find(s.name);
+                        std::uint64_t trap_addr = 0;
+                        if (trap_it != image.import_traps.end()) {
+                            trap_addr = trap_it->second;
+                        } else {
+                            std::size_t index = image.imports.size();
+                            Ps4Import imp;
+                            imp.name = s.name;
+                            imp.nid = key.nid;
+                            imp.data = (s.type == 1);
+                            require(index < 100000 &&
+                                    index < (UINT64_MAX - image.code_traps) / 32 &&
+                                    index < (UINT64_MAX - image.data_traps) / 4096,
+                                    "excesso de imports no modulo dinamico");
+                            imp.trap = (imp.data ? image.data_traps + 4096 * index : image.code_traps + 32 * index);
+                            imp.address = imp.trap;
+                            if (imp.data) {
+                                mem.map(imp.trap, 4096, Permission::read | Permission::write);
+                            }
+                            image.import_traps.emplace(imp.name, imp.trap);
+                            image.imports.push_back(imp);
+                            trap_addr = imp.trap;
+                        }
+                        require((s.type == 1 || r.addend == 0) && r.addend < 4096, "addend de import nao suportado");
+                        value = trap_addr + r.addend;
+                    }
+                }
+            }
+            put(m.image, r.target, value);
+        }
+
+        require(mem.store(candidate, m.image.data(), m.image.size()) == MemoryError::ok,
+                "falha ao gravar imagem do modulo dinamico");
+
+        Ps4Module info;
+        info.name = name;
+        info.handle = ++image.next_module_handle;
+        info.base = candidate;
+        info.size = m.size;
+        info.unloaded = false;
+
+        auto it_init = m.tags.find(12);
+        if (it_init != m.tags.end()) {
+            require(m.mapped(it_init->second, 1), "init fora do modulo dinamico");
+            info.init = candidate + it_init->second;
+        }
+        auto it_fini = m.tags.find(13);
+        if (it_fini != m.tags.end()) {
+            require(m.mapped(it_fini->second, 1), "fini fora do modulo dinamico");
+            info.fini = candidate + it_fini->second;
+        }
+
+        for (const auto& h : m.ph) {
+            if (h.type == 0x61000010) {
+                if (info.data_size == 0) {
+                    info.data_base = candidate + h.vaddr;
+                    info.data_size = h.memsz;
+                }
+            } else if (h.type == 1) {
+                if ((h.flags & 1) && info.code_size == 0) {
+                    info.code_base = candidate + h.vaddr;
+                    info.code_size = h.memsz;
+                } else if (info.data_size == 0) {
+                    info.data_base = candidate + h.vaddr;
+                    info.data_size = h.memsz;
+                }
+            }
+        }
+
+        if (m.tls.memsz > 0) {
+            info.tls = m.tls;
+            info.tls.address = candidate + m.tls.address;
+            info.tls.module_id = mod_tls_id;
+            Ps4Bootstrap::register_dynamic_tls(mem, image, info.tls);
+        }
+
+        for (const auto& s : m.symbols) {
+            if (s.section && (s.binding == 1 || s.binding == 2) &&
+                (s.type == 1 || s.type == 2) && s.name.find('#') != std::string::npos) {
+                if (m.mapped(s.value, std::max<std::uint64_t>(1, s.size))) {
+                    auto key = m.identity(s.name);
+                    if (!key.nid.empty()) {
+                        image.exports[key] = candidate + s.value;
+                    }
+                }
+            }
+        }
+
+        image.modules.push_back(info);
+        return info.handle;
+    } catch (...) {
+        mem.unmap(candidate);
+        throw;
+    }
+}
+
+bool Ps4Loader::unload_dynamic_module(GuestMemory& mem, Ps4Image& image, std::uint64_t handle) {
+    if (handle == 0) return false;
+    for (auto& m : image.modules) {
+        if (m.handle == handle) {
+            if (m.unloaded) return false;
+            m.unloaded = true;
+            if (m.base != 0 && m.size != 0) {
+                mem.unmap(m.base);
+            }
+            if (m.tls.module_id != 0) {
+                std::uint64_t align = image.tls.align ? image.tls.align : 16;
+                std::uint64_t main_size = (image.tls.memsz + align - 1) & ~(align - 1);
+                std::uint64_t tcb = Ps4Bootstrap::tls_base + main_size;
+                std::uint64_t check_tcb = 0;
+                if (mem.load(tcb, &check_tcb, 8) == MemoryError::ok && check_tcb == tcb) {
+                    std::uint64_t dtv = tcb + 64;
+                    std::uint64_t zero = 0;
+                    mem.store(dtv + 8 * m.tls.module_id, &zero, 8);
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Ps4Loader::get_module_info(const Ps4Image& image, std::uint64_t handle, Ps4ModuleInfo& out_info) {
+    if (handle == 0) return false;
+    for (const auto& m : image.modules) {
+        if (m.handle == handle && !m.unloaded) {
+            out_info.name = m.name;
+            out_info.handle = m.handle;
+            out_info.code_base = m.code_base;
+            out_info.code_size = m.code_size;
+            out_info.data_base = m.data_base;
+            out_info.data_size = m.data_size;
+            out_info.tls_address = m.tls.address;
+            out_info.tls_size = m.tls.memsz;
+            out_info.tls_module_id = m.tls.module_id;
+            out_info.init = m.init;
+            out_info.fini = m.fini;
+            return true;
+        }
+    }
+    return false;
+}
+
+const Ps4Module* Ps4Loader::find_module_by_address(const Ps4Image& image, std::uint64_t guest_addr) {
+    for (const auto& m : image.modules) {
+        if (!m.unloaded && guest_addr >= m.base && guest_addr < m.base + m.size) {
+            return &m;
+        }
+    }
+    return nullptr;
+}
+
+void Ps4Loader::get_module_list(const Ps4Image& image, std::vector<std::uint64_t>& out_handles) {
+    out_handles.clear();
+    for (const auto& m : image.modules) {
+        if (!m.unloaded) {
+            out_handles.push_back(m.handle);
+        }
+    }
 }
 } // namespace bb

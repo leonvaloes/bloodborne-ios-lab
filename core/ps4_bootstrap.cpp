@@ -79,4 +79,52 @@ void Ps4Bootstrap::game_entry(GuestMemory& mem, CpuState& cpu, const Ps4Image& i
     cpu.gpr[7] = param_base;
     cpu.gpr[6] = exit_trap;
 }
+std::uint64_t Ps4Bootstrap::register_dynamic_tls(GuestMemory& mem, const Ps4Image& image, const Ps4Tls& tls) {
+    if (!tls.module_id) return 0;
+    std::uint64_t main_size = aligned(image.tls.memsz, image.tls.align);
+    if (main_size > (1u<<20)) throw std::runtime_error("TLS principal excessivo");
+    const std::uint64_t tcb = tls_base + main_size;
+    constexpr std::uint64_t region_size = 16u << 20;
+
+    std::uint64_t check_tcb = 0;
+    if (mem.load(tcb, &check_tcb, 8) != MemoryError::ok || check_tcb != tcb) {
+        throw std::runtime_error("TCB nao inicializado no bootstrap");
+    }
+
+    const std::uint64_t dtv = tcb + 64;
+    if (tls.module_id > 64 || dtv + 8 * tls.module_id >= tcb + 256) {
+        throw std::runtime_error("indice TLS de modulo excessivo");
+    }
+
+    if (tls.memsz == 0) {
+        word(mem, dtv + 8 * tls.module_id, 0);
+        return 0;
+    }
+
+    std::uint64_t next = (tcb + 512 + 63) & ~std::uint64_t(63);
+    for (const auto& module : image.modules) {
+        const auto& m_tls = module.tls;
+        if (!m_tls.module_id || !m_tls.memsz || m_tls.module_id == tls.module_id) continue;
+        next = aligned(next, m_tls.align ? m_tls.align : 16);
+        next += aligned(m_tls.memsz, m_tls.align);
+    }
+
+    next = aligned(next, tls.align ? tls.align : 16);
+    auto size = aligned(tls.memsz, tls.align);
+    if (next > tls_base + region_size || size > tls_base + region_size - next) {
+        throw std::runtime_error("TLS de modulos excessivo");
+    }
+
+    copy_tls(mem, tls, next);
+
+    std::uint64_t count = 0;
+    if (mem.load(dtv, &count, 8) == MemoryError::ok) {
+        if (tls.module_id >= count) {
+            word(mem, dtv, tls.module_id + 1);
+        }
+    }
+
+    word(mem, dtv + 8 * tls.module_id, next);
+    return next;
+}
 } // namespace bb

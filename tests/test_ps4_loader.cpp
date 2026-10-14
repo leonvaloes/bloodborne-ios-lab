@@ -134,4 +134,116 @@ int main() { return run([] {
     broken=self(main);put(broken,32,0x80a); // segmento SELF criptografado
     rejected=false;try { GuestMemory m(1<<20);Ps4Loader::load(m,broken); } catch (const std::runtime_error&) { rejected=true; }
     CHECK(rejected);
+
+    // Dynamic module loading, module info inspection, and address lookup
+    auto dyn_elf = elf(true);
+    std::size_t dt_fini = 0x700 + 11 * 16;
+    tag(dyn_elf, dt_fini, 13, 0x430);
+    put(dyn_elf, 0x800 + 64 + 30, 0, 2);
+    dyn_elf[0x480] = 0x11; dyn_elf[0x481] = 0x22; dyn_elf[0x482] = 0x33; dyn_elf[0x483] = 0x44;
+
+    GuestMemory dyn_mem(64u << 20);
+    auto dyn_image = Ps4Loader::load(dyn_mem, self(main), self(lib));
+    CpuState dyn_cpu;
+    const auto dyn_tcb = Ps4Bootstrap::prepare(dyn_mem, dyn_cpu, dyn_image);
+    CHECK(dyn_tcb != 0);
+
+    std::vector<std::uint64_t> handles_init;
+    Ps4Loader::get_module_list(dyn_image, handles_init);
+    CHECK(handles_init.size() == 1 && handles_init[0] == 1);
+
+    Ps4ModuleInfo base_info{};
+    CHECK(Ps4Loader::get_module_info(dyn_image, 1, base_info));
+    CHECK(base_info.name == "libc.prx" && base_info.handle == 1);
+    CHECK(base_info.code_base == dyn_image.modules[0].base + 0x400 && base_info.code_size == 0x200);
+    CHECK(base_info.data_base == dyn_image.modules[0].base + 0x600 && base_info.data_size == 0x100);
+    CHECK(base_info.init == dyn_image.modules[0].base + 0x400);
+    CHECK(base_info.tls_module_id == 2);
+
+    auto dyn_handle = Ps4Loader::load_dynamic_module(dyn_mem, dyn_image, "libdyn.prx", self(dyn_elf));
+    CHECK(dyn_handle == 2);
+    CHECK(dyn_image.modules.size() == 2);
+
+    const auto& dyn_mod = dyn_image.modules[1];
+    CHECK(dyn_mod.handle == dyn_handle);
+    CHECK(dyn_mod.name == "libdyn.prx");
+    CHECK(dyn_mod.base > dyn_image.modules[0].base);
+    CHECK((dyn_mod.base & 0xffff) == 0);
+    CHECK(dyn_mod.init == dyn_mod.base + 0x400);
+    CHECK(dyn_mod.fini == dyn_mod.base + 0x430);
+    CHECK(dyn_mod.code_base == dyn_mod.base + 0x400 && dyn_mod.code_size == 0x200);
+    CHECK(dyn_mod.data_base == dyn_mod.base + 0x600 && dyn_mod.data_size == 0x100);
+    CHECK(dyn_mod.tls.module_id == 3);
+    CHECK(dyn_mod.tls.address == dyn_mod.base + 0x480);
+
+    // Verificação de relocações no módulo dinâmico
+    std::uint64_t reloc_val = 0;
+    CHECK(dyn_mem.load(dyn_mod.base + 0x628, &reloc_val, 8) == MemoryError::ok && reloc_val == dyn_mod.base + 0x411);
+    CHECK(dyn_mem.load(dyn_mod.base + 0x620, &reloc_val, 8) == MemoryError::ok && reloc_val == dyn_image.modules[0].base + 0x410);
+
+    // Verificação do registro TLS dinâmico no DTV
+    std::uint64_t dtv_slot3 = 0;
+    CHECK(dyn_mem.load(dyn_tcb + 64 + 8 * 3, &dtv_slot3, 8) == MemoryError::ok && dtv_slot3 != 0);
+    std::uint8_t dtv_tls[4]{};
+    CHECK(dyn_mem.load(dtv_slot3, dtv_tls, 4) == MemoryError::ok);
+    CHECK(dtv_tls[0] == 0x11 && dtv_tls[1] == 0x22 && dtv_tls[2] == 0x33 && dtv_tls[3] == 0x44);
+
+    // Consulta de informações de módulo
+    Ps4ModuleInfo dyn_info{};
+    CHECK(Ps4Loader::get_module_info(dyn_image, dyn_handle, dyn_info));
+    CHECK(dyn_info.name == "libdyn.prx");
+    CHECK(dyn_info.handle == dyn_handle);
+    CHECK(dyn_info.code_base == dyn_mod.code_base && dyn_info.code_size == dyn_mod.code_size);
+    CHECK(dyn_info.data_base == dyn_mod.data_base && dyn_info.data_size == dyn_mod.data_size);
+    CHECK(dyn_info.tls_address == dyn_mod.tls.address && dyn_info.tls_size == 16);
+    CHECK(dyn_info.tls_module_id == 3);
+    CHECK(dyn_info.init == dyn_mod.init);
+    CHECK(dyn_info.fini == dyn_mod.fini);
+
+    // Busca de módulo por endereço
+    auto found_dyn = Ps4Loader::find_module_by_address(dyn_image, dyn_mod.base + 0x10);
+    CHECK(found_dyn != nullptr && found_dyn->handle == dyn_handle);
+    auto found_base = Ps4Loader::find_module_by_address(dyn_image, dyn_image.modules[0].base + 0x10);
+    CHECK(found_base != nullptr && found_base->handle == 1);
+    CHECK(Ps4Loader::find_module_by_address(dyn_image, 0x50000000) == nullptr);
+
+    // Listagem de módulos ativos
+    std::vector<std::uint64_t> active_handles;
+    Ps4Loader::get_module_list(dyn_image, active_handles);
+    CHECK(active_handles.size() == 2 && active_handles[0] == 1 && active_handles[1] == dyn_handle);
+
+    // Descarga de módulo
+    CHECK(Ps4Loader::unload_dynamic_module(dyn_mem, dyn_image, dyn_handle));
+
+    // Verificação de erro ao consultar handle descarregado ou inválido
+    Ps4ModuleInfo invalid_info{};
+    CHECK(!Ps4Loader::get_module_info(dyn_image, dyn_handle, invalid_info));
+    CHECK(!Ps4Loader::get_module_info(dyn_image, 99999, invalid_info));
+    CHECK(Ps4Loader::find_module_by_address(dyn_image, dyn_mod.base + 0x10) == nullptr);
+
+    Ps4Loader::get_module_list(dyn_image, active_handles);
+    CHECK(active_handles.size() == 1 && active_handles[0] == 1);
+
+    CHECK(dyn_mem.load(dyn_mod.base, &reloc_val, 8) == MemoryError::unmapped);
+    CHECK(dyn_mem.load(dyn_tcb + 64 + 8 * 3, &dtv_slot3, 8) == MemoryError::ok && dtv_slot3 == 0);
+
+    CHECK(!Ps4Loader::unload_dynamic_module(dyn_mem, dyn_image, dyn_handle));
+    CHECK(!Ps4Loader::unload_dynamic_module(dyn_mem, dyn_image, 99999));
+
+    // Recusa por falta de memória (budget)
+    GuestMemory budget_mem(32768);
+    auto budget_img = Ps4Loader::load(budget_mem, main);
+    bool budget_fail = false;
+    try { Ps4Loader::load_dynamic_module(budget_mem, budget_img, "dyn.prx", dyn_elf); }
+    catch (const std::runtime_error&) { budget_fail = true; }
+    CHECK(budget_fail);
+
+    // Recusa por colisão / espaço de endereçamento insuficiente
+    GuestMemory col_mem(64u << 20);
+    auto col_img = Ps4Loader::load(col_mem, main);
+    col_mem.map(0x10010000, static_cast<std::size_t>(0x6e000000 - 0x10010000), Permission::read | Permission::write);
+    bool col_fail = false;
+    try { Ps4Loader::load_dynamic_module(col_mem, col_img, "dyn.prx", dyn_elf); }
+    catch (const std::runtime_error&) { col_fail = true; }
+    CHECK(col_fail);
 }); }

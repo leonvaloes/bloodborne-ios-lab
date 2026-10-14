@@ -16,5 +16,7 @@ public:
     // only after its return trap has been reached with a zero return value.
     static void module_call(GuestMemory& memory, CpuState& cpu, const Ps4Module& module);
     static void game_entry(GuestMemory& memory, CpuState& cpu, const Ps4Image& image);
+    // Dynamic module TLS registration in the guest TCB / DTV.
+    static std::uint64_t register_dynamic_tls(GuestMemory& memory, const Ps4Image& image, const Ps4Tls& tls);
 };
 } // namespace bb
