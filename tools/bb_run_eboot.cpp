@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(image.entry),image.imports.size(),image.modules.size(),
                     static_cast<unsigned long long>(tcb));
         bb::OrbisRuntime runtime(memory);
+        runtime.set_procparam(image.procparam);
         std::uint64_t steps=0;
         bb::CpuRunResult result;
         auto execute=[&]() {
