@@ -410,20 +410,29 @@ void Exec::avx(bool three) {
     }
     const bool mov = ((op == 0x10 || op == 0x11 || op == 0x28 || op == 0x29) && pp <= 1) ||
                      ((op == 0x6F || op == 0x7F) && (pp == 1 || pp == 2));
-    const bool logic = op == 0x57 || (pp == 1 && (op == 0xEF || op == 0xDB || op == 0xEB));
-    const bool arith = op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E;
+    const bool logic = (op == 0x57) || (pp == 0 && (op == 0x54 || op == 0x55 || op == 0x56)) ||
+                       (pp == 1 && (op == 0xEF || op == 0xDB || op == 0xEB || op == 0xDF ||
+                                    op == 0x54 || op == 0x55 || op == 0x56 || op == 0x57));
+    const bool arith = op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E ||
+                       op == 0x5F || op == 0x5D;
     const bool unpack = pp == 1 &&
         ((op >= 0x60 && op <= 0x62) || op == 0x6C ||
          (op >= 0x68 && op <= 0x6A) || op == 0x6D);
     const bool padd_sub = pp == 1 &&
         (op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4 ||
          op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB);
-    if ((!mov && !logic && !arith && !unpack && !padd_sub) || (pp > 1 && !arith && !mov) ||
-        (pp > 1 && len != 2 && !mov) || (logic && op != 0x57 && pp != 1))
+    const bool shuffle = (op == 0x70 && pp == 1) || (op == 0xC6 && pp <= 1);
+    if ((!mov && !logic && !arith && !unpack && !padd_sub && !shuffle) ||
+        (pp > 1 && !arith && !mov) || (pp > 1 && len != 2 && !mov) ||
+        (logic && op != 0x57 && pp != 1 && pp != 0))
         throw Unsupported{};
     if (mov && src1 != 0) throw Unsupported{}; // reserved vvvv=1111
     if ((op == 0x28 || op == 0x29) && pp != 0 && pp != 1) throw Unsupported{};
     if (op == 0x57 && pp != 0 && pp != 1) throw Unsupported{};
+    if (shuffle) {
+        if (len != 2 && len != 4) throw Unsupported{}; // 128 or 256 bit only
+        if (src1 != 0) throw Unsupported{}; // reserved vvvv
+    }
     int rg = 0;
     const Rm rm = decode_rm(rg, 0);
     std::uint64_t source[4] = {}, dest[4] = {};
@@ -483,6 +492,43 @@ void Exec::avx(bool three) {
             std::memcpy(out + i, &z, elem_width);
         }
         std::memcpy(dest, out, len * 8);
+    } else if (shuffle) {
+        // vpshufd (0x70, pp=1) or vshufps/vshufpd (0xC6, pp=0/1)
+        const unsigned imm = u8();
+        for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+        if (op == 0x70) { // vpshufd: shuffle 32-bit ints within each 128-bit lane
+            for (int lane = 0; lane < len / 2; ++lane) {
+                std::uint64_t lane_src[2] = {dest[lane * 2], dest[lane * 2 + 1]};
+                std::uint64_t lane_dst[2] = {0, 0};
+                for (int i = 0; i < 4; ++i) {
+                    const int idx = (imm >> (i * 2)) & 3;
+                    const std::uint64_t v = (lane_src[idx / 2] >> ((idx % 2) * 32)) & 0xFFFFFFFFULL;
+                    const int j = i / 2, sh = (i % 2) * 32;
+                    lane_dst[j] = (lane_dst[j] & ~(0xFFFFFFFFULL << sh)) | (v << sh);
+                }
+                dest[lane * 2] = lane_dst[0];
+                dest[lane * 2 + 1] = lane_dst[1];
+            }
+        } else { // op == 0xC6: vshufps (pp=0) or vshufpd (pp=1)
+            const bool is_pd = (pp == 1); // 64-bit elements for PD, 32-bit for PS
+            const int elem_bits = is_pd ? 64 : 32;
+            const int elems_per_lane = 128 / elem_bits;
+            for (int lane = 0; lane < len / 2; ++lane) {
+                std::uint64_t lane_src[2] = {dest[lane * 2], dest[lane * 2 + 1]};
+                std::uint64_t lane_dst[2] = {s.xmm[rg][lane * 2], s.xmm[rg][lane * 2 + 1]};
+                for (int i = 0; i < elems_per_lane * 2; ++i) {
+                    const std::uint64_t* from = (i < elems_per_lane) ? &lane_dst[0] : &lane_src[0];
+                    const int from_idx = i < elems_per_lane ? i : i - elems_per_lane;
+                    const int from_word = (from_idx * elem_bits) / 64;
+                    const int from_shift = (from_idx * elem_bits) % 64;
+                    const std::uint64_t mask = (elem_bits == 64) ? ~0ULL : 0xFFFFFFFFULL;
+                    const std::uint64_t v = (from[from_word] >> from_shift) & mask;
+                    const int to_word = (i * elem_bits) / 64;
+                    const int to_shift = (i * elem_bits) % 64;
+                    dest[lane * 2 + to_word] = (dest[lane * 2 + to_word] & ~(mask << to_shift)) | (v << to_shift);
+                }
+            }
+        }
     } else {
         for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
         for (int i = 0; i < bytes / width; ++i) {
@@ -490,13 +536,21 @@ void Exec::avx(bool three) {
             const std::uint64_t mask = mask_of(width);
             const std::uint64_t a = (dest[word] >> shift) & mask, b = (source[word] >> shift) & mask;
             std::uint64_t value = 0;
-            if (logic) value = op == 0xDB ? a & b : op == 0xEB ? a | b : a ^ b;
-            else if (width == 8) {
+            if (logic) {
+                if (op == 0xDB || (pp == 1 && op == 0x54)) value = a & b;
+                else if (op == 0xEB || (pp == 1 && op == 0x56)) value = a | b;
+                else if (op == 0xDF || (pp == 1 && op == 0x55)) value = (~a) & b;
+                else value = a ^ b; // 0x57, 0xEF
+            } else if (width == 8) {
                 const double x = f64(a), y = f64(b);
-                value = bits64(op == 0x58 ? x + y : op == 0x59 ? x * y : op == 0x5C ? x - y : x / y);
+                value = bits64(op == 0x58 ? x + y : op == 0x59 ? x * y : op == 0x5C ? x - y
+                    : op == 0x5E ? x / y : op == 0x5F ? (std::isnan(x) || std::isnan(y) || x == y ? y : (x > y ? x : y))
+                    : (std::isnan(x) || std::isnan(y) || x == y ? y : (x < y ? x : y)));
             } else {
                 const float x = f32(a), y = f32(b);
-                value = bits32(op == 0x58 ? x + y : op == 0x59 ? x * y : op == 0x5C ? x - y : x / y);
+                value = bits32(op == 0x58 ? x + y : op == 0x59 ? x * y : op == 0x5C ? x - y
+                    : op == 0x5E ? x / y : op == 0x5F ? (std::isnan(x) || std::isnan(y) || x == y ? y : (x > y ? x : y))
+                    : (std::isnan(x) || std::isnan(y) || x == y ? y : (x < y ? x : y)));
             }
             dest[word] = (dest[word] & ~(mask << shift)) | ((value & mask) << shift);
         }
@@ -1401,7 +1455,13 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
              ((op == 0x6F || op == 0x7F) && (pp == 1 || pp == 2)) ||
              (((op >= 0x60 && op <= 0x62) || op == 0x6C || (op >= 0x68 && op <= 0x6A) || op == 0x6D) && pp == 1) ||
              ((op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4 ||
-               op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB) && pp == 1))) d.supported = true;
+               op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB) && pp == 1) ||
+             ((op == 0x54 || op == 0x55 || op == 0x56) && pp <= 1) ||
+             (op == 0xDF && pp == 1) ||
+             ((op == 0x5F || op == 0x5D) && pp <= 1) ||
+             ((op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E || op == 0x5F || op == 0x5D) && pp >= 2) ||
+             (op == 0x70 && pp == 1) ||
+             (op == 0xC6 && pp <= 1))) d.supported = true;
         if (!vex && map == 2 && pp == 1 && (op == 0x00 || op == 0x40)) d.supported = true;
         if (!vex && map == 3 && pp == 1 && op == 0x0F) d.supported = true;
     }
