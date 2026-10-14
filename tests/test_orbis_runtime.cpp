@@ -32,12 +32,9 @@ int main() {
         r=cpu.run(10); assert(r.stop==CpuStop::halt);
         return result;
     };
-    assert(call("sceKernelGetProcParam",0x2000)==0x80020016);
+    assert(call("sceKernelGetProcParam")==0);
     rt.set_procparam(0x12345000);
-    assert(call("sceKernelGetProcParam",0)==0x80020016);
-    assert(call("sceKernelGetProcParam",0x5000)==0x80020016);
-    assert(call("sceKernelGetProcParam",0x2000)==0);
-    std::uint64_t param=0; assert(m.load(0x2000,&param,8)==MemoryError::ok && param==0x12345000);
+    assert(call("sceKernelGetProcParam")==0x12345000);
     assert(call("sceKernelGetDirectMemorySize")==5056ULL*1024*1024);
     assert(call("sceKernelAllocateDirectMemory",0,0x100000,0x4000,0x4000,0,0x2000)==0);
     std::uint64_t phys=~0ULL; assert(m.load(0x2000,&phys,8)==MemoryError::ok && phys==0);
@@ -180,22 +177,11 @@ int main() {
             dest.insert(dest.end(), src.begin(), src.end());
         };
 
-        // Test 1: sceKernelGetProcParam validando ponteiro de saída
+        // Test 1: sceKernelGetProcParam retornando ponteiro de procparam em rax
         {
             CpuState test_cpu{};
-            test_cpu.gpr[7] = 0; // null pointer
-            auto inv_null = srt.invoke_trap("sceKernelGetProcParam", test_cpu, 1, return_trap);
-            assert(inv_null.action == OrbisRuntime::InvocationResult::Action::returned && inv_null.value == 0x80020016);
-
-            test_cpu.gpr[7] = 0x90000; // unmapped address
-            auto inv_unmapped = srt.invoke_trap("sceKernelGetProcParam", test_cpu, 1, return_trap);
-            assert(inv_unmapped.action == OrbisRuntime::InvocationResult::Action::returned && inv_unmapped.value == 0x80020016);
-
-            test_cpu.gpr[7] = 0x20000; // valid mapped address
-            auto inv_ok = srt.invoke_trap("sceKernelGetProcParam", test_cpu, 1, return_trap);
-            assert(inv_ok.action == OrbisRuntime::InvocationResult::Action::returned && inv_ok.value == 0);
-            std::uint64_t written = 0;
-            assert(gm.load(0x20000, &written, 8) == MemoryError::ok && written == 0xfeedfaceULL);
+            auto inv = srt.invoke_trap("sceKernelGetProcParam", test_cpu, 1, return_trap);
+            assert(inv.action == OrbisRuntime::InvocationResult::Action::returned && inv.value == 0xfeedfaceULL);
         }
 
         // Test 2: Machine-code scePthreadCreate + scePthreadJoin + scePthreadExit

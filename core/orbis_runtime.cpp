@@ -402,11 +402,7 @@ OrbisRuntime::InvocationResult OrbisRuntime::complete_callback(CpuState& cpu, Gu
 std::uint64_t OrbisRuntime::handle(const std::string& n, const CpuState& c) {
     auto a=[&](unsigned i){return arg(c,i);};
     if (n=="_init_env") return 0;
-    if (n=="sceKernelGetProcParam") {
-        if (!a(0) || !procparam_) return invalid;
-        if (mem_.store(a(0),&procparam_,sizeof procparam_)!=MemoryError::ok) return invalid;
-        return 0;
-    }
+    if (n=="sceKernelGetProcParam") return procparam_;
     if (n=="atexit" || n=="__cxa_atexit") {
         if (!a(0)) return invalid;
         exit_callbacks_.push_back(a(0)); // registrados, mas não executados sem trampoline guest
