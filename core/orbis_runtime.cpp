@@ -84,7 +84,14 @@ std::uint64_t OrbisRuntime::arg(const CpuState& c, unsigned i) const {
     return get<std::uint64_t>(mem_,c.gpr[4]+8*(i-5));
 }
 std::uint64_t OrbisRuntime::invoke(const std::string& import, const CpuState& cpu) {
-    return handle(resolve(import),cpu);
+    const auto name=resolve(import);
+    if (scheduler_ && (name=="scePthreadMutexLock" || name=="pthread_mutex_lock" ||
+        name=="scePthreadCondWait" || name=="pthread_cond_wait" ||
+        name=="scePthreadCondTimedwait" || name=="pthread_cond_timedwait" ||
+        name=="sceKernelWaitEventFlag" || name=="scePthreadOnce" ||
+        name=="__cxa_guard_acquire" || name=="__cxa_finalize"))
+        throw std::runtime_error("guest scheduler trap adapter unavailable for " + name);
+    return handle(name,cpu);
 }
 std::uint64_t OrbisRuntime::handle(const std::string& n, const CpuState& c) {
     auto a=[&](unsigned i){return arg(c,i);};

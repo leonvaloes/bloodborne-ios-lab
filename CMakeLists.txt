@@ -88,6 +88,7 @@ set(CORE_SOURCES
     core/dispatcher.cpp
     core/hle.cpp
     core/orbis_runtime.cpp
+    core/guest_scheduler.cpp
     core/kernel_threads.cpp
     core/manifest.cpp
     core/elf_parser.cpp
@@ -150,7 +151,7 @@ else()
     target_link_libraries(bb-run-eboot PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe boot_probe audio stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 video_out gcn_isa gcn_ir ps4_loader)
+        foreach(name guest_scheduler memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe boot_probe audio stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 video_out gcn_isa gcn_ir ps4_loader)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
