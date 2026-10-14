@@ -5,6 +5,7 @@
 #include <sstream>
 #include <algorithm>
 #include <chrono>
+#include <cwctype>
 
 namespace bb {
 
@@ -152,11 +153,21 @@ VfsError VirtualFileSystem::resolve(const std::string &virtual_path, std::string
     if (ec) return VfsError::io_error;
     const auto target = std::filesystem::weakly_canonical(host, ec);
     if (ec) return VfsError::io_error;
+    // Windows paths are case-insensitive. On that platform the spelling of a
+    // canonical existing parent can differ from a mount's user-supplied path.
     auto root_part = root.begin();
     auto target_part = target.begin();
     for (; root_part != root.end(); ++root_part, ++target_part) {
-        if (target_part == target.end() || *root_part != *target_part)
+        if (target_part == target.end()) return VfsError::access_denied;
+#ifdef _WIN32
+        const auto a = root_part->wstring();
+        const auto b = target_part->wstring();
+        if (a.size() != b.size() || !std::equal(a.begin(), a.end(), b.begin(),
+            [](wchar_t x, wchar_t y) { return std::towlower(x) == std::towlower(y); }))
             return VfsError::access_denied;
+#else
+        if (*root_part != *target_part) return VfsError::access_denied;
+#endif
     }
 
     out_host_path = host.string();
