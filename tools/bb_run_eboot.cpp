@@ -1,39 +1,67 @@
 // Diagnostico local: recebe dumps plaintext do usuario; nunca persiste bytes do jogo.
 #include "../core/ps4_bootstrap.h"
 #include "../core/orbis_runtime.h"
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
 namespace {
-std::vector<std::uint8_t> read_file(const std::string& path) {
+std::vector<std::uint8_t> read_file(const std::filesystem::path& path) {
     std::ifstream file(path,std::ios::binary|std::ios::ate);
-    if (!file || file.tellg()<0 || file.tellg()>(512ll<<20)) throw std::runtime_error("arquivo ausente ou excessivo: "+path);
+    if (!file || file.tellg()<0 || file.tellg()>(512ll<<20)) throw std::runtime_error("arquivo ausente ou excessivo: "+path.string());
     std::vector<std::uint8_t> data(static_cast<std::size_t>(file.tellg()));
     file.seekg(0);file.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size()));
-    if (!file) throw std::runtime_error("arquivo truncado: "+path);
+    if (!file) throw std::runtime_error("arquivo truncado: "+path.string());
     return data;
 }
 }
-int main(int argc,char** argv) {
-    if (argc<2) { std::fprintf(stderr,"uso: bb-run-eboot Image0 [max_passos] [--libc] [--hle]\n"); return 2; }
+int main(int argc, char** argv) {
+    std::vector<std::filesystem::path> args;
+#if defined(_WIN32)
+    int wargc = 0;
+    if (auto* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc)) {
+        for (int i = 0; i < wargc; ++i) args.emplace_back(wargv[i]);
+        LocalFree(wargv);
+    }
+#endif
+    if (args.empty()) {
+        for (int i = 0; i < argc; ++i) args.emplace_back(argv[i]);
+    }
+    if (args.size()<2) { std::fprintf(stderr,"uso: bb-run-eboot Image0 [max_passos] [--libc] [--hle]\n"); return 2; }
     try {
         std::uint64_t max_steps=50000000;
         bool linked=false, hle=false, budget_set=false;
-        for (int a=2;a<argc;++a) {
-            const std::string arg=argv[a];
+        for (std::size_t a=2;a<args.size();++a) {
+            const std::string arg = args[a].string();
             if (arg=="--libc") linked=true;
             else if (arg=="--hle") hle=true;
             else if (!budget_set && !arg.empty() && arg.find_first_not_of("0123456789")==std::string::npos) {
-                max_steps=std::strtoull(argv[a],nullptr,10);budget_set=true;
+                max_steps=std::strtoull(arg.c_str(),nullptr,10);budget_set=true;
             } else throw std::runtime_error("opcao desconhecida: "+arg);
         }
         bb::GuestMemory memory(768u<<20);
-        auto eboot=read_file(std::string(argv[1])+"/eboot.bin");
-        auto libc=linked?read_file(std::string(argv[1])+"/sce_module/libc.prx"):std::vector<std::uint8_t>{};
-        auto image=bb::Ps4Loader::load(memory,eboot,libc);
+        const std::filesystem::path root = args[1];
+        auto eboot=read_file(root/"eboot.bin");
+        std::map<std::string,std::vector<std::uint8_t>> modules;
+        std::uint64_t total=eboot.size();
+        const auto directory=root/"sce_module";
+        if (std::filesystem::is_directory(directory)) for (const auto& item:std::filesystem::directory_iterator(directory)) {
+            if (!item.is_regular_file() || item.path().extension()!=".prx") continue;
+            auto bytes=read_file(item.path());
+            if (bytes.size()>(512ull<<20)-total) throw std::runtime_error("total de arquivos excessivo");
+            total+=bytes.size();
+            modules.emplace(item.path().filename().string(),std::move(bytes));
+        }
+        if (linked && !modules.count("libc.prx")) throw std::runtime_error("libc.prx ausente");
+        auto image=linked ? bb::Ps4Loader::load(memory,eboot,modules.at("libc.prx"))
+                          : bb::Ps4Loader::load(memory,eboot,modules);
         bb::X86Interpreter cpu(memory);
         cpu.add_trap_range(0x7f000000,32*(image.imports.size()+1));
         cpu.add_trap_range(0x7e000000,4096*(image.imports.size()+1));
@@ -69,10 +97,10 @@ int main(int argc,char** argv) {
             bb::Ps4Bootstrap::module_call(memory,cpu.state,image.modules[i]);
             execute();
             if (result.stop!=bb::CpuStop::trap || result.rip!=bb::Ps4Bootstrap::exit_trap+32 || cpu.state.gpr[0]!=0) {
-                std::printf("modulo %zu nao inicializado: %s\n",i,result.describe().c_str());
+                std::printf("modulo %zu (%s) nao inicializado: %s\n",i,image.modules[i].name.c_str(),result.describe().c_str());
                 return 1;
             }
-            std::printf("modulo %zu inicializado apos %llu passos\n",i,static_cast<unsigned long long>(steps));
+            std::printf("modulo %zu (%s) inicializado apos %llu passos\n",i,image.modules[i].name.c_str(),static_cast<unsigned long long>(steps));
         }
         bb::Ps4Bootstrap::game_entry(memory,cpu.state,image);
         execute();
@@ -81,6 +109,6 @@ int main(int argc,char** argv) {
             std::printf("import chamado: %s\n",imp.name.c_str());
         if (result.rip>=0x10000000 && result.rip<0x70000000)
             std::printf("rip(imagem+)=0x%llx\n",static_cast<unsigned long long>(result.rip-0x10000000));
-        return 0;
+        return result.stop==bb::CpuStop::trap && result.rip==bb::Ps4Bootstrap::exit_trap ? 0 : 1;
     } catch (const std::exception& e) { std::fprintf(stderr,"erro: %s\n",e.what()); return 2; }
 }
