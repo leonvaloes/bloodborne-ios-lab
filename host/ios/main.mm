@@ -8,6 +8,7 @@
 #include "shader_translator.h"
 #include "metal_pipeline.h"
 #include "flver_parser.h"
+#include "game_asset_probe.h"
 #include <exception>
 #include <sys/utsname.h>
 #include <simd/simd.h>
@@ -22,6 +23,7 @@
     UILabel *_gpuStatus;
     UILabel *_subsystemStatus;
     UILabel *_documentStatus;
+    UILabel *_assetStatus;
     MTKView *_metal;
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
@@ -87,6 +89,13 @@
     [documentButton setTitle:@"Verificar teste-bblab.txt em Documents" forState:UIControlStateNormal];
     [documentButton addTarget:self action:@selector(checkDocument) forControlEvents:UIControlEventTouchUpInside];
 
+    _assetStatus = [UILabel new];
+    _assetStatus.numberOfLines = 0;
+    _assetStatus.text = @"SFO: coloque param.sfo em Documentos e toque em Verificar.";
+    UIButton *assetButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [assetButton setTitle:@"Verificar param.sfo via VFS" forState:UIControlStateNormal];
+    [assetButton addTarget:self action:@selector(checkGameAsset) forControlEvents:UIControlEventTouchUpInside];
+
     UIButton *run = [UIButton buttonWithType:UIButtonTypeSystem];
     [run setTitle:@"Executar testes completos (CPU, VFS, Áudio, Entrada)" forState:UIControlStateNormal];
     [run addTarget:self action:@selector(runTests) forControlEvents:UIControlEventTouchUpInside];
@@ -128,7 +137,7 @@
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
         title, scope, _status, run, _metal, _gpuStatus, _subsystemStatus,
-        documentButton, _documentStatus, dpadRow, actionsRow, exportButton]];
+        documentButton, _documentStatus, assetButton, _assetStatus, dpadRow, actionsRow, exportButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -407,6 +416,28 @@
         [result[@"valid"] boolValue] ? @"Texto UTF-8 registrado no relatorio." : @"Confira o arquivo em Documentos de BB Lab."];
 }
 
+- (void)checkGameAsset {
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    const auto probe = bb::probe_sfo_in_documents(documents.path ? documents.path.UTF8String : "");
+    NSString *status = [NSString stringWithUTF8String:probe.status.c_str()];
+    NSMutableDictionary *result = [@{@"path": @"/app0/param.sfo", @"status": status,
+        @"valid": @(probe.valid), @"size_bytes": @(probe.size_bytes),
+        @"crc32": @(probe.crc32)} mutableCopy];
+    if (probe.valid) {
+        NSString *titleId = [NSString stringWithUTF8String:probe.title_id.c_str()];
+        NSString *title = [NSString stringWithUTF8String:probe.title.c_str()];
+        NSString *version = [NSString stringWithUTF8String:probe.app_ver.c_str()];
+        result[@"title_id"] = titleId ? titleId : @"";
+        result[@"title"] = title ? title : @"";
+        result[@"app_ver"] = version ? version : @"";
+    }
+    result[@"checked_at"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
+    _report[@"sfo_probe"] = result;
+    _assetStatus.text = [NSString stringWithFormat:@"SFO via VFS: %@ (%llu bytes, %@).",
+        status, probe.size_bytes, probe.valid ? result[@"title_id"] : @"sem metadados"];
+}
+
 - (void)drawInMTKView:(MTKView *)view {
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
     id<CAMetalDrawable> drawable = view.currentDrawable;
@@ -499,6 +530,7 @@
 
 - (void)exportReport:(UIButton *)sender {
     [self checkDocument];
+    [self checkGameAsset];
     _report[@"timestamp"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     auto pacing = _pacingTracker.get_stats();
     _report[@"frame_pacing_p50_ms"] = @(pacing.p50_ms);

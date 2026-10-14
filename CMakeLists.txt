@@ -90,6 +90,7 @@ set(CORE_SOURCES
     core/kernel_threads.cpp
     core/manifest.cpp
     core/elf_parser.cpp
+    core/game_asset_probe.cpp
     core/guest_loader.cpp
     core/input.cpp
     core/vfs.cpp
@@ -132,7 +133,7 @@ else()
     target_link_libraries(bb-smoke PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder audio stability engine shader_translator metal_pipeline flver_parser)
+        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe audio stability engine shader_translator metal_pipeline flver_parser)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
@@ -144,6 +145,6 @@ else()
             "-DAOT=$<TARGET_FILE:bb-aot>" "-DSMOKE=$<TARGET_FILE:bb-smoke>"
             "-DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/add.hex"
             "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake")
-        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder audio stability engine shader_translator metal_pipeline flver_parser aot_rejection cli_integration PROPERTIES TIMEOUT 60)
+        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe audio stability engine shader_translator metal_pipeline flver_parser aot_rejection cli_integration PROPERTIES TIMEOUT 60)
     endif()
 endif()
