@@ -77,11 +77,11 @@ int main() {
             CHECK(r.steps == 0);
         }
         {   // unsupported opcode is reported, not skipped
-            Machine m{0x0F, 0x05};
+            Machine m{0x0F, 0x38, 0x00};
             const auto r = m.run();
             CHECK(r.stop == CpuStop::unsupported_opcode);
             CHECK(r.rip == CODE);
-            CHECK(r.byte_count >= 2 && r.bytes[0] == 0x0F && r.bytes[1] == 0x05);
+            CHECK(r.byte_count >= 2 && r.bytes[0] == 0x0F && r.bytes[1] == 0x38);
         }
         {   // divide by zero
             Machine m{0x31, 0xC9, 0xF7, 0xF1};
@@ -130,6 +130,77 @@ int main() {
             std::uint64_t ret = 0;
             CHECK(m.mem.load(m.cpu.state.gpr[4], &ret, 8) == MemoryError::ok);
             CHECK(ret == CODE + 12);
+        }
+        {   // pshufd: [1,2,3,4] -> [4,3,2,1]
+            Machine m{0x66, 0x0F, 0x70, 0xC1, 0x1B, 0xC3};
+            m.cpu.state.xmm[1][0] = 0x0000000200000001ULL;
+            m.cpu.state.xmm[1][1] = 0x0000000400000003ULL;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.xmm[0][0] == 0x0000000300000004ULL);
+            CHECK(m.cpu.state.xmm[0][1] == 0x0000000100000002ULL);
+        }
+        {   // paddb: modular, pcmpeqb: igualdade byte a byte
+            Machine m{0x66, 0x0F, 0xFC, 0xC1, 0x66, 0x0F, 0x74, 0xC1, 0xC3};
+            m.cpu.state.xmm[0][0] = 0xFF;
+            m.cpu.state.xmm[1][0] = 1;
+            CHECK(m.run(1).stop == CpuStop::step_limit);
+            CHECK(m.cpu.state.xmm[0][0] == 0);
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.xmm[0][0] == 0xFFFFFFFFFFFFFF00ULL);
+        }
+        {   // sqrtps [4,9,16,25] -> [2,3,4,5]
+            Machine m{0x0F, 0x51, 0xC1, 0xC3};
+            m.cpu.state.xmm[1][0] = 0x4110000040800000ULL;
+            m.cpu.state.xmm[1][1] = 0x41C8000041800000ULL;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.xmm[0][0] == 0x4040000040000000ULL);
+            CHECK(m.cpu.state.xmm[0][1] == 0x40A0000040800000ULL);
+        }
+        {   // endereçamento de 32 bits disp32 absoluto, GS após truncar endereço
+            Machine m{0x67, 0x65, 0x8B, 0x05, 0x20, 0, 0, 0, 0xC3};
+            m.cpu.state.gs_base = DATA - 0x20;
+            const std::uint32_t v = 0x12345678;
+            CHECK(m.mem.store(DATA, &v, 4) == MemoryError::ok);
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[0] == v);
+        }
+        {   // repne scasb encontra terceiro byte e deixa RCX=1
+            Machine m{0xF2, 0xAE, 0xC3};
+            const std::uint8_t v[] = {1, 2, 7, 9};
+            CHECK(m.mem.store(DATA, v, sizeof(v)) == MemoryError::ok);
+            m.cpu.state.gpr[0] = 7; m.cpu.state.gpr[7] = DATA; m.cpu.state.gpr[1] = 4;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[7] == DATA + 3 && m.cpu.state.gpr[1] == 1);
+            CHECK((m.cpu.state.rflags & FLAG_ZF) != 0);
+        }
+        {   // SSSE3 pshufb: identidade invertida e zero explícito
+            Machine m{0x66, 0x0F, 0x38, 0x00, 0xC1, 0xC3};
+            m.cpu.state.xmm[0][0] = 0x0706050403020100ULL;
+            m.cpu.state.xmm[0][1] = 0x0F0E0D0C0B0A0908ULL;
+            m.cpu.state.xmm[1][0] = 0x08090A0B0C0D0E0FULL;
+            m.cpu.state.xmm[1][1] = 0x8001020304050607ULL;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.xmm[0][0] == 0x08090A0B0C0D0E0FULL);
+            CHECK(m.cpu.state.xmm[0][1] == 0x0001020304050607ULL);
+        }
+        {   // palignr: deslocamento 14 de src:dest
+            Machine m{0x66, 0x0F, 0x3A, 0x0F, 0xC1, 14, 0xC3};
+            m.cpu.state.xmm[0][0] = 0x1122334455667788ULL;
+            m.cpu.state.xmm[0][1] = 0x99AABBCCDDEEFF00ULL;
+            m.cpu.state.xmm[1][1] = 0x2211000000000000ULL;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK((m.cpu.state.xmm[0][0] & 0xFFFFULL) == 0x2211);
+            CHECK(m.cpu.state.xmm[0][0] == 0x3344556677882211ULL);
+        }
+        {   // flags e syscall não escapam para o host
+            Machine m{0xF9, 0x9C, 0xF8, 0x9D, 0x0F, 0x05};
+            CHECK(m.run().stop == CpuStop::halt);
+            CHECK((m.cpu.state.rflags & FLAG_CF) != 0);
+        }
+        {   // decodificador estrutural
+            const std::uint8_t b[] = {0x66, 0x0F, 0x70, 0xC1, 0x1B};
+            const auto d = decode_x86(b, sizeof(b));
+            CHECK(d.length == 5 && d.opcode == 0x10170 && d.supported);
         }
         {   // ud2
             Machine m{0x0F, 0x0B};

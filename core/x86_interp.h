@@ -24,12 +24,24 @@ enum class CpuStop {
 
 const char* cpu_stop_name(CpuStop stop);
 
+// Decodificação estrutural (não executa bytes). length=0 indica instrução truncada.
+// supported significa que o interpretador reconhece a família; combinações inválidas
+// de prefixos/ModRM ainda podem produzir unsupported_opcode na execução.
+struct X86Decoded {
+    std::size_t length = 0;
+    std::uint32_t opcode = 0; // 0x0fXX, 0x0f38XX, 0x0f3aXX ou 0xVMPPXX
+    bool supported = false;
+};
+X86Decoded decode_x86(const std::uint8_t* bytes, std::size_t available);
+
 struct CpuState {
     std::uint64_t gpr[16] = {};   // rax rcx rdx rbx rsp rbp rsi rdi r8..r15
     std::uint64_t rip = 0;
     std::uint64_t rflags = 0x202;
     std::uint64_t xmm[16][2] = {};
+    std::uint64_t ymm_hi[16][2] = {};
     std::uint64_t fs_base = 0;
+    std::uint64_t gs_base = 0;
 };
 
 struct CpuRunResult {

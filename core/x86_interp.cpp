@@ -1,5 +1,7 @@
 #include "x86_interp.h"
 #include <cstring>
+#include <cmath>
+#include <limits>
 #include <sstream>
 
 namespace bb {
@@ -75,7 +77,7 @@ struct Exec {
     std::size_t n = 0, pos = 0;
     std::uint64_t start = 0;
     bool p66 = false, rep = false, repne = false, rex = false, rw = false, rr = false, rx = false,
-         rb = false, fs = false;
+         rb = false, fs = false, gs = false, addr32 = false;
     bool branched = false;
 
     Exec(CpuState& st, GuestMemory& mem) : s(st), m(mem) {}
@@ -153,8 +155,10 @@ struct Exec {
         if (mod == 1) disp += static_cast<std::int8_t>(u8());
         else if (mod == 2) disp += static_cast<std::int32_t>(u32());
         addr += static_cast<std::uint64_t>(disp);
-        if (riprel) addr += start + pos + static_cast<std::uint64_t>(imm_after);
+        if (riprel && !addr32) addr += start + pos + static_cast<std::uint64_t>(imm_after);
+        if (addr32) addr = static_cast<std::uint32_t>(addr);
         if (fs) addr += s.fs_base;
+        if (gs) addr += s.gs_base;
         return Rm{false, 0, addr};
     }
 
@@ -290,6 +294,52 @@ void Exec::two_byte(int opsz) {
     const std::uint8_t op2 = u8();
     int rg = 0;
     if (op2 == 0x0B) throw UdEx{};
+    if (op2 == 0x05) throw HaltEx{}; // syscall: trap, nunca chamar o kernel do host
+    if (op2 == 0x38 || op2 == 0x3A) {
+        const unsigned op3 = u8();
+        if (!p66 || (op2 == 0x38 && op3 != 0x00 && op3 != 0x40) ||
+            (op2 == 0x3A && op3 != 0x0F)) throw Unsupported{};
+        const int imm = op2 == 0x3A ? 1 : 0;
+        const Rm rm = decode_rm(rg, imm);
+        std::uint64_t src[2]; rd_xmm_rm(rm, src);
+        std::uint8_t a[16], b[16], out[16];
+        std::memcpy(a, s.xmm[rg], 16); std::memcpy(b, src, 16);
+        if (op2 == 0x3A) { // palignr concatena src:dest, deslocamento em bytes
+            const unsigned shift = u8();
+            for (unsigned i = 0; i < 16; ++i) {
+                const unsigned j = shift + i;
+                out[i] = j < 16 ? b[j] : j < 32 ? a[j - 16] : 0;
+            }
+        } else if (op3 == 0x00) { // pshufb: controle de alta bit zera o byte
+            for (int i = 0; i < 16; ++i) out[i] = b[i] & 0x80 ? 0 : a[b[i] & 15];
+        } else { // pmulld (produto modular de 32 bits)
+            for (int i = 0; i < 4; ++i) {
+                std::uint32_t x, y;
+                std::memcpy(&x, a + i * 4, 4); std::memcpy(&y, b + i * 4, 4);
+                const std::uint32_t z = x * y;
+                std::memcpy(out + i * 4, &z, 4);
+            }
+        }
+        std::memcpy(s.xmm[rg], out, 16);
+        return;
+    }
+    if (op2 == 0x31) { // contador determinístico sem relógio do host
+        s.gpr[0] = 0; s.gpr[2] = 0; return;
+    }
+    if (op2 == 0xA2) { // CPUID: perfil conservador Jaguar, sem anunciar AVX sem XSAVE
+        const std::uint32_t leaf = static_cast<std::uint32_t>(s.gpr[0]);
+        const std::uint32_t sub = static_cast<std::uint32_t>(s.gpr[1]);
+        std::uint32_t a = 0, b = 0, c = 0, d = 0;
+        if (leaf == 0) { a = 7; b = 0x68747541; d = 0x69746e65; c = 0x444d4163; }
+        else if (leaf == 1) {
+            a = 0x00700f01; c = (1u << 0) | (1u << 9) | (1u << 19) | (1u << 20) | (1u << 23);
+            d = (1u << 4) | (1u << 15) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);
+        } else if (leaf == 7 && sub == 0) b = (1u << 3); // BMI1
+        else if (leaf == 0x80000000u) a = 0x80000001u;
+        else if (leaf == 0x80000001u) { c = (1u << 5); d = (1u << 29); }
+        s.gpr[0] = a; s.gpr[3] = b; s.gpr[1] = c; s.gpr[2] = d;
+        return;
+    }
     if (op2 == 0x1F || op2 == 0x1E || op2 == 0x18 || op2 == 0x0D) {  // nop r/m, endbr64, prefetch
         decode_rm(rg, 0);
         return;
@@ -497,18 +547,111 @@ void Exec::sse(std::uint8_t op2, int opsz) {
         }
         return;
     }
-    case 0x58: case 0x59: case 0x5C: case 0x5E: {
-        if (!(rep || repne)) throw Unsupported{};
+    case 0x58: case 0x59: case 0x5C: case 0x5E: case 0x51: case 0x5D: case 0x5F: case 0x53: case 0x52: {
         const Rm rm = decode_rm(rg, 0);
-        if (rep) {
-            const float a = f32(s.xmm[rg][0]), b = f32(rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 4));
-            const float r = op2 == 0x58 ? a + b : op2 == 0x59 ? a * b : op2 == 0x5C ? a - b : a / b;
-            s.xmm[rg][0] = (s.xmm[rg][0] & ~0xFFFFFFFFULL) | bits32(r);
-        } else {
-            const double a = f64(s.xmm[rg][0]), b = f64(rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 8));
-            const double r = op2 == 0x58 ? a + b : op2 == 0x59 ? a * b : op2 == 0x5C ? a - b : a / b;
-            s.xmm[rg][0] = bits64(r);
+        const bool scalar = rep || repne;
+        const bool dbl = repne || (!scalar && pd);
+        const int width = dbl ? 8 : 4;
+        const int lanes = scalar ? 1 : 16 / width;
+        std::uint64_t src[2] = {};
+        if (rm.reg) { src[0] = s.xmm[rm.r][0]; src[1] = s.xmm[rm.r][1]; }
+        else if (scalar) src[0] = rd_mem(rm.addr, width);
+        else rd_xmm_rm(rm, src);
+        if (dbl && (op2 == 0x53 || op2 == 0x52)) throw Unsupported{};
+        for (int i = 0; i < lanes; ++i) {
+            const int word = (i * width) / 8, shift = (i * width % 8) * 8;
+            const std::uint64_t mask = mask_of(width);
+            const std::uint64_t a = (s.xmm[rg][word] >> shift) & mask, b = (src[word] >> shift) & mask;
+            std::uint64_t result = 0;
+            if (dbl) {
+                const double x = f64(a), y = f64(b);
+                const double z = op2 == 0x58 ? x + y : op2 == 0x59 ? x * y : op2 == 0x5C ? x - y
+                    : op2 == 0x5E ? x / y : op2 == 0x51 ? std::sqrt(y)
+                    : op2 == 0x5D ? (std::isnan(x) || std::isnan(y) || x == y ? y : (x < y ? x : y))
+                    : (std::isnan(x) || std::isnan(y) || x == y ? y : (x > y ? x : y));
+                result = bits64(z);
+            } else {
+                const float x = f32(a), y = f32(b);
+                const float z = op2 == 0x58 ? x + y : op2 == 0x59 ? x * y : op2 == 0x5C ? x - y
+                    : op2 == 0x5E ? x / y : op2 == 0x51 ? std::sqrt(y) : op2 == 0x53 ? 1.0f / y
+                    : op2 == 0x52 ? 1.0f / std::sqrt(y)
+                    : op2 == 0x5D ? (std::isnan(x) || std::isnan(y) || x == y ? y : (x < y ? x : y))
+                    : (std::isnan(x) || std::isnan(y) || x == y ? y : (x > y ? x : y));
+                result = bits32(z);
+            }
+            s.xmm[rg][word] = (s.xmm[rg][word] & ~(mask << shift)) | ((result & mask) << shift);
         }
+        return;
+    }
+    case 0x70: case 0xC6: {  // pshufd / shufps / shufpd
+        const Rm rm = decode_rm(rg, 1);
+        const unsigned imm = u8();
+        std::uint64_t src[2]; rd_xmm_rm(rm, src);
+        const std::uint64_t dst[2] = {s.xmm[rg][0], s.xmm[rg][1]};
+        if (op2 == 0x70 && pd) {
+            for (int i = 0; i < 4; ++i) {
+                const int idx = (imm >> (i * 2)) & 3;
+                const std::uint64_t v = (src[idx / 2] >> ((idx % 2) * 32)) & 0xFFFFFFFFULL;
+                const int j = i / 2, sh = (i % 2) * 32;
+                s.xmm[rg][j] = (s.xmm[rg][j] & ~(0xFFFFFFFFULL << sh)) | (v << sh);
+            }
+        } else if (op2 == 0xC6) {
+            if (pd) {
+                s.xmm[rg][0] = (imm & 1) ? dst[1] : dst[0];
+                s.xmm[rg][1] = (imm & 2) ? src[1] : src[0];
+            } else {
+                for (int i = 0; i < 4; ++i) {
+                    const int idx = (imm >> (i * 2)) & 3;
+                    const std::uint64_t* from = i < 2 ? dst : src;
+                    const std::uint64_t v = (from[idx / 2] >> ((idx % 2) * 32)) & 0xFFFFFFFFULL;
+                    const int j = i / 2, sh = (i % 2) * 32;
+                    s.xmm[rg][j] = (s.xmm[rg][j] & ~(0xFFFFFFFFULL << sh)) | (v << sh);
+                }
+            }
+        } else throw Unsupported{};
+        return;
+    }
+    case 0xD7: {  // pmovmskb
+        if (!pd) throw Unsupported{};
+        const Rm rm = decode_rm(rg, 0);
+        if (!rm.reg) throw UdEx{};
+        unsigned bits = 0;
+        for (int i = 0; i < 16; ++i)
+            bits |= static_cast<unsigned>((s.xmm[rm.r][i / 8] >> ((i % 8) * 8 + 7)) & 1) << i;
+        wr_reg(rg, 4, bits);
+        return;
+    }
+    case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A:
+    case 0xFC: case 0xFD: case 0xFE: case 0xD4:
+    case 0xF8: case 0xF9: case 0xFA: case 0xFB:
+    case 0x74: case 0x75: case 0x76: case 0xD5: {
+        if (!pd) throw Unsupported{};
+        const Rm rm = decode_rm(rg, 0);
+        std::uint64_t src[2]; rd_xmm_rm(rm, src);
+        std::uint8_t a[16], b[16], out[16];
+        std::memcpy(a, s.xmm[rg], 16); std::memcpy(b, src, 16);
+        const bool unpack = (op2 >= 0x60 && op2 <= 0x62) || (op2 >= 0x68 && op2 <= 0x6A);
+        const int width = (op2 == 0xD4 || op2 == 0xFB) ? 8
+                        : (op2 == 0xFE || op2 == 0xFA || op2 == 0x76) ? 4
+                        : (op2 == 0xFD || op2 == 0xF9 || op2 == 0x75 || op2 == 0xD5 || op2 == 0x61 || op2 == 0x69) ? 2 : 1;
+        if (unpack) {
+            const int first = op2 >= 0x68 ? 8 : 0;
+            for (int i = 0; i < 8 / width; ++i) {
+                std::memcpy(out + 2 * i * width, a + first + i * width, width);
+                std::memcpy(out + (2 * i + 1) * width, b + first + i * width, width);
+            }
+        } else {
+            for (int i = 0; i < 16; i += width) {
+                std::uint64_t x = 0, y = 0, z = 0;
+                std::memcpy(&x, a + i, width); std::memcpy(&y, b + i, width);
+                if (op2 >= 0x74 && op2 <= 0x76) z = x == y ? mask_of(width) : 0;
+                else if (op2 == 0xD5) z = x * y;
+                else if (op2 == 0xFC || op2 == 0xFD || op2 == 0xFE || op2 == 0xD4) z = x + y;
+                else z = x - y;
+                std::memcpy(out + i, &z, width);
+            }
+        }
+        std::memcpy(s.xmm[rg], out, 16);
         return;
     }
     case 0x2A: {  // cvtsi2ss / cvtsi2sd
@@ -559,8 +702,9 @@ void Exec::step() {
         else if (b == 0xF2) { repne = true; ++pos; }
         else if (b == 0xF0) { ++pos; }
         else if (b == 0x64) { fs = true; ++pos; }
-        else if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 || b == 0x65) { ++pos; }
-        else if (b == 0x67) { throw Unsupported{}; }
+        else if (b == 0x65) { gs = true; ++pos; }
+        else if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36) { ++pos; }
+        else if (b == 0x67) { addr32 = true; ++pos; }
         else break;
     }
     if (pos < n && buf[pos] >= 0x40 && buf[pos] <= 0x4F) {
@@ -707,19 +851,37 @@ void Exec::step() {
         else if (p66) wr_reg(2, 2, (s.gpr[0] & 0x8000) ? 0xFFFF : 0);
         else wr_reg(2, 4, (s.gpr[0] & 0x80000000ULL) ? 0xFFFFFFFFULL : 0);
         break;
+    case 0x9C: push(s.rflags | 2); break;
+    case 0x9D: s.rflags = (pop() & 0x00000000003F7FD7ULL) | 2; break;
+    case 0x9E: s.rflags = (s.rflags & ~0xD5ULL) | ((s.gpr[0] >> 8) & 0xD5); break;
+    case 0x9F: s.gpr[0] = (s.gpr[0] & ~0xFF00ULL) | (((s.rflags & 0xD5ULL) | 2) << 8); break;
+    case 0xF8: s.rflags &= ~FLAG_CF; break;
+    case 0xF9: s.rflags |= FLAG_CF; break;
+    case 0xFC: s.rflags &= ~FLAG_DF; break;
+    case 0xFD: s.rflags |= FLAG_DF; break;
     case 0xA8: alu(4, rd_reg(0, 1), u8(), 1); break;
     case 0xA9: { const std::uint64_t imm = imm_of(opsz == 2 ? 2 : 4); alu(4, rd_reg(0, opsz), imm, opsz); break; }
-    case 0xA4: case 0xA5: case 0xAA: case 0xAB: {
+    case 0xA4: case 0xA5: case 0xAA: case 0xAB:
+    case 0xA6: case 0xA7: case 0xAE: case 0xAF: case 0xAC: case 0xAD: {
         const int sz = (op & 1) ? opsz : 1;
         const bool movs = (op == 0xA4 || op == 0xA5);
         const std::int64_t step = (s.rflags & FLAG_DF) ? -sz : sz;
-        std::uint64_t count = (rep || repne) ? s.gpr[1] : 1;
+        const bool cmps = op == 0xA6 || op == 0xA7, scas = op == 0xAE || op == 0xAF;
+        const bool lods = op == 0xAC || op == 0xAD;
+        std::uint64_t count = (rep || repne) ? (addr32 ? static_cast<std::uint32_t>(s.gpr[1]) : s.gpr[1]) : 1;
         while (count) {
-            if (movs) { wr_mem(s.gpr[7], sz, rd_mem(s.gpr[6], sz)); s.gpr[6] += static_cast<std::uint64_t>(step); }
-            else wr_mem(s.gpr[7], sz, rd_reg(0, sz));
-            s.gpr[7] += static_cast<std::uint64_t>(step);
+            const std::uint64_t si = addr32 ? static_cast<std::uint32_t>(s.gpr[6]) : s.gpr[6];
+            const std::uint64_t di = addr32 ? static_cast<std::uint32_t>(s.gpr[7]) : s.gpr[7];
+            if (movs) wr_mem(di, sz, rd_mem(si + (fs ? s.fs_base : gs ? s.gs_base : 0), sz));
+            else if (cmps) alu(7, rd_mem(si + (fs ? s.fs_base : gs ? s.gs_base : 0), sz), rd_mem(di, sz), sz);
+            else if (scas) alu(7, rd_reg(0, sz), rd_mem(di, sz), sz);
+            else if (lods) wr_reg(0, sz, rd_mem(si + (fs ? s.fs_base : gs ? s.gs_base : 0), sz));
+            else wr_mem(di, sz, rd_reg(0, sz));
+            if (movs || cmps || lods) s.gpr[6] = addr32 ? static_cast<std::uint32_t>(s.gpr[6] + step) : s.gpr[6] + step;
+            if (!lods) s.gpr[7] = addr32 ? static_cast<std::uint32_t>(s.gpr[7] + step) : s.gpr[7] + step;
             --count;
-            if (rep || repne) s.gpr[1] = count;
+            if (rep || repne) s.gpr[1] = addr32 ? static_cast<std::uint32_t>(count) : count;
+            if ((cmps || scas) && (rep || repne) && count && ((s.rflags & FLAG_ZF) != 0) != rep) break;
         }
         break;
     }
@@ -742,6 +904,7 @@ void Exec::step() {
         wr_rm(rm, sz, imm);
         break;
     }
+    case 0xC8: { const std::uint16_t frame = u16(); const unsigned nesting = u8() & 31; if (nesting) throw Unsupported{}; push(s.gpr[5]); s.gpr[5] = s.gpr[4]; s.gpr[4] -= frame; break; }
     case 0xC9: { s.gpr[4] = s.gpr[5]; s.gpr[5] = pop(); break; }
     case 0xCC: throw HaltEx{};
     case 0xF4: throw HaltEx{};
@@ -816,7 +979,7 @@ void Exec::step() {
                 }
                 s.gpr[0] = q; s.gpr[2] = r;
             } else {
-                const int dsz = (sz == 1) ? 2 : sz;
+                const int dsz = sz == 1 ? 2 : sz * 2;
                 std::uint64_t dividend = (sz == 1) ? (s.gpr[0] & 0xFFFF)
                                        : ((rd_reg(2, sz) << (sz * 8)) | rd_reg(0, sz));
                 std::uint64_t q, r;
@@ -829,7 +992,7 @@ void Exec::step() {
                     if (sq != sext(static_cast<std::uint64_t>(sq) & mask_of(sz), sz)) throw DivErr{};
                     q = static_cast<std::uint64_t>(sq); r = static_cast<std::uint64_t>(sr);
                 }
-                if (sz == 1) { wr_reg(0, 1, q); wr_reg(4, 1, r); }  // AL, AH (no REX for AH here)
+                if (sz == 1) s.gpr[0] = (s.gpr[0] & ~0xFFFFULL) | (q & 0xFF) | ((r & 0xFF) << 8);
                 else { wr_reg(0, sz, q); wr_reg(2, sz, r); }
             }
         }
@@ -859,6 +1022,93 @@ void Exec::step() {
 }
 
 } // namespace
+
+X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
+    X86Decoded d;
+    if (!b || !n) return d;
+    n = n < 15 ? n : 15;
+    std::size_t p = 0;
+    bool p66 = false, f2 = false, f3 = false, w = false, vex = false;
+    while (p < n) {
+        const unsigned x = b[p];
+        if (x == 0x66) p66 = true;
+        else if (x == 0xF2) f2 = true;
+        else if (x == 0xF3) f3 = true;
+        else if (x == 0x67 || x == 0xF0 || x == 0x64 || x == 0x65 ||
+                 x == 0x2E || x == 0x3E || x == 0x26 || x == 0x36) {}
+        else break;
+        ++p;
+    }
+    if (p < n && b[p] >= 0x40 && b[p] <= 0x4F) { w = (b[p] & 8) != 0; ++p; }
+    if (p >= n) return d;
+    unsigned map = 0, op = b[p++], pp = p66 ? 1 : f3 ? 2 : f2 ? 3 : 0;
+    if (op == 0xC5 || op == 0xC4) {
+        vex = true;
+        if (p + (op == 0xC4 ? 2u : 1u) >= n) return d;
+        if (op == 0xC4) { map = b[p++] & 31; const unsigned v = b[p++]; pp = v & 3; w = (v & 128) != 0; }
+        else { map = 1; pp = b[p++] & 3; }
+        op = b[p++];
+    } else if (op == 0x0F) {
+        if (p >= n) return d;
+        map = 1; op = b[p++];
+        if (op == 0x38 || op == 0x3A) { map = op == 0x38 ? 2 : 3; if (p >= n) return d; op = b[p++]; }
+    }
+    d.opcode = (vex ? 0x100000u : 0) | (map << 16) | (pp << 8) | op;
+    bool modrm = false;
+    unsigned imm = 0;
+    if (map == 0) {
+        modrm = (op < 0x40 && (op & 7) < 4) || op == 0x63 || op == 0x69 || op == 0x6B ||
+            (op >= 0x80 && op <= 0x8F) || op == 0x8D || (op >= 0xC0 && op <= 0xC1) ||
+            (op >= 0xC6 && op <= 0xC7) || (op >= 0xD0 && op <= 0xD3) ||
+            (op >= 0xF6 && op <= 0xF7) || (op >= 0xFE);
+        if (op >= 0xB0 && op <= 0xBF) imm = op < 0xB8 ? 1 : w ? 8 : p66 ? 2 : 4;
+        if (op < 0x40 && (op & 7) >= 4 && (op & 7) <= 5) imm = (op & 7) == 4 ? 1 : p66 ? 2 : 4;
+        if (op == 0x68 || op == 0xE8 || op == 0xE9 || op == 0xA9) imm = 4;
+        if (op == 0x6A || op == 0xEB || op == 0xA8 || op == 0xCD || op == 0xC0 || op == 0xC1 || op == 0x6B || op == 0x80 || op == 0x83 || op == 0xC6) imm = 1;
+        if (op == 0x69 || op == 0x81 || op == 0xC7) imm = p66 ? 2 : 4;
+        if (op == 0xC2 || op == 0xC8) imm = 2 + (op == 0xC8);
+        if (op >= 0x70 && op <= 0x7F) imm = 1;
+        if (op >= 0xA0 && op <= 0xA3) imm = 8;
+        if (op >= 0xE0 && op <= 0xE3) imm = 1;
+        d.supported = (op < 0x40 && (op & 7) < 6) || (op >= 0x50 && op <= 0x5F) ||
+            (op >= 0x70 && op <= 0x8D) || (op >= 0x90 && op <= 0x99) ||
+            (op >= 0xA4 && op <= 0xAB) || (op >= 0xB0 && op <= 0xBF) ||
+            (op >= 0xC0 && op <= 0xC3) || op == 0xC6 || op == 0xC7 || op == 0xC9 || op == 0xCC ||
+            op == 0xE8 || op == 0xE9 || op == 0xEB || op == 0xF4 || op == 0xF6 || op == 0xF7 || op == 0xFE || op == 0xFF || op == 0x63 || op == 0x68 || op == 0x69 || op == 0x6A;
+    } else {
+        modrm = !(map == 1 && (op == 0x05 || op == 0x0B || op == 0x31 || op == 0xA2 || (op >= 0x80 && op <= 0x8F) || (op >= 0xC8 && op <= 0xCF)));
+        if (map == 1 && op >= 0x80 && op <= 0x8F) imm = 4;
+        if (map == 3 || (map == 1 && (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73 || op == 0xBA || op == 0xC2 || op == 0xC4 || op == 0xC5 || op == 0xC6))) imm = 1;
+        d.supported = !vex && map == 1 && ((op >= 0x80 && op <= 0x9F) ||
+            (op >= 0x40 && op <= 0x4F) || (op >= 0xC8 && op <= 0xCF) ||
+            op == 0x0B || op == 0x1F || op == 0x1E || op == 0x18 || op == 0x0D ||
+            op == 0xAF || op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF ||
+            op == 0xB0 || op == 0xB1 || op == 0xC0 || op == 0xC1 || op == 0xBA ||
+            op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB || op == 0xBC || op == 0xBD || op == 0xB8 ||
+            op == 0x10 || op == 0x11 || op == 0x28 || op == 0x29 || op == 0x6F || op == 0x7F ||
+            op == 0x6E || op == 0x7E || op == 0xD6 || op == 0xEF || op == 0x57 ||
+            (op >= 0x54 && op <= 0x5F) || (op >= 0x58 && op <= 0x62) ||
+            op == 0x68 || op == 0x69 || op == 0x6A || op == 0xDB || op == 0xDF || op == 0xEB ||
+            (op >= 0xF8 && op <= 0xFE) || (op >= 0x74 && op <= 0x76) || op == 0xD4 || op == 0xD5 || op == 0xD7 ||
+            op == 0x70 || op == 0xC6 || (op >= 0x2A && op <= 0x2F));
+        if (!vex && map == 2 && pp == 1 && (op == 0x00 || op == 0x40)) d.supported = true;
+        if (!vex && map == 3 && pp == 1 && op == 0x0F) d.supported = true;
+    }
+    if (modrm) {
+        if (p >= n) return X86Decoded{};
+        const unsigned m = b[p++], mode = m >> 6, rm = m & 7;
+        if (map == 0 && (op == 0xF6 || op == 0xF7) && ((m >> 3) & 7) < 2) imm = op == 0xF6 ? 1 : p66 ? 2 : 4;
+        if (mode != 3) {
+            if (rm == 4) { if (p >= n) return X86Decoded{}; const unsigned sib = b[p++]; if (mode == 0 && (sib & 7) == 5) p += 4; }
+            else if (mode == 0 && rm == 5) p += 4;
+            if (mode == 1) ++p;
+            if (mode == 2) p += 4;
+        }
+    }
+    p += imm;
+    if (p <= n && p <= 15) d.length = p;
+    return d;
+}
 
 const char* cpu_stop_name(CpuStop stop) {
     switch (stop) {
@@ -898,13 +1148,24 @@ bool X86Interpreter::in_trap(std::uint64_t rip) const {
 
 CpuRunResult X86Interpreter::run(std::uint64_t max_steps) {
     CpuRunResult out;
+    Exec e(state, mem_);
     while (out.steps < max_steps) {
         out.rip = state.rip;
         if (in_trap(state.rip)) { out.stop = CpuStop::trap; return out; }
-        Exec e(state, mem_);
         e.start = state.rip;
-        for (std::size_t len = 15; len > 0; --len) {
-            if (mem_.load(e.start, e.buf, len) == MemoryError::ok) { e.n = len; break; }
+        e.pos = e.n = 0;
+        e.p66 = e.rep = e.repne = e.rex = e.rw = e.rr = e.rx = e.rb = false;
+        e.fs = e.gs = e.addr32 = e.branched = false;
+        if (mem_.load(e.start, e.buf, 15) == MemoryError::ok) e.n = 15;
+        else {
+            // Busca binária pelo prefixo acessível, preservando fault no byte exato.
+            std::size_t lo = 0, hi = 15;
+            while (lo + 1 < hi) {
+                const std::size_t mid = (lo + hi) / 2;
+                if (mem_.load(e.start, e.buf, mid) == MemoryError::ok) lo = mid;
+                else hi = mid;
+            }
+            e.n = lo;
         }
         auto capture = [&]() {
             out.byte_count = e.n < sizeof(out.bytes) ? e.n : sizeof(out.bytes);
