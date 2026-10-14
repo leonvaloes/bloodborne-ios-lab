@@ -174,7 +174,7 @@
     (void)note;
     _report[@"gamepad_connected"] = @YES;
     _subsystemStatus.text = [NSString stringWithFormat:@"GameController MFi/DualSense conectado: %@",
-        GCController.controllers.firstObject.vendorName ?: @"Compatível"];
+        (GCController.controllers.firstObject.vendorName ? GCController.controllers.firstObject.vendorName : @"Compatível")];
 }
 
 - (void)onVirtualButtonTouch:(UIButton *)sender {

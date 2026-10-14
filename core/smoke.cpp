@@ -223,7 +223,8 @@ SmokeReport smoke() {
     check(ring.write(smp, 2) == 2);
     std::int16_t out_smp[4] = {0};
     check(ring.read(out_smp, 2) == 2 && out_smp[0] == 1);
-    check(ring.read(out_smp, 10) == 0); // Underflow intencional
+    std::vector<std::int16_t> underflow_smp(20, 0);
+    check(ring.read(underflow_smp.data(), 10) == 0); // Underflow intencional
     check(ring.get_stats().underflow_count >= 1);
     AudioManager audio;
     check(audio.init({48000, 2, 64}));
