@@ -19,11 +19,18 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 
 namespace bb {
 SmokeReport smoke() {
     SmokeReport report{0, 0};
-    const auto check = [&report](bool passed) { ++report.checks; if (!passed) ++report.failures; };
+    const auto check = [&report](bool passed) {
+        ++report.checks;
+        if (!passed) {
+            ++report.failures;
+            std::cerr << "smoke: check #" << report.checks << " failed\n";
+        }
+    };
 
     // Legacy baseline checks (6 checks)
     check(fixture_add(1, 2).value == 3);
