@@ -102,6 +102,7 @@ set(CORE_SOURCES
     core/pad_hle.cpp
     core/user_service.cpp
     core/touch_controls.cpp
+    core/dialog_hle.cpp
     core/vfs.cpp
     core/binder.cpp
     core/game_package.cpp
@@ -163,7 +164,7 @@ else()
     target_link_libraries(bb-run-eboot PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-foreach(name guest_scheduler memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls vfs binder game_package game_asset_probe boot_probe audio audio_out ngs2_hle stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 gnm_context video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle)
+foreach(name guest_scheduler memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls dialog_hle vfs binder game_package game_asset_probe boot_probe audio audio_out ngs2_hle stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 gnm_context video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
