@@ -401,7 +401,7 @@ OrbisRuntime::InvocationResult OrbisRuntime::complete_callback(CpuState& cpu, Gu
 }
 std::uint64_t OrbisRuntime::handle(const std::string& n, const CpuState& c) {
     auto a=[&](unsigned i){return arg(c,i);};
-    if (n=="_init_env") return 0;
+    if (n=="_init_env" || n=="_sceKernelRtldSetApplicationHeapAPI") return 0;
     if (n=="sceKernelGetProcParam") return procparam_;
     if (n=="atexit" || n=="__cxa_atexit") {
         if (!a(0)) return invalid;
