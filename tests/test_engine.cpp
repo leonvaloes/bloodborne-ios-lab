@@ -64,7 +64,7 @@ int main() { return run([] {
     player.blood_echoes = 42500;
     player.hp = 850;
     player.stamina = 120;
-    std::strncpy(player.weapon_name, "Saw Cleaver +3", sizeof(player.weapon_name) - 1);
+    std::memcpy(player.weapon_name, "Saw Cleaver +3", sizeof("Saw Cleaver +3"));
 
     CHECK(engine.save_game_state("slot_001", &player, sizeof(player)));
 
