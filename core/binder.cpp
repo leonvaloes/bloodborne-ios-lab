@@ -47,21 +47,9 @@ static inline std::uint32_t read_le32(const std::uint8_t *p) {
            (static_cast<std::uint32_t>(p[3]) << 24);
 }
 
-static inline void write_le32(std::uint8_t *p, std::uint32_t val) {
-    p[0] = static_cast<std::uint8_t>(val & 0xFF);
-    p[1] = static_cast<std::uint8_t>((val >> 8) & 0xFF);
-    p[2] = static_cast<std::uint8_t>((val >> 16) & 0xFF);
-    p[3] = static_cast<std::uint8_t>((val >> 24) & 0xFF);
-}
-
 static inline std::uint64_t read_le64(const std::uint8_t *p) {
     return static_cast<std::uint64_t>(read_le32(p)) |
            (static_cast<std::uint64_t>(read_le32(p + 4)) << 32);
-}
-
-static inline void write_le64(std::uint8_t *p, std::uint64_t val) {
-    write_le32(p, static_cast<std::uint32_t>(val & 0xFFFFFFFFu));
-    write_le32(p + 4, static_cast<std::uint32_t>((val >> 32) & 0xFFFFFFFFu));
 }
 
 static std::uint32_t compute_adler32(const std::uint8_t *data, std::size_t len) {
