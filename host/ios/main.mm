@@ -392,6 +392,10 @@
             NSData *bytes = [NSData dataWithContentsOfURL:file options:NSDataReadingMappedIfSafe error:&error];
             if (!bytes) {
                 result[@"status"] = @"read_error";
+                if (error) {
+                    result[@"error_domain"] = error.domain;
+                    result[@"error_code"] = @(error.code);
+                }
             } else {
                 NSString *content = [[NSString alloc] initWithData:bytes encoding:NSUTF8StringEncoding];
                 if (!content) {
@@ -406,8 +410,15 @@
                 }
             }
         }
-    } else if (error && error.code != NSFileNoSuchFileError) {
-        result[@"status"] = @"read_error";
+    } else if (error) {
+        if ([error.domain isEqualToString:NSCocoaErrorDomain] &&
+            (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError)) {
+            result[@"status"] = @"not_found";
+        } else {
+            result[@"status"] = @"read_error";
+            result[@"error_domain"] = error.domain;
+            result[@"error_code"] = @(error.code);
+        }
     }
     result[@"checked_at"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     _report[@"documents_test"] = result;

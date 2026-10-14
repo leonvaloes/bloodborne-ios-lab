@@ -18,3 +18,9 @@ Teste host: `test_game_asset_probe` cobre ausente, sintese valida, cabecalho inv
 ## Limites
 
 Este teste valida somente montagem do diretorio, leitura de um arquivo de metadados e parsing SFO. Nao demonstra ingestao de BHD5/BDT, descompressao DCX, execucao do `eboot`, graficos do jogo ou jogabilidade. `game_execution` permanece `false`.
+
+## Evidencia no iPhone (14/10/2026, 12:23:32 UTC)
+
+O usuario exportou o diagnostico do build `d4d168a52f1fd164c9323526c1f0b0a784da67ff` no iPhone 15 Pro Max (`iPhone16,2`, iOS 26.6.2). `sfo_probe` registrou `status = ok`, `valid = true`, `size_bytes = 1760`, `crc32 = 633060768`, `title_id = CUSA03173`, `app_ver = 01.09` e `title = Bloodborne(TM)` (o JSON real usa o simbolo de marca registrada). O tamanho e CRC32 conferem com os bytes do `Sc0/param.sfo` local. Resultado: leitura do arquivo via VFS e parsing de metadados confirmados no aparelho.
+
+No mesmo relatorio, `documents_test.status = read_error` para o arquivo de texto do teste anterior. O codigo desse build nao registrava o erro de Foundation e comparava apenas `NSFileNoSuchFileError`, entao nao e possivel distinguir ausencia do arquivo de outra falha so por esse JSON. A falha do arquivo de texto nao invalida o SFO, mas tambem nao deve ser ocultada: a classificacao e o diagnostico de erro foram corrigidos para uma proxima build. `game_execution = false` continua.
