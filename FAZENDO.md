@@ -1,46 +1,25 @@
-﻿# FAZENDO — Atividades em Andamento Imediato
+# FAZENDO — Atividades em Andamento Imediato
 
-**Fase:** Execução Paralela Multi-Agente (Sprints 1 a 4 em branches dedicadas)  
+**Fase:** Integracao Total Multi-Agente Concluida e Validacao Lead QA Final  
 **Orquestrador:** AGENTE 5 (Integrador e Lead QA) — Pasta `bloodborne-ios-lab` (branch `main`)  
-**Status da Suite de Testes:** 18/18 testes aprovados (100% verde)  
-**Status do Pipeline IPA:** Compilação e empacotamento iOS arm64 100% verde (`BBHost-unsigned-arm64`)  
+**Status da Suite de Testes:** 21/21 testes aprovados (100% verde)  
+**Status do Pipeline IPA:** Compilacao e empacotamento iOS arm64 100% verde (`BBHost-unsigned-arm64`)  
 
 ---
 
-## Matriz de Execução por Agente e Terminal
+## Matriz de Execucao por Agente e Terminal
 
-| Agente | Terminal / Pasta | Branch | Tarefas em Andamento | Status |
+| Agente | Terminal / Pasta | Branch | Tarefas Realizadas | Status |
 |:---:|---|---|---|:---:|
-| **Agente 1** | worktrees/agent1-vfs | feature/vfs-bdt-ingestion | **Sprint 1 Concluída:** Implementação de core/binder.h/.cpp (BHD5/BDT parser) e descompressor DCX em streaming. | *Concluído / Integrado na main* |
-| **Agente 2** | worktrees/agent2-metal | feature/metal3-shaders | **Sprint 2 Concluída:** Tradução SPIR-V para Metal MSL 3.0, pipeline Metal 3 e parser FLVER 3D. | *Concluído / Pronto para Merge* |
-| **Agente 3** | worktrees/agent3-aot | feature/aot-batch | **Sprint 3 Concluída:** Lifter x86-64, Recompilador AOT em lote, Indirect Dispatcher com batch registry e validação no eboot.elf real. | *Concluído / 100% Verde* |
-| **Agente 4** | worktrees/agent4-hle | feature/hle-audio-threads | **Sprint 4 Concluída:** Primitivas de multithreading do Orbis OS sobre pthreads e integração da LibAtrac9. | *Concluído / Integrado na main* |
-
-| **Agente 5** | `bloodborne-ios-lab` | `main` | **Integração Contínua e QA:** Gestão do board, revisão de commits dos agentes 1 a 4, merge das features validadas, execução da suite de 18 testes e garantia do build IPA. | *Ativo / 100% Verde* |
+| **Agente 1** | `worktrees/agent1-vfs` | `feature/vfs-bdt-ingestion` | **Sprint 1 Concluida:** Parser de contêineres BHD5/BDT e descompressor DCX em streaming. | *Concluido / Integrado na main* |
+| **Agente 2** | `worktrees/agent2-metal` | `feature/metal3-shaders` | **Sprint 2 Concluida:** Tradutor SPIR-V -> MSL 3.0, Argument Buffers Tier 2, Leitor FLVER2 e Pipeline 3D com Depth32Float e Blinn-Phong no host iOS. | *Concluido / Integrado na main* |
+| **Agente 3** | `worktrees/agent3-aot` | `feature/aot-batch` | **Sprint 3 Concluida:** Lifter x86-64, Recompilador AOT em lote, Indirect Dispatcher com batch registry e validacao no `eboot.elf` real. | *Concluido / Integrado na main* |
+| **Agente 4** | `worktrees/agent4-hle` | `feature/hle-audio-threads` | **Sprint 4 Concluida:** Primitivas de multithreading do Orbis OS sobre pthreads e integracao da LibAtrac9. | *Concluido / Integrado na main* |
+| **Agente 5** | `bloodborne-ios-lab` | `main` | **Integracao Continua e QA:** Unificacao total das 4 branches, compilacao das 21 suites de testes + smoke test com 118 verificacoes, garantia do build IPA e documentacao por sprints. | *Concluido / 100% Verde* |
 
 ---
 
-## Detalhamento das Tarefas em Andamento:
-
-### 1. Terminal 1 (Agente 1) — Leitor BHD5/BDT e Descompressor DCX
-- **Módulo:** `core/binder.h` e `core/binder.cpp`.
-- **Objetivo:** O Bloodborne armazena seus assets em contêineres `.bdt` indexados por `.bhd5`. O leitor precisa realizar streaming sob demanda de arquivos específicos diretamente para o VFS sem carregar 30 GB na RAM.
-- **Descompressão DCX:** Suporte a arquivos compactados (KRAK / Deflate) para extração transparente de texturas e modelos.
-
-### 2. Terminal 2 (Agente 2) — Tradutor de Shaders SPIR-V e Geometria FLVER
-- **Módulos:** `core/shader_translator.h` e `core/flver_parser.h`.
-- **Objetivo:** Traduzir shaders compilados PS4/Vulkan para Metal Shading Language (MSL) e carregar a geometria dos modelos do jogo na GPU Apple A17 Pro com layout de memória unificada.
-
-### 3. Terminal 3 (Agente 3) — Recompilador AOT em Lote (x86-64 → arm64)
-- **Módulo:** `tools/aot.cpp` e `tools/aot_main.cpp`.
-- **Objetivo:** Recompilar em C++ estático as seções de código do executável `eboot.elf` (84,85 MB), gerando blocos sem dependência de JIT ou permissões proibidas `RWX`.
-
-### 4. Terminal 4 (Agente 4) — Multithreading Orbis OS e Áudio ATRAC9
-- **Módulos:** `core/kernel_threads.h` e integração da LibAtrac9.
-- **Objetivo:** Emular chamadas de semáforos/mutexes leves (`sceKernelCreateSema`, `sceKernelWaitSema`) e alimentar o ring buffer estéreo de 48.000 Hz com pacotes decodificados.
-
-### 5. Terminal 5 (Agente 5) — Orquestração de QA e Integridade do Pipeline
-- **Branches Sincronizadas:** As 4 branches de feature (`feature/vfs-bdt-ingestion`, `feature/metal3-shaders`, `feature/aot-batch`, `feature/hle-audio-threads`) foram sincronizadas com o commit mais recente da `main` (`93f31b0`).
-- **Validação Local:** Script `tools/test-windows.ps1` ajustado para execução transparente a partir de qualquer worktree.
-- **Suite de 18 Testes:** Execução contínua com 100% de aprovação (tempo de execução: ~2.2 s no host Windows).
-- **Pipeline Remoto de IPA:** GitHub Actions monitorado em tempo real com compilação e artefato `BBHost-unsigned-arm64` ativo.
+## Proximas Atividades Imediatas (Sprint 5 / Empacotamento de Assets):
+1. **Transferencia dos Assets do Jogo:** Conectar o iPhone 15 Pro Max ao Windows via USB e copiar a pasta `dvdroot_ps4/` extraida de Bloodborne para a pasta de documentos do app via iTunes ou Sideloadly.
+2. **Execucao do Pipeline AOT Completo:** Rodar `bb-aot --batch-elf` para gerar todas as unidades de traducao C++ do `eboot.bin` completo do jogo.
+3. **Execucao e Jogabilidade em Hardware:** Inicializar o aplicativo no iPhone 15 Pro Max com os dados montados no VFS e validar o boot completo do jogo.

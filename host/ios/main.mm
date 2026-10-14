@@ -5,10 +5,15 @@
 #include "smoke.h"
 #include "stability.h"
 #include "input.h"
+#include "shader_translator.h"
+#include "metal_pipeline.h"
+#include "flver_parser.h"
 #include <exception>
 #include <sys/utsname.h>
 #include <simd/simd.h>
 #include <chrono>
+#include <vector>
+#include <cstring>
 
 @interface LabController : UIViewController <MTKViewDelegate>
 @end
@@ -19,7 +24,14 @@
     MTKView *_metal;
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
-    id<MTLBuffer> _uniformBuffer;
+    id<MTLDepthStencilState> _depthState;
+    id<MTLBuffer> _vertexBuffer;
+    id<MTLBuffer> _indexBuffer;
+    uint32_t _indexCount;
+    id<MTLBuffer> _mvpBuffer;
+    id<MTLBuffer> _lightingBuffer;
+    id<MTLTexture> _diffuseTexture;
+    id<MTLSamplerState> _samplerState;
     NSMutableDictionary *_report;
     NSUInteger _completedFrames;
     float _angle;
@@ -27,6 +39,8 @@
     bb::FramePacingTracker _pacingTracker;
     bb::MemoryMonitor _memoryMonitor;
     bb::InputManager _inputManager;
+    uint32_t _modelVertexCount;
+    uint32_t _modelTriangleCount;
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -96,10 +110,12 @@
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     _metal = [[MTKView alloc] initWithFrame:CGRectZero device:device];
     _metal.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+    _metal.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
     _metal.clearColor = MTLClearColorMake(0.04, 0.05, 0.09, 1);
+    _metal.clearDepth = 1.0;
     _metal.preferredFramesPerSecond = 30;
     _metal.paused = YES;
-    [_metal.heightAnchor constraintEqualToConstant:180].active = YES;
+    [_metal.heightAnchor constraintEqualToConstant:220].active = YES;
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
         title, scope, _status, run, _metal, _gpuStatus, _subsystemStatus, dpadRow, actionsRow, exportButton]];
@@ -133,31 +149,158 @@
     _report[@"metal_max_buffer_length"] = @(device.maxBufferLength);
 
     _queue = [device newCommandQueue];
-    _uniformBuffer = [device newBufferWithLength:sizeof(simd_float4x4) options:MTLResourceStorageModeShared];
 
-    NSString *shader = @"#include <metal_stdlib>\n"
-        "using namespace metal;\n"
-        "struct VertexOut { float4 position [[position]]; float4 color; };\n"
-        "struct Uniforms { float4x4 transform; };\n"
-        "vertex VertexOut triangle_vs(uint i [[vertex_id]], constant Uniforms &u [[buffer(0)]]) {\n"
-        "    const float2 pos[3] = {float2(0, 0.75), float2(-0.7, -0.7), float2(0.7, -0.7)};\n"
-        "    const float4 col[3] = {float4(0.9, 0.2, 0.15, 1), float4(0.2, 0.8, 0.3, 1), float4(0.2, 0.4, 0.9, 1)};\n"
-        "    VertexOut out;\n"
-        "    out.position = u.transform * float4(pos[i], 0, 1);\n"
-        "    out.color = col[i];\n"
-        "    return out;\n"
-        "}\n"
-        "fragment float4 color_fs(VertexOut in [[stage_in]]) { return in.color; }\n";
+    MTLDepthStencilDescriptor *depthDesc = [MTLDepthStencilDescriptor new];
+    depthDesc.depthCompareFunction = MTLCompareFunctionLessEqual;
+    depthDesc.depthWriteEnabled = YES;
+    _depthState = [device newDepthStencilStateWithDescriptor:depthDesc];
+
+    bb::TranslationOptions opts{};
+    opts.msl_version = 30000;
+    opts.enable_argument_buffers = false;
+    opts.flip_vertex_y = true;
+
+    auto vs_spv = bb::ShaderTranslator::build_basic_vertex_spirv();
+    auto vs_res = bb::ShaderTranslator::translate_spirv_to_msl(vs_spv, opts);
+    if (!vs_res.success) {
+        [self gpuError:[NSString stringWithUTF8String:vs_res.error_message.c_str()]];
+        return;
+    }
+
+    auto fs_spv = bb::ShaderTranslator::build_basic_fragment_spirv();
+    auto fs_res = bb::ShaderTranslator::translate_spirv_to_msl(fs_spv, opts);
+    if (!fs_res.success) {
+        [self gpuError:[NSString stringWithUTF8String:fs_res.error_message.c_str()]];
+        return;
+    }
 
     NSError *error = nil;
-    id<MTLLibrary> library = [device newLibraryWithSource:shader options:nil error:&error];
-    if (!library || !_queue) { [self gpuError:error ? error.localizedDescription : @"Falha ao criar biblioteca Metal"]; return; }
+    NSString *vsSource = [NSString stringWithUTF8String:vs_res.msl_source.c_str()];
+    id<MTLLibrary> vsLib = [device newLibraryWithSource:vsSource options:nil error:&error];
+    if (!vsLib) {
+        [self gpuError:error ? error.localizedDescription : @"Falha ao compilar Vertex Shader MSL"];
+        return;
+    }
+
+    NSString *fsSource = [NSString stringWithUTF8String:fs_res.msl_source.c_str()];
+    id<MTLLibrary> fsLib = [device newLibraryWithSource:fsSource options:nil error:&error];
+    if (!fsLib) {
+        [self gpuError:error ? error.localizedDescription : @"Falha ao compilar Fragment Shader MSL"];
+        return;
+    }
+
+    MTLVertexDescriptor *vdesc = [MTLVertexDescriptor new];
+    vdesc.attributes[0].format = MTLVertexFormatFloat3;
+    vdesc.attributes[0].offset = 0;
+    vdesc.attributes[0].bufferIndex = 0;
+
+    vdesc.attributes[1].format = MTLVertexFormatFloat3;
+    vdesc.attributes[1].offset = 3 * sizeof(float);
+    vdesc.attributes[1].bufferIndex = 0;
+
+    vdesc.attributes[2].format = MTLVertexFormatFloat2;
+    vdesc.attributes[2].offset = 6 * sizeof(float);
+    vdesc.attributes[2].bufferIndex = 0;
+
+    vdesc.layouts[0].stride = 12 * sizeof(float);
+    vdesc.layouts[0].stepRate = 1;
+    vdesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+
     MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
-    descriptor.vertexFunction = [library newFunctionWithName:@"triangle_vs"];
-    descriptor.fragmentFunction = [library newFunctionWithName:@"color_fs"];
+    descriptor.vertexFunction = [vsLib newFunctionWithName:[NSString stringWithUTF8String:vs_res.reflection.entry_point_name.c_str()]];
+    descriptor.fragmentFunction = [fsLib newFunctionWithName:[NSString stringWithUTF8String:fs_res.reflection.entry_point_name.c_str()]];
+    descriptor.vertexDescriptor = vdesc;
     descriptor.colorAttachments[0].pixelFormat = _metal.colorPixelFormat;
+    descriptor.depthAttachmentPixelFormat = _metal.depthStencilPixelFormat;
+
     _pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-    if (!_pipeline) { [self gpuError:error ? error.localizedDescription : @"Falha no pipeline"]; return; }
+    if (!_pipeline) { [self gpuError:error ? error.localizedDescription : @"Falha no pipeline 3D"]; return; }
+
+    bb::FlverModel model;
+    std::string parseErr;
+    bool loadedFromDisk = false;
+
+    NSArray *docDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (docDirs.count > 0) {
+        NSString *flverPath = [docDirs.firstObject stringByAppendingPathComponent:@"dvdroot_ps4/map/m24_00_00_00/m24_00_00_00_900091.flver.dcx"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:flverPath]) {
+            loadedFromDisk = bb::FlverParser::parse_file([flverPath UTF8String], model, parseErr);
+        }
+    }
+
+    if (!loadedFromDisk) {
+        auto cleaverBytes = bb::FlverParser::create_synthetic_flver_saw_cleaver();
+        bb::FlverParser::parse(cleaverBytes.data(), cleaverBytes.size(), model, parseErr);
+    }
+
+    bb::MetalMeshBuffer mesh = bb::FlverParser::convert_to_metal_buffers(model);
+    _modelVertexCount = mesh.vertex_count;
+    _modelTriangleCount = mesh.index_count / 3;
+    _indexCount = mesh.index_count;
+
+    _vertexBuffer = [device newBufferWithBytes:mesh.vertex_data.data()
+                                        length:mesh.vertex_data.size() * sizeof(float)
+                                       options:MTLResourceStorageModeShared];
+
+    _indexBuffer = [device newBufferWithBytes:mesh.index_data.data()
+                                       length:mesh.index_data.size() * sizeof(uint32_t)
+                                      options:MTLResourceStorageModeShared];
+
+    _mvpBuffer = [device newBufferWithLength:sizeof(bb::ModelViewProjectionUniforms)
+                                     options:MTLResourceStorageModeShared];
+
+    _lightingBuffer = [device newBufferWithLength:sizeof(bb::LightingUniforms)
+                                          options:MTLResourceStorageModeShared];
+
+    bb::LightingUniforms lighting{};
+    lighting.dir_light_direction[0] = 0.577f;
+    lighting.dir_light_direction[1] = -0.577f;
+    lighting.dir_light_direction[2] = 0.577f;
+    lighting.dir_light_direction[3] = 0.0f;
+    lighting.dir_light_color[0] = 1.0f;
+    lighting.dir_light_color[1] = 0.95f;
+    lighting.dir_light_color[2] = 0.85f;
+    lighting.dir_light_color[3] = 1.0f;
+    lighting.ambient_light[0] = 0.15f;
+    lighting.ambient_light[1] = 0.18f;
+    lighting.ambient_light[2] = 0.22f;
+    lighting.ambient_light[3] = 1.0f;
+    lighting.camera_position[0] = 0.0f;
+    lighting.camera_position[1] = 1.2f;
+    lighting.camera_position[2] = 2.8f;
+    lighting.camera_position[3] = 1.0f;
+    lighting.specular_power = 32.0f;
+    lighting.roughness = 0.35f;
+    std::memcpy(_lightingBuffer.contents, &lighting, sizeof(lighting));
+
+    MTLTextureDescriptor *texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64 height:64 mipmapped:NO];
+    _diffuseTexture = [device newTextureWithDescriptor:texDesc];
+    std::vector<uint32_t> texPixels(64 * 64);
+    for (int y = 0; y < 64; ++y) {
+        for (int x = 0; x < 64; ++x) {
+            bool check = ((x / 8) ^ (y / 8)) & 1;
+            uint8_t base = check ? 180 : 130;
+            uint8_t noise = static_cast<uint8_t>(((x * 37 + y * 17) ^ 0x5A) % 30);
+            uint8_t r = base + noise;
+            uint8_t g = static_cast<uint8_t>(base * 0.9f) + noise;
+            uint8_t b = static_cast<uint8_t>(base * 0.8f) + noise;
+            texPixels[y * 64 + x] = (0xFF << 24) | (b << 16) | (g << 8) | r;
+        }
+    }
+    [_diffuseTexture replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:texPixels.data() bytesPerRow:64 * sizeof(uint32_t)];
+
+    MTLSamplerDescriptor *samplerDesc = [MTLSamplerDescriptor new];
+    samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
+    samplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
+    samplerDesc.sAddressMode = MTLSamplerAddressModeRepeat;
+    samplerDesc.tAddressMode = MTLSamplerAddressModeRepeat;
+    _samplerState = [device newSamplerStateWithDescriptor:samplerDesc];
+
+    _report[@"metal_flver_vertices"] = @(_modelVertexCount);
+    _report[@"metal_flver_triangles"] = @(_modelTriangleCount);
+    _report[@"metal_depth_buffer"] = @"Depth32Float";
+    _report[@"metal_shader_msl_version"] = @"3.0";
+    _report[@"model_rendered"] = loadedFromDisk ? @"Bloodborne Map FLVER" : @"Saw Cleaver (FromSoftware FLVER)";
 
     // Registra suporte a controles externos Apple GameController
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onControllerConnected:)
@@ -214,7 +357,7 @@
 - (void)drawInMTKView:(MTKView *)view {
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
     id<CAMetalDrawable> drawable = view.currentDrawable;
-    if (!pass || !drawable || !_pipeline) return;
+    if (!pass || !drawable || !_pipeline || !_vertexBuffer || !_indexBuffer) return;
 
     auto now = std::chrono::steady_clock::now();
     double frame_ms = std::chrono::duration<double, std::milli>(now - _lastFrameTime).count();
@@ -222,20 +365,53 @@
     _pacingTracker.record_frame_ms(frame_ms);
 
     _angle += 0.02f;
-    float cos_a = cosf(_angle), sin_a = sinf(_angle);
-    simd_float4x4 rot = matrix_identity_float4x4;
-    rot.columns[0][0] = cos_a;
-    rot.columns[0][1] = sin_a;
-    rot.columns[1][0] = -sin_a;
-    rot.columns[1][1] = cos_a;
-    memcpy(_uniformBuffer.contents, &rot, sizeof(rot));
+    float aspect = (view.bounds.size.height > 0) ? (float)view.bounds.size.width / (float)view.bounds.size.height : 1.777f;
+    bb::Matrix4x4 proj = bb::Matrix4x4::perspective(55.0f * 3.14159265f / 180.0f, aspect, 0.1f, 100.0f);
+    float eye[3] = {0.0f, 1.0f, 2.8f};
+    float target[3] = {0.0f, 0.3f, 0.0f};
+    float up[3] = {0.0f, 1.0f, 0.0f};
+    bb::Matrix4x4 viewMat = bb::Matrix4x4::look_at(eye, target, up);
+    bb::Matrix4x4 modelRot = bb::Matrix4x4::rotation_y(_angle);
+    bb::Matrix4x4 modelPitch = bb::Matrix4x4::rotation_x(0.2f);
+    bb::Matrix4x4 model = bb::Matrix4x4::multiply(modelRot, modelPitch);
+
+    bb::ModelViewProjectionUniforms mvpUniforms{};
+    mvpUniforms.model = model;
+    mvpUniforms.view = viewMat;
+    mvpUniforms.projection = proj;
+    bb::Matrix4x4 modelView = bb::Matrix4x4::multiply(viewMat, model);
+    mvpUniforms.mvp = bb::Matrix4x4::multiply(proj, modelView);
+    mvpUniforms.normal_matrix = bb::Matrix4x4::normal_matrix(modelView);
+
+    std::memcpy(_mvpBuffer.contents, &mvpUniforms, sizeof(mvpUniforms));
 
     id<MTLCommandBuffer> command = [_queue commandBuffer];
     id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
     if (!command || !encoder) { [self gpuError:@"Falha ao criar command buffer"]; return; }
+
     [encoder setRenderPipelineState:_pipeline];
-    [encoder setVertexBuffer:_uniformBuffer offset:0 atIndex:0];
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    if (_depthState) {
+        [encoder setDepthStencilState:_depthState];
+    }
+    [encoder setCullMode:MTLCullModeNone];
+
+    [encoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
+    [encoder setVertexBuffer:_mvpBuffer offset:0 atIndex:1];
+
+    [encoder setFragmentBuffer:_lightingBuffer offset:0 atIndex:1];
+    if (_diffuseTexture) {
+        [encoder setFragmentTexture:_diffuseTexture atIndex:0];
+    }
+    if (_samplerState) {
+        [encoder setFragmentSamplerState:_samplerState atIndex:0];
+    }
+
+    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:_indexCount
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:_indexBuffer
+                 indexBufferOffset:0];
+
     [encoder endEncoding];
     [command presentDrawable:drawable];
 
@@ -252,8 +428,11 @@
                     uint64_t mem_bytes = strongSelf->_memoryMonitor.query_physical_footprint_bytes();
                     double mem_mb = static_cast<double>(mem_bytes) / (1024.0 * 1024.0);
                     strongSelf->_gpuStatus.text = [NSString stringWithFormat:
-                        @"Metal 3: %lu frames | P50: %.1fms P95: %.1fms | Mem: %.1f MB",
-                        (unsigned long)strongSelf->_completedFrames, pacing.p50_ms, pacing.p95_ms, mem_mb];
+                        @"Metal 3: %lu frames | FLVER (%u vtx, %u tri) | P50: %.1fms | Mem: %.1f MB",
+                        (unsigned long)strongSelf->_completedFrames,
+                        strongSelf->_modelVertexCount,
+                        strongSelf->_modelTriangleCount,
+                        pacing.p50_ms, mem_mb];
                 }
             } else {
                 [strongSelf gpuError:finished.error ? finished.error.localizedDescription : @"Erro no command buffer"];
