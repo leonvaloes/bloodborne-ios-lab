@@ -92,6 +92,7 @@ set(CORE_SOURCES
     core/manifest.cpp
     core/elf_parser.cpp
     core/ps4_loader.cpp
+    core/ps4_bootstrap.cpp
     core/game_asset_probe.cpp
     core/guest_loader.cpp
     core/boot_probe.cpp

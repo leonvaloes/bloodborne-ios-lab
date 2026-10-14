@@ -1,5 +1,6 @@
 #include "check.h"
 #include "../core/ps4_loader.h"
+#include "../core/ps4_bootstrap.h"
 #include <algorithm>
 #include <cstring>
 using namespace bb;
@@ -50,7 +51,7 @@ int main() { return run([] {
     CHECK(Ps4Loader::nid("_init_env")=="bzQExy189ZI");
     CHECK(Ps4Loader::nid("malloc")=="gQX+4GDQjpM");
     auto main=elf(), lib=elf(true);
-    GuestMemory mem(1<<20);
+    GuestMemory mem(32u<<20);
     auto image=Ps4Loader::load(mem,self(main),self(lib));
     CHECK(image.entry==0x10000400);CHECK(image.procparam==0x10000500);
     CHECK(image.tls.filesz==4 && image.tls.memsz==16);
@@ -59,6 +60,33 @@ int main() { return run([] {
     CHECK(image.imports[0].address==0x10010410);
     std::uint64_t value=0;CHECK(mem.load(0x10000620,&value,8)==MemoryError::ok && value==image.imports[0].address);
     CHECK(mem.load(0x10000628,&value,8)==MemoryError::ok && value==0x10000411);
+    CpuState cpu;
+    const auto tcb=Ps4Bootstrap::prepare(mem,cpu,image);
+    CHECK(cpu.fs_base==tcb && cpu.rip==image.entry && cpu.gpr[7]==Ps4Bootstrap::param_base);
+    CHECK(cpu.gpr[6]==Ps4Bootstrap::exit_trap);
+    CHECK(mem.load(tcb,&value,8)==MemoryError::ok && value==tcb);
+    CHECK(mem.load(tcb+8,&value,8)==MemoryError::ok && value==tcb+64);
+    CHECK(mem.load(tcb+64+16,&value,8)==MemoryError::ok && value!=0);
+    std::uint8_t initial[16]{};
+    CHECK(mem.load(Ps4Bootstrap::tls_base,initial,sizeof(initial))==MemoryError::ok);
+    CHECK(initial[0]==1 && initial[3]==4 && initial[4]==0);
+    CHECK(mem.load(cpu.gpr[4],&value,8)==MemoryError::ok && value==Ps4Bootstrap::exit_trap);
+    CHECK(mem.load(Ps4Bootstrap::param_base,&value,8)==MemoryError::ok && value==1);
+    Ps4Bootstrap::module_call(mem,cpu,image.modules[0]);
+    CHECK(cpu.rip==image.modules[0].init && cpu.gpr[7]==0 && cpu.gpr[6]==0 && cpu.gpr[2]==0);
+    CHECK(mem.load(cpu.gpr[4],&value,8)==MemoryError::ok && value==Ps4Bootstrap::exit_trap+32);
+    Ps4Bootstrap::game_entry(mem,cpu,image);
+    CHECK(cpu.rip==image.entry && cpu.gpr[7]==Ps4Bootstrap::param_base);
+    // mov rax, fs:[0]; ret — verifica o caminho real do interpretador.
+    const std::uint8_t fs_self[]={0x64,0x48,0x8b,0x04,0x25,0,0,0,0,0xc3};
+    CHECK(mem.store(image.entry+0x20,fs_self,sizeof(fs_self))==MemoryError::ok);
+    X86Interpreter interp(mem);
+    interp.add_trap_range(Ps4Bootstrap::exit_trap,64);
+    interp.state=cpu;
+    interp.state.rip=image.entry+0x20;
+    auto fs_result=interp.run(8);
+    CHECK(fs_result.stop==CpuStop::trap && fs_result.rip==Ps4Bootstrap::exit_trap);
+    CHECK(interp.state.gpr[0]==tcb);
     GuestMemory mem2(1<<20);auto fallback=Ps4Loader::load(mem2,main);
     CHECK(fallback.imports[0].address==0x7f000000);
     CHECK(mem2.load(0x10000620,&value,8)==MemoryError::ok && value==0x7f000000);
