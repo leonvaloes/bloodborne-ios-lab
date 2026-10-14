@@ -51,6 +51,17 @@ struct SceKernelLwMutexWork {
     std::uint32_t id;
     char name[32];
 };
+
+struct SceKernelSemaInfo {
+    std::uint64_t size;
+    char name[32];
+    std::uint32_t attr;
+    std::int32_t init_count;
+    std::int32_t current_count;
+    std::int32_t max_count;
+    std::uint32_t num_wait_threads;
+    std::uint32_t reserved;
+};
 #pragma pack(pop)
 
 // Structure representing an Orbis Semaphore
@@ -190,6 +201,7 @@ public:
     std::int32_t cancel_sema(std::uint32_t id, std::int32_t count, std::int32_t *out_waiters = nullptr);
     std::int32_t delete_sema(std::uint32_t id);
     std::size_t sema_waiters(std::uint32_t id) const;
+    std::int32_t sema_count(std::uint32_t id) const;
 
     // Light-weight Mutex API (Handle-based)
     std::int32_t create_lw_mutex(std::uint32_t *out_id, const char *name, std::uint32_t attr,

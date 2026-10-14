@@ -98,6 +98,95 @@ int main() {
     assert(call("sceKernelSetEventFlag",event,1)==0);
     assert(call("sceKernelPollEventFlag",event,1,0,0x2050)==0);
     assert(call("sceKernelDeleteEventFlag",event)==0);
+
+    // =========================================================================
+    // Testes de Sincronização Expandidos: Semaphores, Mutex, Cond, Event, TLS
+    // =========================================================================
+    // 1. Semaphores - SDK Convention e Lifecycle
+    assert(m.store(0x2100, "TestSema", 9) == MemoryError::ok);
+    auto sid = call("sceKernelCreateSema", 0x2100, 0, 1, 5, 0);
+    assert(sid > 0);
+    assert(call("sceKernelGetSemaInfo", sid, 0x2150) == 0);
+    SceKernelSemaInfo sema_info{};
+    assert(m.load(0x2150, &sema_info, sizeof(sema_info)) == MemoryError::ok);
+    assert(std::string(sema_info.name) == "TestSema");
+    assert(sema_info.init_count == 1);
+    assert(sema_info.max_count == 5);
+    assert(sema_info.current_count == 1);
+
+    assert(call("sceKernelWaitSema", sid, 1, 0) == 0);
+    assert(call("sceKernelGetSemaInfo", sid, 0x2150) == 0);
+    assert(m.load(0x2150, &sema_info, sizeof(sema_info)) == MemoryError::ok);
+    assert(sema_info.current_count == 0);
+
+    assert(call("sceKernelPollSema", sid, 1) == 0x80020010); // EBUSY
+    assert(call("sceKernelSignalSema", sid, 2) == 0);
+    assert(call("sceKernelGetSemaInfo", sid, 0x2150) == 0);
+    assert(m.load(0x2150, &sema_info, sizeof(sema_info)) == MemoryError::ok);
+    assert(sema_info.current_count == 2);
+
+    assert(call("sceKernelDeleteSema", sid) == 0);
+    assert(call("sceKernelGetSemaInfo", sid, 0x2150) == 0x80020003); // ESRCH
+
+    // 2. Semaphores - Legacy Out-pointer Convention
+    assert(call("sceKernelCreateSema", 0x2180, 0, 0x00050002, 0) == 0);
+    std::uint32_t leg_sid = 0;
+    assert(m.load(0x2180, &leg_sid, 4) == MemoryError::ok && leg_sid > 0);
+    assert(call("sceKernelDeleteSema", leg_sid) == 0);
+
+    // 3. Pthread Mutex - Attributes, Protocol & Prioceiling Stubs
+    assert(call("scePthreadMutexattrInit", 0x2200) == 0);
+    assert(call("scePthreadMutexattrSettype", 0x2200, 2) == 0); // recursive
+    assert(call("scePthreadMutexattrGettype", 0x2200, 0x2210) == 0);
+    std::int32_t mtype = 0;
+    assert(m.load(0x2210, &mtype, 4) == MemoryError::ok && mtype == 2);
+    assert(call("scePthreadMutexattrGetprotocol", 0x2200, 0x2210) == 0);
+    assert(call("scePthreadMutexattrSetprotocol", 0x2200, 0) == 0);
+    assert(call("scePthreadMutexattrGetprioceiling", 0x2200, 0x2210) == 0);
+    assert(call("scePthreadMutexattrSetprioceiling", 0x2200, 0) == 0);
+
+    // 4. Pthread Mutex - Recursive Mutex Lock/Trylock
+    assert(call("scePthreadMutexInit", 0x2220, 0x2200) == 0);
+    assert(call("scePthreadMutexGetprioceiling", 0x2220, 0x2210) == 0);
+    assert(call("scePthreadMutexSetprioceiling", 0x2220, 0, 0x2210) == 0);
+    assert(call("scePthreadMutexLock", 0x2220) == 0);
+    assert(call("scePthreadMutexTrylock", 0x2220) == 0); // recursive allowed
+    assert(call("scePthreadMutexUnlock", 0x2220) == 0);
+    assert(call("scePthreadMutexUnlock", 0x2220) == 0);
+    assert(call("scePthreadMutexDestroy", 0x2220) == 0);
+    assert(call("scePthreadMutexattrDestroy", 0x2200) == 0);
+
+    // 5. Pthread Mutex - Normal Mutex Trylock returns EBUSY
+    assert(call("scePthreadMutexInit", 0x2230, 0) == 0);
+    assert(call("scePthreadMutexLock", 0x2230) == 0);
+    assert(call("scePthreadMutexTrylock", 0x2230) == 0x80020010); // EBUSY
+    assert(call("scePthreadMutexUnlock", 0x2230) == 0);
+    assert(call("scePthreadMutexDestroy", 0x2230) == 0);
+
+    // 6. Event Flag - SDK Convention
+    assert(m.store(0x2250, "EventSDK", 9) == MemoryError::ok);
+    auto efid = call("sceKernelCreateEventFlag", 0x2250, 0, 7, 0);
+    assert(efid > 0);
+    assert(call("sceKernelPollEventFlag", efid, 1, 0, 0x2260) == 0);
+    assert(call("sceKernelClearEventFlag", efid, 7) == 0);
+    assert(call("sceKernelPollEventFlag", efid, 1, 0, 0x2260) == 0x80020010);
+    assert(call("sceKernelDeleteEventFlag", efid) == 0);
+
+    // 7. Pthread Cond - Timedwait abstime
+    assert(call("scePthreadCondInit", 0x2270, 0) == 0);
+    assert(call("scePthreadMutexInit", 0x2280, 0) == 0);
+    assert(call("scePthreadCondTimedwait", 0x2270, 0x2280, 100) == 0x80020010);
+    assert(call("scePthreadCondDestroy", 0x2270) == 0);
+    assert(call("scePthreadMutexDestroy", 0x2280) == 0);
+
+    // 8. Pthread Once & TLS aliases
+    assert(call("pthread_once", 0x2040, 0x1234) == 0x80020010);
+    assert(call("pthread_key_create", 0x2290, 0) == 0);
+    std::uint32_t pkey = 0;
+    assert(m.load(0x2290, &pkey, 4) == MemoryError::ok);
+    assert(call("pthread_setspecific", pkey, 456) == 0);
+    assert(call("pthread_getspecific", pkey) == 456);
+    assert(call("pthread_key_delete", pkey) == 0);
     assert(call("sceKernelClockGettime",1,0x2060)==0);
     assert(call("sceKernelClockGettime",1,0)==0x80020016);
     assert(call("sceSysmoduleLoadModule",1)==0x80020002);

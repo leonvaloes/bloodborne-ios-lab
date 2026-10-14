@@ -297,7 +297,8 @@ void Exec::avx(bool three) {
     const std::uint8_t v2 = three ? u8() : v1;
     const std::uint8_t op = u8();
     const int map = three ? (v1 & 31) : 1;
-    const int pp = v2 & 3, len = (v2 & 4) ? 4 : 2;
+    int pp = v2 & 3;
+    const int len = (v2 & 4) ? 4 : 2;
     const int src1 = (~(v2 >> 3)) & 15;
     const bool w = three && ((v2 & 0x80) != 0);
     if (map != 1 || p66 || rep || repne || rex) throw Unsupported{};
@@ -318,7 +319,7 @@ void Exec::avx(bool three) {
         s.ymm_hi[rg][1] = 0;
         return;
     }
-    if (op == 0x7E) { // vmovd / vmovq r/m, xmm OR vmovq xmm, xmm/m64
+    if (op == 0x7E && (pp == 1 || pp == 2)) { // vmovd / vmovq r/m, xmm OR vmovq xmm, xmm/m64
         if (len != 2 || src1 != 0) throw Unsupported{};
         int rg = 0;
         const Rm rm = decode_rm(rg, 0);
@@ -336,6 +337,20 @@ void Exec::avx(bool three) {
             return;
         }
         throw Unsupported{};
+    }
+    if (op == 0xD6 && pp == 1) { // vmovq xmm2/m64, xmm1
+        if (len != 2 || src1 != 0) throw Unsupported{};
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        if (rm.reg) {
+            s.xmm[rm.r][0] = s.xmm[rg][0];
+            s.xmm[rm.r][1] = 0;
+            s.ymm_hi[rm.r][0] = 0;
+            s.ymm_hi[rm.r][1] = 0;
+        } else {
+            wr_mem(rm.addr, 8, s.xmm[rg][0]);
+        }
+        return;
     }
     if (op == 0x2A) { // vcvtsi2ss / vcvtsi2sd
         if ((pp != 2 && pp != 3) || len != 2) throw Unsupported{};
@@ -415,6 +430,12 @@ void Exec::avx(bool three) {
                                     op == 0x54 || op == 0x55 || op == 0x56 || op == 0x57));
     const bool arith = op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E ||
                        op == 0x5F || op == 0x5D;
+    // Horizontal add/sub: VHADDPS(7C,pp=2), VHSUBPS(7D,pp=2), VHADDPD(7C,pp=1), VHSUBPD(7D,pp=1)
+    // Also handles integer HADD: PHADDW(7C,pp=1), PHADDD(7E,pp=1), PHADDSW(7D,pp=1)
+    const bool hadd_sub = (pp == 1 && (op >= 0x7C && op <= 0x7F)) ||
+                          (pp == 2 && (op == 0x7C || op == 0x7D)); // VHADDPS/VHSUBPS
+    // Integer packed compare greater-than: VPCMPGTQ(7C), VPCMPGTW(7D), VPCMPGTD(7E), VPCMPGTB(7F) with pp=3 (F2)
+    const bool cmp_int = (pp == 3 && (op >= 0x7C && op <= 0x7F));
     const bool unpack = pp == 1 &&
         ((op >= 0x60 && op <= 0x62) || op == 0x6C ||
          (op >= 0x68 && op <= 0x6A) || op == 0x6D);
@@ -422,13 +443,21 @@ void Exec::avx(bool three) {
         (op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4 ||
          op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB);
     const bool shuffle = (op == 0x70 && pp == 1) || (op == 0xC6 && pp <= 1);
-    if ((!mov && !logic && !arith && !unpack && !padd_sub && !shuffle) ||
-        (pp > 1 && !arith && !mov) || (pp > 1 && len != 2 && !mov) ||
+    if ((!mov && !logic && !arith && !unpack && !padd_sub && !shuffle && !hadd_sub && !cmp_int) ||
+        (pp > 1 && !arith && !mov && !hadd_sub && !cmp_int) ||
+        (pp > 1 && len != 2 && !mov && !hadd_sub && !cmp_int) ||
         (logic && op != 0x57 && pp != 1 && pp != 0))
         throw Unsupported{};
     if (mov && src1 != 0) throw Unsupported{}; // reserved vvvv=1111
     if ((op == 0x28 || op == 0x29) && pp != 0 && pp != 1) throw Unsupported{};
     if (op == 0x57 && pp != 0 && pp != 1) throw Unsupported{};
+    if (hadd_sub) {
+        if (len != 2 && len != 4) throw Unsupported{}; // 128 or 256 bit only
+        // vvvv (src1) is the first source register for hadd, not reserved
+    }
+    if (cmp_int) {
+        if (len != 2 && len != 4) throw Unsupported{}; // 128 or 256 bit only
+    }
     if (shuffle) {
         if (len != 2 && len != 4) throw Unsupported{}; // 128 or 256 bit only
         if (src1 != 0) throw Unsupported{}; // reserved vvvv
@@ -492,6 +521,59 @@ void Exec::avx(bool three) {
             std::memcpy(out + i, &z, elem_width);
         }
         std::memcpy(dest, out, len * 8);
+    } else if (hadd_sub) {
+        // VHADDPS (0x7C,pp=2), VHSUBPS (0x7D,pp=2), VHADDPD (0x7C,pp=1), VHSUBPD (0x7D,pp=1)
+        // Also PHADDW/PHADDD/PHADDSW (0x7C/0x7E/0x7D, pp=1) for integer.
+        // Horizontal add/sub: adjacent pairs within each source operand.
+        // For PS (4 floats per 128-bit lane): dst[0]=src1[0]±src1[1], dst[1]=src1[2]±src1[3], dst[2]=src2[0]±src2[1], dst[3]=src2[2]±src2[3]
+        // For PD (2 doubles per 128-bit lane): dst[0]=src1[0]±src1[1], dst[1]=src2[0]±src2[1]
+        // 256-bit: same operation independently in each 128-bit lane.
+        for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+        // PD (double) for op=0x7C/0x7D with pp=1, or op=0x7E/0x7F with pp=1
+        const bool is_pd = (op == 0x7E || op == 0x7F) || ((op == 0x7C || op == 0x7D) && pp == 1);
+        const bool is_sub = (op == 0x7D || op == 0x7F);
+        const int elem_bits = is_pd ? 64 : 32;
+        const int elem_bytes = elem_bits / 8;
+        const int elems_per_128 = 128 / elem_bits;
+        const int num_lanes = len / 2; // each 128-bit lane
+        std::uint8_t a[32], b[32], out[32];
+        // src1 is in dest (from src1 register), src2 is in source (from modrm)
+        std::memcpy(a, dest, len * 8);
+        std::memcpy(b, source, len * 8);
+        for (int lane = 0; lane < num_lanes; ++lane) {
+            const std::uint8_t* lane_a = a + lane * 16;
+            const std::uint8_t* lane_b = b + lane * 16;
+            std::uint8_t* lane_out = out + lane * 16;
+            for (int i = 0; i < elems_per_128 / 2; ++i) {
+                // Add/sub adjacent pairs from src1 (lane_a)
+                std::uint64_t x1 = 0, x2 = 0;
+                std::memcpy(&x1, lane_a + 2 * i * elem_bytes, elem_bytes);
+                std::memcpy(&x2, lane_a + (2 * i + 1) * elem_bytes, elem_bytes);
+                std::uint64_t r1 = 0;
+                if (is_pd) {
+                    const double d1 = f64(x1), d2 = f64(x2);
+                    r1 = bits64(is_sub ? d1 - d2 : d1 + d2);
+                } else {
+                    const float f1 = f32(x1), f2 = f32(x2);
+                    r1 = bits32(is_sub ? f1 - f2 : f1 + f2);
+                }
+                std::memcpy(lane_out + 2 * i * elem_bytes, &r1, elem_bytes);
+                // Add/sub adjacent pairs from src2 (lane_b)
+                std::uint64_t y1 = 0, y2 = 0;
+                std::memcpy(&y1, lane_b + 2 * i * elem_bytes, elem_bytes);
+                std::memcpy(&y2, lane_b + (2 * i + 1) * elem_bytes, elem_bytes);
+                std::uint64_t r2 = 0;
+                if (is_pd) {
+                    const double d1 = f64(y1), d2 = f64(y2);
+                    r2 = bits64(is_sub ? d1 - d2 : d1 + d2);
+                } else {
+                    const float f1 = f32(y1), f2 = f32(y2);
+                    r2 = bits32(is_sub ? f1 - f2 : f1 + f2);
+                }
+                std::memcpy(lane_out + (2 * i + 1) * elem_bytes, &r2, elem_bytes);
+            }
+        }
+        std::memcpy(dest, out, len * 8);
     } else if (shuffle) {
         // vpshufd (0x70, pp=1) or vshufps/vshufpd (0xC6, pp=0/1)
         const unsigned imm = u8();
@@ -529,6 +611,38 @@ void Exec::avx(bool three) {
                 }
             }
         }
+    } else if (cmp_int) {
+        for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+        const int elem_width = (op == 0x7C) ? 8 : (op == 0x7E) ? 4 : (op == 0x7D) ? 2 : 1;
+        const int total_bytes = len * 8;
+        std::uint8_t a[32] = {}, b[32] = {}, out[32] = {};
+        std::memcpy(a, dest, total_bytes);
+        std::memcpy(b, source, total_bytes);
+        for (int i = 0; i < total_bytes; i += elem_width) {
+            bool gt = false;
+            if (elem_width == 8) {
+                std::int64_t va = 0, vb = 0;
+                std::memcpy(&va, a + i, 8);
+                std::memcpy(&vb, b + i, 8);
+                gt = va > vb;
+            } else if (elem_width == 4) {
+                std::int32_t va = 0, vb = 0;
+                std::memcpy(&va, a + i, 4);
+                std::memcpy(&vb, b + i, 4);
+                gt = va > vb;
+            } else if (elem_width == 2) {
+                std::int16_t va = 0, vb = 0;
+                std::memcpy(&va, a + i, 2);
+                std::memcpy(&vb, b + i, 2);
+                gt = va > vb;
+            } else {
+                const std::int8_t va = static_cast<std::int8_t>(a[i]);
+                const std::int8_t vb = static_cast<std::int8_t>(b[i]);
+                gt = va > vb;
+            }
+            std::memset(out + i, gt ? 0xFF : 0x00, elem_width);
+        }
+        std::memcpy(dest, out, total_bytes);
     } else {
         for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
         for (int i = 0; i < bytes / width; ++i) {
@@ -1447,12 +1561,15 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
             ((op == 0x77 && pp == 0 && !(b[p - 2] & 4)) ||
              (op == 0x6E && pp == 1 && !(b[p - 2] & 4)) ||
              (op == 0x7E && (pp == 1 || pp == 2) && !(b[p - 2] & 4)) ||
+             (op == 0xD6 && pp == 1 && !(b[p - 2] & 4)) ||
              (op == 0x2A && (pp == 2 || pp == 3) && !(b[p - 2] & 4)) ||
              (op == 0x2C && (pp == 2 || pp == 3) && !(b[p - 2] & 4)) ||
              ((op == 0x10 || op == 0x11) && (pp <= 1 || !(b[p - 2] & 4))) ||
              ((op == 0x28 || op == 0x29 || op == 0x57 || op == 0xEF || op == 0xDB || op == 0xEB) && pp <= 1) ||
              ((op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E) && (pp <= 1 || !(b[p - 2] & 4))) ||
              ((op == 0x6F || op == 0x7F) && (pp == 1 || pp == 2)) ||
+             ((op >= 0x7C && op <= 0x7F) && (pp == 1 || pp == 3)) ||
+             ((op == 0x7C || op == 0x7D) && pp == 2) ||
              (((op >= 0x60 && op <= 0x62) || op == 0x6C || (op >= 0x68 && op <= 0x6A) || op == 0x6D) && pp == 1) ||
              ((op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4 ||
                op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB) && pp == 1) ||

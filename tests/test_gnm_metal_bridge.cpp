@@ -311,10 +311,13 @@ int main() {
         // 18. Teste: Compute Dispatch
         // =====================================================================
         const std::uint32_t cs_shader_words[] = {
-            0x80000000u | (0u << 23) | (2u << 16) | (1u << 8) | 0u, // s_add_u32 s2, s0, s1 (SOP2 opcode 0)
+            0x80000000u | (0u << 23) | (3u << 16) | (1u << 8) | 0u, // s_add_u32 s3, s0, s1 (SOP2 opcode 0)
             0xBF810000u // s_endpgm
         };
         CHECK(memory.store(0x10004000, cs_shader_words, sizeof(cs_shader_words)) == MemoryError::ok);
+
+        auto hits_before = bridge.shader_cache().hit_count();
+        auto misses_before = bridge.shader_cache().miss_count();
 
         DispatchCall dispatch{};
         dispatch.threadgroups_x = 4;
@@ -336,7 +339,8 @@ int main() {
         CHECK(disp_cmd.threadgroups_y == 1);
         CHECK(disp_cmd.threadgroups_z == 1);
 
-        std::cerr << "After first dispatch: hits=" << bridge.shader_cache().hit_count() << " misses=" << bridge.shader_cache().miss_count() << std::endl;
+        CHECK(bridge.shader_cache().hit_count() == hits_before);
+        CHECK(bridge.shader_cache().miss_count() == misses_before + 1);
 
         // Segunda chamada - cache hit
         BridgeResult<MetalDispatchCommand> disp_result2 = bridge.process_dispatch(dispatch);
@@ -344,15 +348,15 @@ int main() {
             std::cerr << "disp_result2 error: " << bridge_error_to_string(disp_result2.error) << " - " << disp_result2.message << std::endl;
         }
         CHECK(disp_result2.ok());
-        std::cerr << "After second dispatch: hits=" << bridge.shader_cache().hit_count() << " misses=" << bridge.shader_cache().miss_count() << std::endl;
-        CHECK(bridge.shader_cache().hit_count() == 3); // VS + PS + CS
+        CHECK(bridge.shader_cache().hit_count() == hits_before + 1);
+        CHECK(bridge.shader_cache().miss_count() == misses_before + 1);
 
         // =====================================================================
         // 19. Teste: ShaderCache stats
         // =====================================================================
         CHECK(bridge.shader_cache().size() == 3); // VS, PS, CS
-        CHECK(bridge.shader_cache().hit_count() == 3);
-        CHECK(bridge.shader_cache().miss_count() == 3);
+        CHECK(bridge.shader_cache().hit_count() == hits_before + 1);
+        CHECK(bridge.shader_cache().miss_count() == misses_before + 1);
 
         bridge.shader_cache().clear();
         CHECK(bridge.shader_cache().size() == 0);
@@ -365,7 +369,7 @@ int main() {
         // Configurar user data com buffer descriptor inline
         // Slots 0-3: buffer descriptor
         context.set_user_data(ShaderStage::Vertex, 0, 0x20002000); // base lo
-        context.set_user_data(ShaderStage::Vertex, 1, 0x00010000); // base hi + stride
+        context.set_user_data(ShaderStage::Vertex, 1, (16 << 16)); // base hi=0, stride=16
         context.set_user_data(ShaderStage::Vertex, 2, 100);        // num_records
         context.set_user_data(ShaderStage::Vertex, 3, 0);          // format
 
@@ -373,7 +377,7 @@ int main() {
         const auto& vs_binds = bridge.bindings(ShaderStage::Vertex);
         CHECK(vs_binds.buffers[0].valid);
         CHECK(vs_binds.buffers[0].guest_address == 0x20002000);
-        CHECK(vs_binds.buffers[0].stride == 0x10000); // stride está nos bits 16-29 do slot 1
+        CHECK(vs_binds.buffers[0].stride == 16); // stride está nos bits 16-29 do slot 1
 
         // =====================================================================
         // 21. Teste: bind_buffer_table
@@ -394,6 +398,7 @@ int main() {
             auto encoded = GnmContext::encode_buffer_descriptor(table_bufs[i]);
             std::memcpy(table_bytes.data() + i * 16, encoded.data(), 16);
         }
+        CHECK(memory.map(0x50000000, 64 * 1024, Permission::read | Permission::write) == MemoryError::ok);
         CHECK(memory.store(0x50000000, table_bytes.data(), table_bytes.size()) == MemoryError::ok);
 
         bool ok = bridge.bind_buffer_table(ShaderStage::Vertex, 0, 0x50000000, 2);

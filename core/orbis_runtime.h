@@ -74,13 +74,32 @@ private:
     GuestScheduler* scheduler_ = nullptr;
     std::uint64_t procparam_ = 0;
     std::uint64_t thread_stack_next_ = 0x3000000000ULL;
+    int exit_code_ = 0;
+    
+    struct PthreadAttrDefaults {
+        std::uint64_t stack_size = 0;
+        std::uint32_t detach_state = 0;
+        std::uint32_t sched_policy = 0;
+        std::uint32_t sched_param = 0;
+        std::uint64_t affinity = 0;
+        std::uint32_t inherit_sched = 0;
+    };
+    std::unordered_map<std::uint64_t, PthreadAttrDefaults> attr_defaults_;
+    
     UserServiceManager user_mgr_;
     PadHleManager pad_mgr_;
     SaveDataManager save_mgr_;
     AudioOutManager audio_mgr_;
     struct PendingCallback { std::uint64_t key = 0, return_address = 0, return_trap = 0; };
     std::unordered_map<GuestScheduler::Id, PendingCallback> callbacks_;
-    std::unordered_map<std::uint64_t, GuestScheduler::Id> guest_mutexes_, guest_conds_, guest_events_;
+    std::unordered_map<std::uint64_t, GuestScheduler::Id> guest_mutexes_, guest_conds_, guest_events_, guest_semas_;
+    struct SemaRecord {
+        std::string name;
+        std::uint32_t attr = 0;
+        std::int32_t init_count = 0;
+        std::int32_t max_count = 0;
+    };
+    std::unordered_map<std::uint32_t, SemaRecord> sema_records_;
     std::unordered_map<std::string, std::string> names_;
     std::map<std::uint64_t, std::uint64_t> physical_, mappings_, heap_;
     std::map<std::uint64_t, std::uint64_t> direct_mappings_; // virtual -> physical offset

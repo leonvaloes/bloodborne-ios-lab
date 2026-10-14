@@ -79,15 +79,23 @@ int main(int argc, char** argv) {
                 result=cpu.run(max_steps-steps);
                 steps+=result.steps;
                 if (!hle || result.stop!=bb::CpuStop::trap || result.rip<0x7f000000 ||
-                    result.rip>=0x7f000000+32*image.imports.size() || steps>=max_steps) break;
+                    result.rip>=0x7f000000+32*image.imports.size() || steps>=max_steps) {
+                    break;
+                }
                 auto index=(result.rip-0x7f000000)/32;
                 const auto& imp=image.imports[static_cast<std::size_t>(index)];
-                if (imp.trap!=result.rip) break;
+                if (imp.trap!=result.rip) {
+                    std::printf("trap rip 0x%llx != imp.trap 0x%llx\n", (unsigned long long)result.rip, (unsigned long long)imp.trap);
+                    break;
+                }
                 std::uint64_t value=0;
                 try { value=runtime.invoke(imp.name,cpu.state); }
-                catch (const std::exception& e) { std::printf("HLE: %s\n",e.what()); break; }
+                catch (const std::exception& e) { std::printf("HLE: %s (import: %s)\n",e.what(), imp.name.c_str()); break; }
                 std::uint64_t ret=0;
-                if (memory.load(cpu.state.gpr[4],&ret,8)!=bb::MemoryError::ok) break;
+                if (memory.load(cpu.state.gpr[4],&ret,8)!=bb::MemoryError::ok) {
+                    std::printf("falha ao desempilhar retorno do trap\n");
+                    break;
+                }
                 cpu.state.gpr[0]=value;
                 cpu.state.gpr[4]+=8;
                 cpu.state.rip=ret;
@@ -106,10 +114,34 @@ int main(int argc, char** argv) {
         bb::Ps4Bootstrap::game_entry(memory,cpu.state,image);
         execute();
         std::printf("parou: %s\n",result.describe().c_str());
+        std::printf("rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx\n",
+                    (unsigned long long)cpu.state.gpr[0], (unsigned long long)cpu.state.gpr[3],
+                    (unsigned long long)cpu.state.gpr[1], (unsigned long long)cpu.state.gpr[2]);
+        std::printf("rsi=0x%llx rdi=0x%llx rbp=0x%llx rsp=0x%llx\n",
+                    (unsigned long long)cpu.state.gpr[6], (unsigned long long)cpu.state.gpr[7],
+                    (unsigned long long)cpu.state.gpr[5], (unsigned long long)cpu.state.gpr[4]);
+        std::printf("r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx\n",
+                    (unsigned long long)cpu.state.gpr[8], (unsigned long long)cpu.state.gpr[9],
+                    (unsigned long long)cpu.state.gpr[10], (unsigned long long)cpu.state.gpr[11]);
+        std::printf("r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx\n",
+                    (unsigned long long)cpu.state.gpr[12], (unsigned long long)cpu.state.gpr[13],
+                    (unsigned long long)cpu.state.gpr[14], (unsigned long long)cpu.state.gpr[15]);
+        std::printf("rflags=0x%llx\n", (unsigned long long)cpu.state.rflags);
         for (const auto& imp:image.imports) if (result.rip==imp.trap)
-            std::printf("import chamado: %s\n",imp.name.c_str());
+            std::printf("import chamado: %s (%s)\n",imp.name.c_str(), runtime.resolve(imp.name).c_str());
         if (result.rip>=0x10000000 && result.rip<0x70000000)
             std::printf("rip(imagem+)=0x%llx\n",static_cast<unsigned long long>(result.rip-0x10000000));
+        // Disassemble 64 bytes around RIP
+        std::uint8_t code_peek[64] = {};
+        std::uint64_t peek_addr = result.rip >= 32 ? result.rip - 32 : result.rip;
+        if (memory.load(peek_addr, code_peek, 64) == bb::MemoryError::ok) {
+            std::printf("code at [rip-32 .. rip+32] (rip at offset +32):\n");
+            for (int k = 0; k < 64; ++k) {
+                if (k == 32) std::printf(" [RIP->]");
+                std::printf("%02x ", code_peek[k]);
+                if (k == 31 || k == 63) std::printf("\n");
+            }
+        }
         return result.stop==bb::CpuStop::trap && result.rip==bb::Ps4Bootstrap::exit_trap ? 0 : 1;
     } catch (const std::exception& e) { std::fprintf(stderr,"erro: %s\n",e.what()); return 2; }
 }

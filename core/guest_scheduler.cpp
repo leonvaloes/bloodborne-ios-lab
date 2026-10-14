@@ -32,10 +32,11 @@ void GuestScheduler::ready(Id id, std::int32_t result) {
     auto* t=find(id); if (!t || t->state!=State::waiting) return;
     t->state=State::ready; t->wait=Wait::none; t->timed=false; t->result=result; ready_.push_back(id);
 }
-void GuestScheduler::block(Id id, Wait kind, Id object, std::uint64_t timeout) {
+void GuestScheduler::block(Id id, Wait kind, Id object, std::uint64_t timeout, std::int32_t need) {
     auto& t=*find(id); t.state=State::waiting; t.wait=kind; t.object=object;
     t.result=ORBIS_OK; t.timed=timeout!=0;
     t.deadline=timeout>UINT64_MAX-now_ ? UINT64_MAX : now_+timeout;
+    t.need = need;
 }
 std::int32_t GuestScheduler::resume(Id id) const { auto* t=find(id); return t?t->result:ORBIS_KERNEL_ERROR_ESRCH; }
 GuestScheduler::State GuestScheduler::state(Id id) const { auto* t=find(id); return t?t->state:State::faulted; }
@@ -61,6 +62,13 @@ std::int32_t GuestScheduler::join(Id caller, Id target, std::uint64_t* out, std:
 std::int32_t GuestScheduler::cancel(Id id) {
     auto* t=find(id); if (!t || t->state!=State::waiting) return ORBIS_KERNEL_ERROR_EINVAL;
     if (t->wait==Wait::cond || t->wait==Wait::reacquire) { reacquire(id,t->mutex,ORBIS_KERNEL_ERROR_ECANCELED); return ORBIS_OK; }
+    if (t->wait==Wait::sema) {
+        auto it = semas_.find(t->object);
+        if (it != semas_.end()) {
+            auto& w = it->second.waiters;
+            w.erase(std::remove(w.begin(), w.end(), id), w.end());
+        }
+    }
     ready(id,ORBIS_KERNEL_ERROR_ECANCELED); return ORBIS_OK;
 }
 void GuestScheduler::advance(std::uint64_t us) {
@@ -69,6 +77,14 @@ void GuestScheduler::advance(std::uint64_t us) {
         auto& t=kv.second;
         if (t.state!=State::waiting || !t.timed || now_<t.deadline) continue;
         if (t.wait==Wait::cond || t.wait==Wait::reacquire) reacquire(kv.first,t.mutex,ORBIS_KERNEL_ERROR_ETIMEDOUT);
+        else if (t.wait==Wait::sema) {
+            auto it = semas_.find(t.object);
+            if (it != semas_.end()) {
+                auto& w = it->second.waiters;
+                w.erase(std::remove(w.begin(), w.end(), kv.first), w.end());
+            }
+            ready(kv.first, ORBIS_KERNEL_ERROR_ETIMEDOUT);
+        }
         else ready(kv.first,t.wait==Wait::sleep?ORBIS_OK:ORBIS_KERNEL_ERROR_ETIMEDOUT);
     }
 }
@@ -89,8 +105,17 @@ std::int32_t GuestScheduler::lock(Id tid, Id id, std::uint64_t timeout) {
 std::int32_t GuestScheduler::try_lock(Id tid, Id id) {
     auto* t=find(tid); auto it=mutexes_.find(id);
     if (!t || t->state!=State::ready || it==mutexes_.end()) return ORBIS_KERNEL_ERROR_EINVAL;
-    if (it->second.owner && it->second.owner!=tid) return ORBIS_KERNEL_ERROR_EBUSY;
-    return lock(tid,id);
+    auto& m = it->second;
+    if (m.owner) {
+        if (m.owner == tid && m.recursive && m.depth < UINT_MAX) {
+            ++m.depth;
+            return ORBIS_OK;
+        }
+        return ORBIS_KERNEL_ERROR_EBUSY;
+    }
+    m.owner = tid;
+    m.depth = 1;
+    return ORBIS_OK;
 }
 void GuestScheduler::acquire_next(Id id) {
     auto& m=mutexes_.at(id);
@@ -155,6 +180,127 @@ std::int32_t GuestScheduler::event_clear(Id id, std::uint64_t bits) { auto it=ev
 std::uint64_t GuestScheduler::event_bits(Id id) const {
     auto it=events_.find(id); return it==events_.end()?0:it->second.bits;
 }
+
+// Kernel Semaphores
+GuestScheduler::Id GuestScheduler::sema_create(std::int32_t initial_count, std::int32_t max_count) {
+    Id id = next_++;
+    semas_[id].count = initial_count;
+    semas_[id].max_count = max_count;
+    return id;
+}
+
+std::int32_t GuestScheduler::sema_wait(Id tid, Id sid, std::int32_t need, std::uint64_t timeout) {
+    auto* t = find(tid);
+    auto it = semas_.find(sid);
+    if (!t || t->state != State::ready || it == semas_.end()) return ORBIS_KERNEL_ERROR_EINVAL;
+    if (need <= 0 || need > it->second.max_count) return ORBIS_KERNEL_ERROR_EINVAL;
+
+    auto& s = it->second;
+    if (s.count >= need) {
+        s.count -= need;
+        return ORBIS_OK;
+    }
+
+    block(tid, Wait::sema, sid, timeout, need);
+    s.waiters.push_back(tid);
+    return ORBIS_OK;
+}
+
+std::int32_t GuestScheduler::sema_poll(Id sid, std::int32_t need) {
+    auto it = semas_.find(sid);
+    if (it == semas_.end()) return ORBIS_KERNEL_ERROR_ESRCH;
+    if (need <= 0 || need > it->second.max_count) return ORBIS_KERNEL_ERROR_EINVAL;
+
+    auto& s = it->second;
+    if (s.count >= need) {
+        s.count -= need;
+        return ORBIS_OK;
+    }
+    return ORBIS_KERNEL_ERROR_EBUSY;
+}
+
+std::int32_t GuestScheduler::sema_signal(Id sid, std::int32_t count) {
+    auto it = semas_.find(sid);
+    if (it == semas_.end()) return ORBIS_KERNEL_ERROR_ESRCH;
+    if (count <= 0) return ORBIS_KERNEL_ERROR_EINVAL;
+
+    auto& s = it->second;
+    if (count > s.max_count - s.count) return ORBIS_KERNEL_ERROR_EINVAL;
+
+    s.count += count;
+
+    // Wake waiters in FIFO order
+    auto& waiters = s.waiters;
+    for (auto wit = waiters.begin(); wit != waiters.end(); ) {
+        Id wtid = *wit;
+        auto* wt = find(wtid);
+        if (wt && wt->state == State::waiting && wt->wait == Wait::sema && wt->object == sid && wt->need <= s.count) {
+            s.count -= wt->need;
+            wit = waiters.erase(wit);
+            ready(wtid, ORBIS_OK);
+        } else {
+            ++wit;
+        }
+    }
+    return ORBIS_OK;
+}
+
+std::int32_t GuestScheduler::sema_delete(Id sid) {
+    auto it = semas_.find(sid);
+    if (it == semas_.end()) return ORBIS_KERNEL_ERROR_ESRCH;
+
+    // Wake all waiters with ECANCELED
+    for (Id wtid : it->second.waiters) {
+        auto* wt = find(wtid);
+        if (wt && wt->state == State::waiting && wt->wait == Wait::sema && wt->object == sid) {
+            ready(wtid, ORBIS_KERNEL_ERROR_ECANCELED);
+        }
+    }
+    semas_.erase(it);
+    return ORBIS_OK;
+}
+
+std::int32_t GuestScheduler::sema_count(Id sid) const {
+    auto it = semas_.find(sid);
+    if (it == semas_.end()) return -1;
+    return it->second.count;
+}
+
+std::size_t GuestScheduler::sema_waiters(Id sid) const {
+    auto it = semas_.find(sid);
+    if (it == semas_.end()) return 0;
+    return it->second.waiters.size();
+}
+
+// TLS (Thread-Local Storage)
+GuestScheduler::Id GuestScheduler::tls_create(std::uint64_t destructor) {
+    Id key = next_++;
+    if (destructor) tls_destructors_[key] = destructor;
+    return key;
+}
+
+std::int32_t GuestScheduler::tls_delete(Id key) {
+    tls_destructors_.erase(key);
+    for (auto& kv : threads_) {
+        kv.second.tls_values.erase(key);
+    }
+    return ORBIS_OK;
+}
+
+std::int32_t GuestScheduler::tls_set(Id tid, Id key, std::uint64_t value) {
+    auto* t = find(tid);
+    if (!t) return ORBIS_KERNEL_ERROR_EINVAL;
+    t->tls_values[key] = value;
+    return ORBIS_OK;
+}
+
+std::uint64_t GuestScheduler::tls_get(Id tid, Id key) const {
+    auto* t = find(tid);
+    if (!t) return 0;
+    auto it = t->tls_values.find(key);
+    return it == t->tls_values.end() ? 0 : it->second;
+}
+
 void GuestScheduler::set_resume(Id id, std::function<void(CpuState&, std::int32_t)> hook) {
     auto* t=find(id); if (!t) throw std::logic_error("unknown thread for resume");
     t->on_resume=std::move(hook);

@@ -10,6 +10,15 @@
 #include <limits>
 #include <stdexcept>
 #include <vector>
+#if defined(_WIN32)
+#include <io.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
 
 namespace bb {
 namespace {
@@ -51,6 +60,21 @@ template<typename T> T get(GuestMemory& m, std::uint64_t a) {
 template<typename T> void put(GuestMemory& m, std::uint64_t a, const T& v) {
     if (m.store(a,&v,sizeof v)!=MemoryError::ok) throw std::runtime_error("escrita guest inválida");
 }
+[[maybe_unused]] bool is_likely_string_ptr(const GuestMemory& mem, std::uint64_t addr) {
+    if (addr < 0x1000 || addr > 0x7fffffffffffULL) return false;
+    char buf[64];
+    std::size_t len = 0;
+    for (; len < sizeof(buf); ++len) {
+        char ch = 0;
+        if (mem.load(addr + len, &ch, 1) != MemoryError::ok) return false;
+        buf[len] = ch;
+        if (ch == '\0') break;
+        if (ch != '\t' && (static_cast<unsigned char>(ch) < 0x20 || static_cast<unsigned char>(ch) > 0x7E)) {
+            return false;
+        }
+    }
+    return len > 0 && len < sizeof(buf) && buf[len] == '\0';
+}
 }
 std::string orbis_nid(const std::string& symbol) {
     static const char salt[] = "\x51\x8d\x64\xa6\x35\xde\xd8\xc1\xe6\xb0\x39\xb1\xc3\xe5\x52\x30";
@@ -71,7 +95,8 @@ OrbisRuntime::OrbisRuntime(GuestMemory& memory)
 #include "orbis_import_names.h"
         "scePthreadMutexattrInit", "scePthreadMutexattrSettype", "scePthreadMutexattrDestroy",
         "scePthreadMutexInit", "scePthreadMutexLock", "scePthreadMutexUnlock", "scePthreadMutexDestroy",
-        "scePthreadMutexTrylock", "sceKernelMmap", "sceKernelMunmap", "sceKernelVirtualQuery",
+        "scePthreadMutexTrylock", "scePthreadMutexTimedlock",
+        "sceKernelMmap", "sceKernelMunmap", "sceKernelVirtualQuery",
         "__cxa_guard_abort",
         // libScePad
         "scePadOpen", "scePadClose", "scePadReadState", "scePadSetVibration", "scePadSetLightBar", "scePadInit",
@@ -94,7 +119,35 @@ OrbisRuntime::OrbisRuntime(GuestMemory& memory)
         // Conversions & stdlib
         "strtol", "strtoul", "strtoll", "strtoull", "strtod", "strtof", "qsort", "bsearch",
         // Formatting
-        "snprintf", "vsnprintf"
+        "snprintf", "vsnprintf",
+        // Kernel semaphores
+        "sceKernelCreateSema", "sceKernelDeleteSema", "sceKernelWaitSema", "sceKernelPollSema", "sceKernelSignalSema",
+        "sceKernelGetSemaInfo",
+        // Kernel event flags
+        "sceKernelCreateEventFlag", "sceKernelDeleteEventFlag", "sceKernelSetEventFlag", "sceKernelClearEventFlag",
+        "sceKernelWaitEventFlag", "sceKernelPollEventFlag",
+        // Pthread condition variables (sce-prefixed)
+        "scePthreadCondInit", "scePthreadCondDestroy", "scePthreadCondWait", "scePthreadCondTimedwait",
+        "scePthreadCondSignal", "scePthreadCondBroadcast",
+        // Pthread once/key
+        "scePthreadOnce", "scePthreadKeyCreate", "scePthreadKeyDelete", "scePthreadSetspecific", "scePthreadGetspecific",
+        "pthread_once", "pthread_key_create", "pthread_key_delete", "pthread_setspecific", "pthread_getspecific",
+        // Pthread mutex attr (sce-prefixed)
+        "scePthreadMutexattrSetprotocol", "scePthreadMutexattrGetprotocol",
+        "scePthreadMutexattrSetprioceiling", "scePthreadMutexattrGetprioceiling",
+        "scePthreadMutexattrGettype",
+        "pthread_mutexattr_getprotocol", "pthread_mutexattr_setprotocol",
+        "pthread_mutexattr_getprioceiling", "pthread_mutexattr_setprioceiling",
+        "pthread_mutexattr_gettype",
+        // Pthread rwlock (sce-prefixed)
+        "scePthreadRwlockInit", "scePthreadRwlockDestroy", "scePthreadRwlockRdlock", "scePthreadRwlockTryrdlock",
+        "scePthreadRwlockTimedrdlock", "scePthreadRwlockWrlock", "scePthreadRwlockTrywrlock",
+        "scePthreadRwlockTimedwrlock", "scePthreadRwlockUnlock",
+        // Pthread mutex (sce-prefixed, already in orbis_import_names.h but ensure coverage)
+        "scePthreadMutexInit", "scePthreadMutexLock", "scePthreadMutexUnlock", "scePthreadMutexTrylock",
+        "scePthreadMutexDestroy", "scePthreadMutexTimedlock",
+        "scePthreadMutexGetprioceiling", "scePthreadMutexSetprioceiling",
+        "pthread_mutex_getprioceiling", "pthread_mutex_setprioceiling",
     };
     for (const char* s : symbols) names_.emplace(orbis_nid(s), s);
 }
@@ -116,9 +169,11 @@ std::uint64_t OrbisRuntime::invoke(const std::string& import, const CpuState& cp
 std::uint64_t OrbisRuntime::invoke(const std::string& import, CpuState& cpu) {
     const auto name=resolve(import);
     if (scheduler_ && (name=="scePthreadMutexLock" || name=="pthread_mutex_lock" ||
+        name=="scePthreadMutexTimedlock" || name=="pthread_mutex_timedlock" ||
         name=="scePthreadCondWait" || name=="pthread_cond_wait" ||
         name=="scePthreadCondTimedwait" || name=="pthread_cond_timedwait" ||
-        name=="sceKernelWaitEventFlag" || name=="scePthreadOnce" ||
+        name=="sceKernelWaitEventFlag" || name=="sceKernelPollEventFlag" ||
+        name=="sceKernelWaitSema" || name=="scePthreadOnce" ||
         name=="__cxa_guard_acquire" || name=="__cxa_finalize"))
         throw std::runtime_error("guest scheduler trap adapter unavailable for " + name);
     return handle(name,cpu);
@@ -132,6 +187,15 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
     auto a = [&](unsigned i) { return arg(cpu, i); };
     auto result = [&](std::uint64_t value) {
         return InvocationResult{InvocationResult::Action::returned, value, 0, 0};
+    };
+    auto read_guest_string = [&](std::uint64_t addr, std::size_t max_len = 4096) -> std::string {
+        std::string s;
+        for (std::size_t i = 0; i < max_len; ++i) {
+            char ch = 0;
+            if (mem_.load(addr + i, &ch, 1) != MemoryError::ok || ch == '\0') break;
+            s.push_back(ch);
+        }
+        return s;
     };
 
     if (n == "scePthreadCreate") {
@@ -187,8 +251,9 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         bool recursive = false;
         if (a(1)) {
             auto attr = get<std::uint64_t>(mem_, a(1));
-            if (!attrs_.count(attr)) return result(invalid);
-            recursive = (attrs_.at(attr) == 2);
+            if (attrs_.count(attr)) recursive = (attrs_.at(attr) == 2);
+            else if (attrs_.count(a(1))) recursive = (attrs_.at(a(1)) == 2);
+            else if (attr == 2) recursive = true;
         }
         const auto id = scheduler_->mutex_create(recursive);
         const auto handle = next_handle_++;
@@ -197,9 +262,44 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         return result(0);
     }
 
+    if (n == "scePthreadMutexGetprioceiling" || n == "pthread_mutex_getprioceiling") {
+        if (!a(0) || !a(1)) return result(invalid);
+        put<std::int32_t>(mem_, a(1), 0);
+        return result(0);
+    }
+    if (n == "scePthreadMutexSetprioceiling" || n == "pthread_mutex_setprioceiling") {
+        if (!a(0)) return result(invalid);
+        if (a(2)) put<std::int32_t>(mem_, a(2), 0);
+        return result(0);
+    }
+    if (n == "scePthreadMutexattrGetprioceiling" || n == "pthread_mutexattr_getprioceiling") {
+        if (!a(0) || !a(1)) return result(invalid);
+        put<std::int32_t>(mem_, a(1), 0);
+        return result(0);
+    }
+    if (n == "scePthreadMutexattrSetprioceiling" || n == "pthread_mutexattr_setprioceiling") {
+        if (!a(0)) return result(invalid);
+        return result(0);
+    }
+    if (n == "scePthreadMutexattrGetprotocol" || n == "pthread_mutexattr_getprotocol" ||
+        n == "scePthreadMutexattrSetprotocol" || n == "pthread_mutexattr_setprotocol") {
+        if (!a(0)) return result(invalid);
+        if (n.find("Get") != std::string::npos && a(1)) put<std::int32_t>(mem_, a(1), 0);
+        return result(0);
+    }
+    if (n == "scePthreadMutexattrGettype" || n == "pthread_mutexattr_gettype") {
+        if (!a(0) || !a(1)) return result(invalid);
+        auto h = get<std::uint64_t>(mem_, a(0));
+        unsigned t = 1;
+        if (attrs_.count(h)) t = attrs_[h];
+        put<std::int32_t>(mem_, a(1), static_cast<std::int32_t>(t));
+        return result(0);
+    }
+
     if (n == "scePthreadMutexLock" || n == "pthread_mutex_lock" ||
         n == "scePthreadMutexUnlock" || n == "pthread_mutex_unlock" ||
-        n == "scePthreadMutexTrylock" || n == "scePthreadMutexDestroy" || n == "pthread_mutex_destroy") {
+        n == "scePthreadMutexTrylock" || n == "pthread_mutex_trylock" ||
+        n == "scePthreadMutexDestroy" || n == "pthread_mutex_destroy") {
         if (!a(0)) return result(invalid);
         auto handle = get<std::uint64_t>(mem_, a(0));
         if (!handle && n != "scePthreadMutexUnlock" && n != "pthread_mutex_unlock" &&
@@ -218,7 +318,9 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         if (n == "scePthreadMutexUnlock" || n == "pthread_mutex_unlock") {
             return result(static_cast<std::uint32_t>(scheduler_->unlock(tid, id)));
         }
-        const auto status = (n == "scePthreadMutexTrylock") ? scheduler_->try_lock(tid, id) : scheduler_->lock(tid, id);
+        const auto status = (n == "scePthreadMutexTrylock" || n == "pthread_mutex_trylock")
+            ? scheduler_->try_lock(tid, id)
+            : scheduler_->lock(tid, id);
         if (status) return result(static_cast<std::uint32_t>(status));
         if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
             std::uint64_t ret = 0;
@@ -268,7 +370,28 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         std::uint64_t timeout = 0;
         if (n.find("Timedwait") != std::string::npos || n == "pthread_cond_timedwait") {
             if (!a(2)) return result(invalid);
-            timeout = get<std::uint64_t>(mem_, a(2));
+            if (a(2) < 0x1000) {
+                timeout = a(2);
+            } else {
+                std::int64_t sec = 0, nsec = 0;
+                if (mem_.load(a(2), &sec, 8) != MemoryError::ok ||
+                    mem_.load(a(2) + 8, &nsec, 8) != MemoryError::ok) {
+                    return result(invalid);
+                }
+                if (sec >= 1500000000) {
+                    auto now_sys = std::chrono::system_clock::now().time_since_epoch();
+                    auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(now_sys).count();
+                    auto now_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(now_sys).count() % 1000000000;
+                    if (sec < now_sec || (sec == now_sec && nsec <= now_nsec)) {
+                        return result(0x8002003c); // ETIMEDOUT
+                    }
+                    timeout = static_cast<std::uint64_t>(sec - now_sec) * 1000000ULL +
+                              static_cast<std::uint64_t>((nsec - now_nsec) / 1000);
+                } else if (sec > 0 || nsec > 0) {
+                    timeout = static_cast<std::uint64_t>(sec) * 1000000ULL +
+                              static_cast<std::uint64_t>(nsec / 1000);
+                }
+            }
         }
         auto status = scheduler_->cond_wait(tid, guest_conds_.at(ch), guest_mutexes_.at(mh), timeout);
         if (status) return result(static_cast<std::uint32_t>(status));
@@ -287,11 +410,18 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
     }
 
     if (n == "sceKernelCreateEventFlag") {
-        if (!a(0) || a(2) > 3) return result(invalid);
-        const auto handle = next_handle_++;
-        guest_events_[handle] = scheduler_->event_create(a(3));
-        put<std::uint32_t>(mem_, a(0), static_cast<std::uint32_t>(handle));
-        return result(0);
+        bool is_sdk = is_likely_string_ptr(mem_, a(0)) || a(0) == 0;
+        if (is_sdk) {
+            const auto handle = next_handle_++;
+            guest_events_[handle] = scheduler_->event_create(a(2));
+            return result(handle);
+        } else {
+            if (!a(0) || a(2) > 3) return result(invalid);
+            const auto handle = next_handle_++;
+            guest_events_[handle] = scheduler_->event_create(a(3));
+            put<std::uint32_t>(mem_, a(0), static_cast<std::uint32_t>(handle));
+            return result(0);
+        }
     }
 
     if (n == "sceKernelDeleteEventFlag") {
@@ -351,7 +481,7 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         return result(0);
     }
 
-    if (n == "scePthreadOnce") {
+    if (n == "scePthreadOnce" || n == "pthread_once") {
         if (!a(0) || !a(1) || !return_trap) return result(invalid);
         std::uint32_t done = 0;
         if (mem_.load(a(0), &done, 4) != MemoryError::ok) return result(invalid);
@@ -414,6 +544,191 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         return result(0);
     }
 
+    // Kernel Semaphores
+    if (n == "sceKernelCreateSema") {
+        bool is_sdk = is_likely_string_ptr(mem_, a(0)) || a(0) == 0;
+        std::string sema_name = "sema";
+        std::uint32_t attr = 0;
+        std::int32_t init_val = 0, max_val = 1;
+        std::uint64_t out_id_addr = 0;
+
+        if (is_sdk) {
+            if (a(0)) sema_name = read_guest_string(a(0), 32);
+            attr = static_cast<std::uint32_t>(a(1));
+            init_val = static_cast<std::int32_t>(a(2));
+            max_val = static_cast<std::int32_t>(a(3));
+        } else {
+            out_id_addr = a(0);
+            if (!out_id_addr) return result(invalid);
+            if (a(1)) sema_name = read_guest_string(a(1), 32);
+            if (a(3) != 0 && (a(3) >> 16) != 0) {
+                init_val = static_cast<std::int32_t>(a(3) & 0xFFFF);
+                max_val = static_cast<std::int32_t>((a(3) >> 16) & 0xFFFF);
+            } else if (a(2) != 0 && (a(2) >> 16) != 0) {
+                init_val = static_cast<std::int32_t>(a(2) & 0xFFFF);
+                max_val = static_cast<std::int32_t>((a(2) >> 16) & 0xFFFF);
+            } else if (a(3) != 0) {
+                init_val = static_cast<std::int32_t>(a(2));
+                max_val = static_cast<std::int32_t>(a(3));
+            } else {
+                init_val = static_cast<std::int32_t>(a(2));
+                max_val = std::max<std::int32_t>(1, init_val);
+            }
+        }
+        if (max_val <= 0) max_val = std::max<std::int32_t>(1, init_val);
+        if (init_val < 0 || max_val <= 0 || init_val > max_val) return result(invalid);
+
+        auto sid = scheduler_->sema_create(init_val, max_val);
+        if (!sid) return result(no_memory);
+        auto handle = next_handle_++;
+        guest_semas_[handle] = sid;
+
+        SemaRecord rec;
+        rec.name = sema_name;
+        rec.attr = attr;
+        rec.init_count = init_val;
+        rec.max_count = max_val;
+        sema_records_[static_cast<std::uint32_t>(handle)] = rec;
+
+        if (is_sdk) {
+            return result(handle);
+        } else {
+            put<std::uint32_t>(mem_, out_id_addr, static_cast<std::uint32_t>(handle));
+            return result(0);
+        }
+    }
+
+    if (n == "sceKernelWaitSema") {
+        if (!a(0)) return result(invalid);
+        auto it = guest_semas_.find(a(0));
+        if (it == guest_semas_.end()) return result(invalid);
+        std::int32_t need = a(1) ? static_cast<std::int32_t>(a(1)) : 1;
+        std::uint64_t timeout = 0;
+        if (a(2)) {
+            std::uint32_t to32 = 0;
+            if (mem_.load(a(2), &to32, 4) == MemoryError::ok) timeout = to32;
+        }
+        auto status = scheduler_->sema_wait(tid, it->second, need, timeout);
+        if (status) return result(static_cast<std::uint32_t>(status));
+        if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+            std::uint64_t ret = 0;
+            if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+            cpu.gpr[4] += 8;
+            cpu.rip = ret;
+            cpu.gpr[0] = 0;
+            scheduler_->set_resume(tid, [](CpuState& state, std::int32_t res) {
+                state.gpr[0] = static_cast<std::uint32_t>(res);
+            });
+            return {InvocationResult::Action::blocked, 0, 0, 0};
+        }
+        return result(0);
+    }
+
+    if (n == "sceKernelPollSema") {
+        if (!a(0)) return result(invalid);
+        auto it = guest_semas_.find(a(0));
+        if (it == guest_semas_.end()) return result(invalid);
+        std::int32_t need = a(1) ? static_cast<std::int32_t>(a(1)) : 1;
+        return result(static_cast<std::uint32_t>(scheduler_->sema_poll(it->second, need)));
+    }
+
+    if (n == "sceKernelSignalSema") {
+        if (!a(0)) return result(invalid);
+        auto it = guest_semas_.find(a(0));
+        if (it == guest_semas_.end()) return result(invalid);
+        std::int32_t count = a(1) ? static_cast<std::int32_t>(a(1)) : 1;
+        return result(static_cast<std::uint32_t>(scheduler_->sema_signal(it->second, count)));
+    }
+
+    if (n == "sceKernelDeleteSema") {
+        if (!a(0)) return result(invalid);
+        auto it = guest_semas_.find(a(0));
+        if (it == guest_semas_.end()) return result(invalid);
+        scheduler_->sema_delete(it->second);
+        guest_semas_.erase(it);
+        sema_records_.erase(static_cast<std::uint32_t>(a(0)));
+        return result(0);
+    }
+
+    if (n == "sceKernelGetSemaInfo") {
+        if (!a(0) || !a(1)) return result(invalid);
+        auto sid_handle = static_cast<std::uint32_t>(a(0));
+        auto it_rec = sema_records_.find(sid_handle);
+        if (it_rec == sema_records_.end()) return result(0x80020003); // ESRCH
+        auto it_guest = guest_semas_.find(a(0));
+        std::int32_t cur_cnt = it_rec->second.init_count;
+        std::uint32_t num_waiters = 0;
+        if (it_guest != guest_semas_.end()) {
+            cur_cnt = scheduler_->sema_count(it_guest->second);
+            num_waiters = static_cast<std::uint32_t>(scheduler_->sema_waiters(it_guest->second));
+        }
+        SceKernelSemaInfo info{};
+        std::uint64_t guest_size = 0;
+        mem_.load(a(1), &guest_size, 8);
+        info.size = (guest_size >= 48 && guest_size <= sizeof(SceKernelSemaInfo)) ? guest_size : sizeof(SceKernelSemaInfo);
+        std::strncpy(info.name, it_rec->second.name.c_str(), sizeof(info.name) - 1);
+        info.attr = it_rec->second.attr;
+        info.init_count = it_rec->second.init_count;
+        info.current_count = cur_cnt >= 0 ? cur_cnt : it_rec->second.init_count;
+        info.max_count = it_rec->second.max_count;
+        info.num_wait_threads = num_waiters;
+        auto to_write = std::min<std::size_t>(sizeof(info), info.size);
+        if (mem_.store(a(1), &info, to_write) != MemoryError::ok) return result(invalid);
+        return result(0);
+    }
+
+    // Pthread TLS
+    if (n == "scePthreadKeyCreate" || n == "pthread_key_create") {
+        if (!a(0)) return result(invalid);
+        std::uint64_t destructor = a(1);
+        auto key = scheduler_->tls_create(destructor);
+        put<std::uint32_t>(mem_, a(0), static_cast<std::uint32_t>(key));
+        return result(0);
+    }
+
+    if (n == "scePthreadKeyDelete" || n == "pthread_key_delete") {
+        if (!a(0)) return result(invalid);
+        std::uint32_t key = static_cast<std::uint32_t>(a(0));
+        scheduler_->tls_delete(key);
+        return result(0);
+    }
+
+    if (n == "scePthreadSetspecific" || n == "pthread_setspecific") {
+        std::uint32_t key = static_cast<std::uint32_t>(a(0));
+        std::uint64_t value = a(1);
+        auto status = scheduler_->tls_set(tid, key, value);
+        return result(static_cast<std::uint32_t>(status));
+    }
+
+    if (n == "scePthreadGetspecific" || n == "pthread_getspecific") {
+        std::uint32_t key = static_cast<std::uint32_t>(a(0));
+        return result(scheduler_->tls_get(tid, key));
+    }
+
+    // Pthread Mutex Timedlock
+    if (n == "scePthreadMutexTimedlock" || n == "pthread_mutex_timedlock") {
+        if (!a(0) || !a(1)) return result(invalid);
+        auto handle = get<std::uint64_t>(mem_, a(0));
+        if (!handle) return result(invalid);
+        if (!guest_mutexes_.count(handle)) return result(invalid);
+        const auto id = guest_mutexes_.at(handle);
+        std::uint64_t timeout = get<std::uint64_t>(mem_, a(1));
+        auto status = scheduler_->lock(tid, id, timeout);
+        if (status) return result(static_cast<std::uint32_t>(status));
+        if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+            std::uint64_t ret = 0;
+            if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+            cpu.gpr[4] += 8;
+            cpu.rip = ret;
+            cpu.gpr[0] = 0;
+            scheduler_->set_resume(tid, [](CpuState& state, std::int32_t res) {
+                state.gpr[0] = static_cast<std::uint32_t>(res);
+            });
+            return {InvocationResult::Action::blocked, 0, 0, 0};
+        }
+        return result(0);
+    }
+
     return result(handle(n, cpu));
 }
 OrbisRuntime::InvocationResult OrbisRuntime::complete_callback(CpuState& cpu, GuestScheduler::Id tid) {
@@ -432,6 +747,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     auto a=[&](unsigned i){return arg(c,i);};
     if (n=="_init_env" || n=="_sceKernelRtldSetApplicationHeapAPI") return 0;
     if (n=="sceKernelGetProcParam") return procparam_;
+    // Debug: print unhandled imports
+    // std::printf("HLE handle: %s\n", n.c_str());
 
     auto read_guest_string = [&](std::uint64_t addr, std::size_t max_len = 4096) -> std::string {
         std::string s;
@@ -1038,27 +1355,282 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         auto h=get<std::uint64_t>(mem_,a(0)); if (!attrs_.erase(h)) return invalid;
         put<std::uint64_t>(mem_,a(0),0); return 0;
     }
+    if (n=="scePthreadMutexattrGettype" || n=="pthread_mutexattr_gettype") {
+        if (!a(0) || !a(1)) return invalid;
+        auto h=get<std::uint64_t>(mem_,a(0));
+        unsigned t=1; if (attrs_.count(h)) t=attrs_[h];
+        put<std::int32_t>(mem_,a(1),static_cast<std::int32_t>(t)); return 0;
+    }
+    if (n=="scePthreadMutexattrGetprotocol" || n=="pthread_mutexattr_getprotocol" ||
+        n=="scePthreadMutexattrSetprotocol" || n=="pthread_mutexattr_setprotocol" ||
+        n=="scePthreadMutexattrGetprioceiling" || n=="pthread_mutexattr_getprioceiling" ||
+        n=="scePthreadMutexattrSetprioceiling" || n=="pthread_mutexattr_setprioceiling") {
+        if (!a(0)) return invalid;
+        if (n.find("Get") != std::string::npos && a(1)) put<std::int32_t>(mem_, a(1), 0);
+        return 0;
+    }
+    if (n=="scePthreadMutexGetprioceiling" || n=="pthread_mutex_getprioceiling") {
+        if (!a(0) || !a(1)) return invalid;
+        put<std::int32_t>(mem_, a(1), 0); return 0;
+    }
+    if (n=="scePthreadMutexSetprioceiling" || n=="pthread_mutex_setprioceiling") {
+        if (!a(0)) return invalid;
+        if (a(2)) put<std::int32_t>(mem_, a(2), 0);
+        return 0;
+    }
     if (n=="scePthreadMutexInit" || n=="pthread_mutex_init") {
         unsigned type=1;
-        if (a(1)) { auto attr=get<std::uint64_t>(mem_,a(1)); if (!attrs_.count(attr)) return invalid; type=attrs_[attr]; }
+        if (a(1)) {
+            auto attr=get<std::uint64_t>(mem_,a(1));
+            if (attrs_.count(attr)) type=attrs_[attr];
+            else if (attrs_.count(a(1))) type=attrs_[a(1)];
+            else if (attr >= 1 && attr <= 4) type=static_cast<unsigned>(attr);
+            else return invalid;
+        }
         std::uint32_t id=0; auto ret=KernelSyncManager::instance().pthread_mutex_init(&id,&type);
         if (ret) return static_cast<std::uint32_t>(ret);
         auto h=next_handle_++; mutexes_[h]=id; put(mem_,a(0),h); return 0;
     }
-    if (n=="scePthreadMutexLock" || n=="scePthreadMutexUnlock" || n=="scePthreadMutexTrylock" || n=="scePthreadMutexDestroy" || n=="pthread_mutex_lock" || n=="pthread_mutex_unlock") {
+    if (n=="scePthreadMutexLock" || n=="scePthreadMutexUnlock" || n=="scePthreadMutexTrylock" || n=="scePthreadMutexDestroy" || n=="pthread_mutex_lock" || n=="pthread_mutex_unlock" || n=="pthread_mutex_trylock" || n=="pthread_mutex_destroy" || n=="scePthreadMutexTimedlock" || n=="pthread_mutex_timedlock") {
         auto h=get<std::uint64_t>(mem_,a(0));
-        if (!h && n.find("Unlock")==std::string::npos) {
+        if (!h && n.find("Unlock")==std::string::npos && n.find("Destroy")==std::string::npos) {
             std::uint32_t id=0; auto ret=KernelSyncManager::instance().pthread_mutex_init(&id);
             if (ret) return static_cast<std::uint32_t>(ret);
             h=next_handle_++; mutexes_[h]=id; put(mem_,a(0),h);
         }
         auto it=mutexes_.find(h); if (it==mutexes_.end()) return invalid;
         std::int32_t result=0;
-        if (n.find("Destroy")!=std::string::npos) { result=KernelSyncManager::instance().pthread_mutex_destroy(it->second); if (!result) { mutexes_.erase(it); put<std::uint64_t>(mem_,a(0),2); } }
+        if (n.find("Destroy")!=std::string::npos || n=="pthread_mutex_destroy") { result=KernelSyncManager::instance().pthread_mutex_destroy(it->second); if (!result) { mutexes_.erase(it); put<std::uint64_t>(mem_,a(0),2); } }
         else if (n.find("Unlock")!=std::string::npos || n=="pthread_mutex_unlock") result=KernelSyncManager::instance().pthread_mutex_unlock(it->second);
-        else if (n.find("Trylock")!=std::string::npos) result=KernelSyncManager::instance().pthread_mutex_trylock(it->second);
+        else if (n.find("Trylock")!=std::string::npos || n=="pthread_mutex_trylock") result=KernelSyncManager::instance().pthread_mutex_trylock(it->second);
+        else if (n.find("Timedlock")!=std::string::npos || n=="pthread_mutex_timedlock") {
+            std::uint32_t to = 0;
+            if (a(1)) to = get<std::uint32_t>(mem_, a(1));
+            result=KernelSyncManager::instance().pthread_mutex_timedlock(it->second, to);
+        }
         else result=KernelSyncManager::instance().pthread_mutex_lock(it->second);
         return static_cast<std::uint32_t>(result);
+    }
+    // Kernel semaphores
+    if (n=="sceKernelCreateSema") {
+        bool is_sdk = is_likely_string_ptr(mem_, a(0)) || a(0) == 0;
+        std::string sema_name = "sema";
+        std::uint32_t attr = SCE_KERNEL_SEMA_ATTR_TH_FIFO;
+        std::int32_t init_val = 0, max_val = 1;
+        std::uint64_t out_id_addr = 0;
+
+        if (is_sdk) {
+            if (a(0)) sema_name = read_guest_string(a(0), 32);
+            attr = static_cast<std::uint32_t>(a(1));
+            init_val = static_cast<std::int32_t>(a(2));
+            max_val = static_cast<std::int32_t>(a(3));
+        } else {
+            out_id_addr = a(0);
+            if (!out_id_addr) return invalid;
+            if (a(1)) sema_name = read_guest_string(a(1), 32);
+            if (a(3) != 0 && (a(3) >> 16) != 0) {
+                init_val = static_cast<std::int32_t>(a(3) & 0xFFFF);
+                max_val = static_cast<std::int32_t>((a(3) >> 16) & 0xFFFF);
+            } else if (a(2) != 0 && (a(2) >> 16) != 0) {
+                init_val = static_cast<std::int32_t>(a(2) & 0xFFFF);
+                max_val = static_cast<std::int32_t>((a(2) >> 16) & 0xFFFF);
+            } else if (a(3) != 0) {
+                init_val = static_cast<std::int32_t>(a(2));
+                max_val = static_cast<std::int32_t>(a(3));
+            } else {
+                init_val = static_cast<std::int32_t>(a(2));
+                max_val = std::max<std::int32_t>(1, init_val);
+            }
+        }
+        if (max_val <= 0) max_val = std::max<std::int32_t>(1, init_val);
+        if (init_val < 0 || max_val <= 0 || init_val > max_val) return invalid;
+
+        std::uint32_t id = 0;
+        auto ret = KernelSyncManager::instance().create_sema(&id, sema_name.c_str(), attr, init_val, max_val);
+        if (ret != ORBIS_OK) return static_cast<std::uint32_t>(ret);
+
+        SemaRecord rec;
+        rec.name = sema_name;
+        rec.attr = attr;
+        rec.init_count = init_val;
+        rec.max_count = max_val;
+        sema_records_[id] = rec;
+
+        if (is_sdk) {
+            return id;
+        } else {
+            put<std::uint32_t>(mem_, out_id_addr, id);
+            return 0;
+        }
+    }
+    if (n=="sceKernelWaitSema") {
+        if (!a(0)) return invalid;
+        std::int32_t need = a(1) ? static_cast<std::int32_t>(a(1)) : 1;
+        std::uint32_t timeout=0, *ptimeout=nullptr;
+        if (a(2)) {
+            timeout=get<std::uint32_t>(mem_,a(2));
+            ptimeout=&timeout;
+        }
+        std::int32_t res=KernelSyncManager::instance().wait_sema(static_cast<std::uint32_t>(a(0)), need, ptimeout);
+        if (ptimeout && a(2)) put<std::uint32_t>(mem_,a(2),timeout);
+        return static_cast<std::uint32_t>(res);
+    }
+    if (n=="sceKernelPollSema") {
+        if (!a(0)) return invalid;
+        std::int32_t need = a(1) ? static_cast<std::int32_t>(a(1)) : 1;
+        return static_cast<std::uint32_t>(KernelSyncManager::instance().poll_sema(static_cast<std::uint32_t>(a(0)), need));
+    }
+    if (n=="sceKernelSignalSema") {
+        if (!a(0)) return invalid;
+        std::int32_t count = a(1) ? static_cast<std::int32_t>(a(1)) : 1;
+        return static_cast<std::uint32_t>(KernelSyncManager::instance().signal_sema(static_cast<std::uint32_t>(a(0)), count));
+    }
+    if (n=="sceKernelDeleteSema") {
+        if (!a(0)) return invalid;
+        sema_records_.erase(static_cast<std::uint32_t>(a(0)));
+        return static_cast<std::uint32_t>(KernelSyncManager::instance().delete_sema(static_cast<std::uint32_t>(a(0))));
+    }
+    if (n=="sceKernelGetSemaInfo") {
+        if (!a(0) || !a(1)) return invalid;
+        auto sid = static_cast<std::uint32_t>(a(0));
+        auto it_rec = sema_records_.find(sid);
+        if (it_rec == sema_records_.end()) return 0x80020003; // ESRCH
+        std::int32_t cur_cnt = KernelSyncManager::instance().sema_count(sid);
+        std::uint32_t num_waiters = static_cast<std::uint32_t>(KernelSyncManager::instance().sema_waiters(sid));
+        SceKernelSemaInfo info{};
+        std::uint64_t guest_size = 0;
+        mem_.load(a(1), &guest_size, 8);
+        info.size = (guest_size >= 48 && guest_size <= sizeof(SceKernelSemaInfo)) ? guest_size : sizeof(SceKernelSemaInfo);
+        std::strncpy(info.name, it_rec->second.name.c_str(), sizeof(info.name) - 1);
+        info.attr = it_rec->second.attr;
+        info.init_count = it_rec->second.init_count;
+        info.current_count = cur_cnt >= 0 ? cur_cnt : it_rec->second.init_count;
+        info.max_count = it_rec->second.max_count;
+        info.num_wait_threads = num_waiters;
+        auto to_write = std::min<std::size_t>(sizeof(info), info.size);
+        if (mem_.store(a(1), &info, to_write) != MemoryError::ok) return invalid;
+        return 0;
+    }
+    // pthread thread attributes (scePthreadAttr*)
+    if (n=="scePthreadAttrInit") {
+        if (!a(0)) return invalid;
+        auto h=next_handle_++; put(mem_,a(0),h); attr_defaults_[h]={}; return 0;
+    }
+    if (n=="scePthreadAttrDestroy") {
+        attr_defaults_.erase(a(0)); return 0;
+    }
+    if (n=="scePthreadAttrSetstacksize") {
+        if (!a(0) || !a(1)) return invalid;
+        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
+        it->second.stack_size=a(1); return 0;
+    }
+    if (n=="scePthreadAttrSetdetachstate") {
+        if (!a(0)) return invalid;
+        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
+        it->second.detach_state=static_cast<std::uint32_t>(a(1)); return 0;
+    }
+    if (n=="scePthreadAttrSetschedpolicy") {
+        if (!a(0)) return invalid;
+        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
+        it->second.sched_policy=static_cast<std::uint32_t>(a(1)); return 0;
+    }
+    if (n=="scePthreadAttrSetschedparam") {
+        if (!a(0) || !a(1)) return invalid;
+        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
+        std::uint32_t param=0; if (mem_.load(a(1),&param,4)!=MemoryError::ok) return invalid;
+        it->second.sched_param=param; return 0;
+    }
+    if (n=="scePthreadAttrSetaffinity") {
+        if (!a(0) || !a(1)) return invalid;
+        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
+        std::uint64_t affinity=0; if (mem_.load(a(1),&affinity,8)!=MemoryError::ok) return invalid;
+        it->second.affinity=affinity; return 0;
+    }
+    if (n=="scePthreadAttrSetinheritsched") {
+        if (!a(0)) return invalid;
+        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
+        it->second.inherit_sched=static_cast<std::uint32_t>(a(1)); return 0;
+    }
+    if (n=="scePthreadAttrGet") {
+        if (!a(0) || !a(1)) return invalid;
+        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
+        if (mem_.store(a(1),&it->second,sizeof(PthreadAttrDefaults))!=MemoryError::ok) return invalid;
+        return 0;
+    }
+    if (n=="scePthreadAttrGetaffinity") {
+        if (!a(0) || !a(1)) return invalid;
+        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
+        if (mem_.store(a(1),&it->second.affinity,8)!=MemoryError::ok) return invalid;
+        return 0;
+    }
+    // pthread thread functions (stubs for non-scheduler mode)
+    if (n=="scePthreadSelf") {
+        return 1; // main thread ID
+    }
+    if (n=="scePthreadCreate") {
+        // Simplified: allocate a thread ID and return success
+        if (!a(0) || !a(2)) return invalid;
+        std::uint64_t tid = next_handle_++;
+        put<std::uint64_t>(mem_, a(0), tid);
+        // Note: actual thread creation requires scheduler; returning success for now
+        return 0;
+    }
+    if (n=="scePthreadExit") {
+        // In non-scheduler mode, just return success
+        return 0;
+    }
+    if (n=="scePthreadJoin") {
+        // Simplified: return success immediately
+        return 0;
+    }
+    if (n=="scePthreadDetach") {
+        return 0;
+    }
+    if (n=="scePthreadYield") {
+        return 0;
+    }
+    if (n=="scePthreadEqual") {
+        // Compare two thread IDs
+        return (a(0) == a(1)) ? 1 : 0;
+    }
+    if (n=="scePthreadKeyCreate") {
+        if (!a(0)) return invalid;
+        std::uint64_t key = next_handle_++;
+        keys_[key] = a(1); // destructor
+        put<std::uint32_t>(mem_, a(0), static_cast<std::uint32_t>(key));
+        return 0;
+    }
+    if (n=="scePthreadKeyDelete") {
+        keys_.erase(a(0));
+        key_values_.erase(a(0));
+        return 0;
+    }
+    if (n=="scePthreadSetspecific") {
+        key_values_[a(0)] = a(1);
+        return 0;
+    }
+    if (n=="scePthreadGetspecific") {
+        auto it = key_values_.find(a(0));
+        return it == key_values_.end() ? 0 : it->second;
+    }
+    if (n=="scePthreadGetprio") {
+        if (!a(1)) return invalid;
+        put<std::int32_t>(mem_, a(1), 0); // default priority
+        return 0;
+    }
+    if (n=="scePthreadSetprio") {
+        return 0;
+    }
+    if (n=="scePthreadSetaffinity") {
+        return 0;
+    }
+    if (n=="scePthreadGetaffinity") {
+        if (!a(1)) return invalid;
+        put<std::uint64_t>(mem_, a(1), 1); // CPU 0
+        return 0;
+    }
+    if (n=="scePthreadRename") {
+        return 0;
     }
     if (n.rfind("scePthreadRwlock",0)==0) {
         auto h=get<std::uint64_t>(mem_,a(0));
@@ -1097,29 +1669,42 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (n.find("Wait")!=std::string::npos || n.find("wait")!=std::string::npos) return 0x80020010; // sem scheduler: jamais bloquear
         return 0;
     }
-    if (n=="scePthreadKeyCreate") {
+    if (n=="scePthreadKeyCreate" || n=="pthread_key_create") {
         if (!a(0)) return invalid;
         const auto key=next_handle_++; keys_[key]=a(1); put<std::uint32_t>(mem_,a(0),static_cast<std::uint32_t>(key)); return 0;
     }
-    if (n=="scePthreadKeyDelete" || n=="scePthreadSetspecific" || n=="scePthreadGetspecific") {
-        const auto key=a(0); if (!keys_.count(key)) return n=="scePthreadGetspecific" ? 0 : invalid;
-        if (n=="scePthreadKeyDelete") { keys_.erase(key); key_values_.erase(key); return 0; }
-        if (n=="scePthreadSetspecific") { key_values_[key]=a(1); return 0; }
+    if (n=="scePthreadKeyDelete" || n=="pthread_key_delete" ||
+        n=="scePthreadSetspecific" || n=="pthread_setspecific" ||
+        n=="scePthreadGetspecific" || n=="pthread_getspecific") {
+        const auto key=a(0); if (!keys_.count(key)) return (n=="scePthreadGetspecific" || n=="pthread_getspecific") ? 0 : invalid;
+        if (n=="scePthreadKeyDelete" || n=="pthread_key_delete") { keys_.erase(key); key_values_.erase(key); return 0; }
+        if (n=="scePthreadSetspecific" || n=="pthread_setspecific") { key_values_[key]=a(1); return 0; }
         auto it=key_values_.find(key); return it==key_values_.end() ? 0 : it->second;
     }
-    if (n=="scePthreadOnce") {
+    if (n=="scePthreadOnce" || n=="pthread_once") {
         if (!a(0) || !a(1)) return invalid;
         if (get<std::uint32_t>(mem_,a(0))) return 0;
         return 0x80020010; // exige invocação do callback guest; não marcar concluído
     }
     if (n=="sceKernelCreateEventFlag") {
-        if (!a(0) || a(2)>3) return invalid;
-        const auto h=next_handle_++; event_flags_[h]=a(3); put<std::uint32_t>(mem_,a(0),static_cast<std::uint32_t>(h)); return 0;
+        bool is_sdk = is_likely_string_ptr(mem_, a(0)) || a(0) == 0;
+        if (is_sdk) {
+            const auto h = next_handle_++;
+            event_flags_[h] = a(2);
+            return h;
+        } else {
+            if (!a(0) || a(2) > 3) return invalid;
+            const auto h = next_handle_++;
+            event_flags_[h] = a(3);
+            put<std::uint32_t>(mem_, a(0), static_cast<std::uint32_t>(h));
+            return 0;
+        }
     }
-    if (n=="sceKernelSetEventFlag" || n=="sceKernelDeleteEventFlag" || n=="sceKernelPollEventFlag" || n=="sceKernelWaitEventFlag") {
+    if (n=="sceKernelSetEventFlag" || n=="sceKernelClearEventFlag" || n=="sceKernelDeleteEventFlag" || n=="sceKernelPollEventFlag" || n=="sceKernelWaitEventFlag") {
         auto it=event_flags_.find(a(0)); if (it==event_flags_.end()) return invalid;
         if (n=="sceKernelDeleteEventFlag") { event_flags_.erase(it); return 0; }
         if (n=="sceKernelSetEventFlag") { it->second |= a(1); return 0; }
+        if (n=="sceKernelClearEventFlag") { it->second &= ~a(1); return 0; }
         const auto mask=a(1), mode=a(2);
         if (!mask || (mode & ~0x33)) return invalid;
         const auto bits=it->second & mask;
@@ -1174,6 +1759,53 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (format.find('%')!=std::string::npos) throw std::runtime_error("import não implementado: formato vprintf");
         std::fwrite(format.data(),1,format.size(),stdout);
         return format.size();
+    }
+
+    // vsnprintf - stub funcional básico
+    if (n=="vsnprintf") {
+        std::uint64_t dst = a(0);
+        std::uint64_t max_size = a(1);
+        (void)a(2); // fmt_addr
+        // va_list is at a(3) - simplified: just return 0 for now
+        if (dst && max_size > 0) {
+            char null_byte = '\0';
+            mem_.store(dst, &null_byte, 1);
+        }
+        return 0;
+    }
+
+    // String functions: strncpy, strcat, strncat
+    if (n=="strncpy") {
+        std::uint64_t dst = a(0);
+        std::uint64_t src = a(1);
+        std::uint64_t n_bytes = a(2);
+        if (!dst || !src) return 0;
+        for (std::uint64_t i = 0; i < n_bytes; ++i) {
+            auto ch = get<std::uint8_t>(mem_, src + i);
+            put<std::uint8_t>(mem_, dst + i, ch);
+            if (!ch) {
+                for (++i; i < n_bytes; ++i) put<std::uint8_t>(mem_, dst + i, 0);
+                break;
+            }
+        }
+        return dst;
+    }
+    if (n=="strcat" || n=="strncat") {
+        std::uint64_t dst = a(0);
+        std::uint64_t src = a(1);
+        std::uint64_t max_append = (n=="strncat") ? a(2) : (1u<<20);
+        if (!dst || !src) return dst;
+        // Find end of dst
+        std::uint64_t dst_len = 0;
+        for (; dst_len < (1u<<20); ++dst_len) {
+            if (!get<std::uint8_t>(mem_, dst + dst_len)) break;
+        }
+        for (std::uint64_t i = 0; i < max_append; ++i) {
+            auto ch = get<std::uint8_t>(mem_, src + i);
+            put<std::uint8_t>(mem_, dst + dst_len + i, ch);
+            if (!ch) break;
+        }
+        return dst;
     }
     if (n=="strlen" || n=="strcmp" || n=="strncmp" || n=="strcasecmp" || n=="strncasecmp" || n=="strchr" || n=="strrchr" || n=="strcpy" || n=="strstr") {
         auto read_char=[&](std::uint64_t base,std::uint64_t offset) {
@@ -1238,6 +1870,810 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         auto it=heap_.find(a(0)); if (it==heap_.end()) throw std::runtime_error("free guest inválido");
         mem_.unmap(it->first); heap_.erase(it); return 0;
     }
+
+    // stdlib: exit, abort, abs, labs, llabs, div, ldiv, lldiv
+    if (n=="exit" || n=="_exit") {
+        // Em HLE, apenas registra e retorna - não termina o processo host
+        exit_code_ = static_cast<int>(a(0));
+        return 0;
+    }
+    if (n=="abort") {
+        throw std::runtime_error("guest abort chamado");
+    }
+    if (n=="abs") {
+        long val = static_cast<long>(a(0));
+        return static_cast<std::uint64_t>(val >= 0 ? val : -val);
+    }
+    if (n=="labs") {
+        long val = static_cast<long>(a(0));
+        return static_cast<std::uint64_t>(val >= 0 ? val : -val);
+    }
+    if (n=="llabs") {
+        long long val = static_cast<long long>(a(0));
+        return static_cast<std::uint64_t>(val >= 0 ? val : -val);
+    }
+    if (n=="div") {
+        long numer = static_cast<long>(a(0));
+        long denom = static_cast<long>(a(1));
+        if (denom == 0) return 0;
+        std::uint64_t quot = static_cast<std::uint64_t>(numer / denom);
+        std::uint64_t rem = static_cast<std::uint64_t>(numer % denom);
+        if (a(2)) put<std::uint64_t>(mem_, a(2), quot); // quot in rdi
+        if (a(3)) put<std::uint64_t>(mem_, a(3), rem); // rem in rsi
+        return (quot << 32) | (rem & 0xFFFFFFFF);
+    }
+    if (n=="ldiv") {
+        long numer = static_cast<long>(a(0));
+        long denom = static_cast<long>(a(1));
+        if (denom == 0) return 0;
+        std::uint64_t quot = static_cast<std::uint64_t>(numer / denom);
+        std::uint64_t rem = static_cast<std::uint64_t>(numer % denom);
+        if (a(2)) put<std::uint64_t>(mem_, a(2), quot);
+        if (a(3)) put<std::uint64_t>(mem_, a(3), rem);
+        return (quot << 32) | (rem & 0xFFFFFFFF);
+    }
+    if (n=="lldiv") {
+        long long numer = static_cast<long long>(a(0));
+        long long denom = static_cast<long long>(a(1));
+        if (denom == 0) return 0;
+        std::uint64_t quot = static_cast<std::uint64_t>(numer / denom);
+        std::uint64_t rem = static_cast<std::uint64_t>(numer % denom);
+        if (a(2)) put<std::uint64_t>(mem_, a(2), quot);
+        if (a(3)) put<std::uint64_t>(mem_, a(3), rem);
+        return (quot << 32) | (rem & 0xFFFFFFFF);
+    }
+
+    // stdio: FILE* stubs (simplified - use host FILE* mapping)
+    if (n=="fopen") {
+        std::string path = read_guest_string(a(0));
+        std::string mode = read_guest_string(a(1));
+        FILE* fp = std::fopen(path.c_str(), mode.c_str());
+        return reinterpret_cast<std::uint64_t>(fp);
+    }
+    if (n=="fclose") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        return std::fclose(fp);
+    }
+    if (n=="fread") {
+        void* ptr = reinterpret_cast<void*>(a(0));
+        std::size_t size = static_cast<std::size_t>(a(1));
+        std::size_t nmemb = static_cast<std::size_t>(a(2));
+        FILE* fp = reinterpret_cast<FILE*>(a(3));
+        return std::fread(ptr, size, nmemb, fp);
+    }
+    if (n=="fwrite") {
+        const void* ptr = reinterpret_cast<const void*>(a(0));
+        std::size_t size = static_cast<std::size_t>(a(1));
+        std::size_t nmemb = static_cast<std::size_t>(a(2));
+        FILE* fp = reinterpret_cast<FILE*>(a(3));
+        return std::fwrite(ptr, size, nmemb, fp);
+    }
+    if (n=="fseek") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        long offset = static_cast<long>(a(1));
+        int whence = static_cast<int>(a(2));
+        return std::fseek(fp, offset, whence);
+    }
+    if (n=="ftell") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        return static_cast<std::uint64_t>(std::ftell(fp));
+    }
+    if (n=="rewind") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        std::rewind(fp);
+        return 0;
+    }
+    if (n=="fflush") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        return std::fflush(fp);
+    }
+    if (n=="feof") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        return std::feof(fp);
+    }
+    if (n=="ferror") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        return std::ferror(fp);
+    }
+    if (n=="clearerr") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        std::clearerr(fp);
+        return 0;
+    }
+    if (n=="fprintf" || n=="vfprintf") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        std::string fmt = read_guest_string(a(1));
+        // Simplified: just print the format string without args
+        if (fmt.find('%') != std::string::npos) return 0;
+        return std::fprintf(fp, "%s", fmt.c_str());
+    }
+    if (n=="sprintf" || n=="vsprintf") {
+        std::uint64_t dst = a(0);
+        std::string fmt = read_guest_string(a(1));
+        if (fmt.find('%') != std::string::npos) return 0;
+        if (dst) {
+            mem_.store(dst, fmt.data(), fmt.size());
+            char null_byte = '\0';
+            mem_.store(dst + fmt.size(), &null_byte, 1);
+        }
+        return fmt.size();
+    }
+    if (n=="puts") {
+        std::string s = read_guest_string(a(0));
+        std::fwrite(s.data(), 1, s.size(), stdout);
+        std::fputc('\n', stdout);
+        return static_cast<int>(s.size()) + 1;
+    }
+    if (n=="putchar") {
+        int c = static_cast<int>(a(0));
+        return std::fputc(c, stdout);
+    }
+    if (n=="getchar") {
+        return std::getchar();
+    }
+    if (n=="fgetc") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        return std::fgetc(fp);
+    }
+    if (n=="fgets") {
+        char* buf = reinterpret_cast<char*>(a(0));
+        int size = static_cast<int>(a(1));
+        FILE* fp = reinterpret_cast<FILE*>(a(2));
+        if (!buf || size <= 0) return 0;
+        char* res = std::fgets(buf, size, fp);
+        return res ? a(0) : 0;
+    }
+    if (n=="fputc") {
+        int c = static_cast<int>(a(0));
+        FILE* fp = reinterpret_cast<FILE*>(a(1));
+        return std::fputc(c, fp);
+    }
+    if (n=="fputs") {
+        std::string s = read_guest_string(a(0));
+        FILE* fp = reinterpret_cast<FILE*>(a(1));
+        return std::fputs(s.c_str(), fp);
+    }
+
+    // pthreads stubs
+    if (n=="pthread_self") {
+        return reinterpret_cast<std::uint64_t>(&mem_); // unique-ish per instance
+    }
+    if (n=="pthread_join") {
+        // Stub: return success without waiting
+        return 0;
+    }
+    if (n=="pthread_exit") {
+        // Stub: do nothing
+        return 0;
+    }
+    if (n=="pthread_attr_init") {
+        std::uint64_t attr = a(0);
+        if (!attr) return 0x16; // EINVAL
+        put<std::uint32_t>(mem_, attr, 0); // default attr
+        return 0;
+    }
+    if (n=="pthread_attr_destroy") {
+        std::uint64_t attr = a(0);
+        if (!attr) return 0x16;
+        put<std::uint32_t>(mem_, attr, 0xDEAD);
+        return 0;
+    }
+    if (n=="pthread_attr_setdetachstate") {
+        std::uint64_t attr = a(0);
+        int state = static_cast<int>(a(1));
+        if (!attr) return 0x16;
+        // Store detach state in attr (simplified)
+        put<std::uint32_t>(mem_, attr + 4, static_cast<std::uint32_t>(state));
+        return 0;
+    }
+    if (n=="pthread_attr_getdetachstate") {
+        std::uint64_t attr = a(0);
+        std::uint64_t state_ptr = a(1);
+        if (!attr || !state_ptr) return 0x16;
+        std::uint32_t state = get<std::uint32_t>(mem_, attr + 4);
+        put<std::uint32_t>(mem_, state_ptr, state);
+        return 0;
+    }
+
+    // signals stubs
+    if (n=="signal") {
+        // Return SIG_DFL (0) as previous handler
+        return 0;
+    }
+    if (n=="raise") {
+        // Stub: do nothing
+        return 0;
+    }
+    if (n=="sigaction") {
+        // Stub: return success
+        return 0;
+    }
+    if (n=="sigemptyset") {
+        std::uint64_t set = a(0);
+        if (set) put<std::uint64_t>(mem_, set, 0);
+        return 0;
+    }
+    if (n=="sigfillset") {
+        std::uint64_t set = a(0);
+        if (set) put<std::uint64_t>(mem_, set, ~0ULL);
+        return 0;
+    }
+    if (n=="sigaddset") {
+        // Stub: return success
+        return 0;
+    }
+    if (n=="sigdelset") {
+        // Stub: return success
+        return 0;
+    }
+    if (n=="sigismember") {
+        // Stub: return 0 (not a member)
+        return 0;
+    }
+
+    // time functions
+    if (n=="time") {
+        std::time_t t = std::time(nullptr);
+        if (a(0)) put<std::int64_t>(mem_, a(0), t);
+        return static_cast<std::uint64_t>(t);
+    }
+    if (n=="clock") {
+        return static_cast<std::uint64_t>(std::clock());
+    }
+    if (n=="difftime") {
+        double time1 = 0, time2 = 0;
+        std::uint64_t a0 = a(0);
+        std::uint64_t a1 = a(1);
+        std::memcpy(&time1, &a0, sizeof(time1));
+        std::memcpy(&time2, &a1, sizeof(time2));
+        double diff = time1 - time2;
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &diff, sizeof(bits));
+        return bits;
+    }
+    if (n=="mktime") {
+        // Stub: return 0
+        return 0;
+    }
+    if (n=="localtime") {
+        // Stub: return a static pointer (simplified)
+        std::time_t t = static_cast<std::time_t>(a(0));
+        std::tm* tm = std::localtime(&t);
+        // Allocate a simple struct in guest memory
+        std::uint64_t buf = next_heap_;
+        next_heap_ += 128;
+        mem_.map(buf, 128, read | write);
+        if (tm) {
+            put<std::int32_t>(mem_, buf + 0, tm->tm_sec);
+            put<std::int32_t>(mem_, buf + 4, tm->tm_min);
+            put<std::int32_t>(mem_, buf + 8, tm->tm_hour);
+            put<std::int32_t>(mem_, buf + 12, tm->tm_mday);
+            put<std::int32_t>(mem_, buf + 16, tm->tm_mon);
+            put<std::int32_t>(mem_, buf + 20, tm->tm_year);
+            put<std::int32_t>(mem_, buf + 24, tm->tm_wday);
+            put<std::int32_t>(mem_, buf + 28, tm->tm_yday);
+            put<std::int32_t>(mem_, buf + 32, tm->tm_isdst);
+        }
+        return buf;
+    }
+    if (n=="gmtime") {
+        std::time_t t = static_cast<std::time_t>(a(0));
+        std::tm* tm = std::gmtime(&t);
+        std::uint64_t buf = next_heap_;
+        next_heap_ += 128;
+        mem_.map(buf, 128, read | write);
+        if (tm) {
+            put<std::int32_t>(mem_, buf + 0, tm->tm_sec);
+            put<std::int32_t>(mem_, buf + 4, tm->tm_min);
+            put<std::int32_t>(mem_, buf + 8, tm->tm_hour);
+            put<std::int32_t>(mem_, buf + 12, tm->tm_mday);
+            put<std::int32_t>(mem_, buf + 16, tm->tm_mon);
+            put<std::int32_t>(mem_, buf + 20, tm->tm_year);
+            put<std::int32_t>(mem_, buf + 24, tm->tm_wday);
+            put<std::int32_t>(mem_, buf + 28, tm->tm_yday);
+            put<std::int32_t>(mem_, buf + 32, tm->tm_isdst);
+        }
+        return buf;
+    }
+    if (n=="asctime") {
+        std::uint64_t tm_ptr = a(0);
+        if (!tm_ptr) return 0;
+        std::int32_t sec = get<std::int32_t>(mem_, tm_ptr + 0);
+        std::int32_t min = get<std::int32_t>(mem_, tm_ptr + 4);
+        std::int32_t hour = get<std::int32_t>(mem_, tm_ptr + 8);
+        std::int32_t mday = get<std::int32_t>(mem_, tm_ptr + 12);
+        std::int32_t mon = get<std::int32_t>(mem_, tm_ptr + 16);
+        std::int32_t year = get<std::int32_t>(mem_, tm_ptr + 20);
+        static const char* wday_name[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+        static const char* mon_name[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+        std::uint64_t buf = next_heap_;
+        next_heap_ += 64;
+        mem_.map(buf, 64, read | write);
+        char out[64];
+        std::snprintf(out, sizeof(out), "%.3s %.3s %2d %.2d:%.2d:%.2d %d\n",
+            wday_name[0], mon_name[mon % 12], mday, hour, min, sec, 1900 + year);
+        mem_.store(buf, out, std::strlen(out) + 1);
+        return buf;
+    }
+    if (n=="ctime") {
+        std::time_t t = static_cast<std::time_t>(a(0));
+        std::string s = std::ctime(&t);
+        std::uint64_t buf = next_heap_;
+        next_heap_ += s.size() + 1;
+        mem_.map(buf, s.size() + 1, read | write);
+        mem_.store(buf, s.data(), s.size() + 1);
+        return buf;
+    }
+    if (n=="strftime") {
+        // Stub: return 0
+        return 0;
+    }
+    if (n=="nanosleep") {
+        // Stub: return 0 (slept)
+        return 0;
+    }
+
+    // Other common libc functions
+    if (n=="memalign") {
+        std::size_t alignment = static_cast<std::size_t>(a(0));
+        std::size_t size = static_cast<std::size_t>(a(1));
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0) return 0;
+        CpuState copy = c; copy.gpr[7] = size;
+        std::uint64_t ptr = handle("malloc", copy);
+        if (ptr && (ptr % alignment) != 0) {
+            // Align up
+            ptr = (ptr + alignment - 1) & ~(alignment - 1);
+        }
+        return ptr;
+    }
+    if (n=="memchr") {
+        std::uint64_t ptr = a(0);
+        int val = static_cast<int>(a(1));
+        std::size_t n_bytes = static_cast<std::size_t>(a(2));
+        for (std::size_t i = 0; i < n_bytes; ++i) {
+            auto ch = get<std::uint8_t>(mem_, ptr + i);
+            if (ch == static_cast<std::uint8_t>(val)) return ptr + i;
+        }
+        return 0;
+    }
+    if (n=="getpagesize") {
+        return 4096;
+    }
+    if (n=="remove") {
+        std::string path = read_guest_string(a(0));
+        return std::remove(path.c_str());
+    }
+    if (n=="rename") {
+        std::string oldpath = read_guest_string(a(0));
+        std::string newpath = read_guest_string(a(1));
+        return std::rename(oldpath.c_str(), newpath.c_str());
+    }
+    if (n=="mkdir") {
+        std::string path = read_guest_string(a(0));
+        // mode is a(1) - ignored on Windows
+        return std::system(("mkdir \"" + path + "\"").c_str());
+    }
+    if (n=="rmdir") {
+        std::string path = read_guest_string(a(0));
+        return std::system(("rmdir \"" + path + "\"").c_str());
+    }
+    if (n=="fgetpos") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        std::fpos_t pos;
+        int res = std::fgetpos(fp, &pos);
+        if (res == 0 && a(1)) put<std::uint64_t>(mem_, a(1), static_cast<std::uint64_t>(pos));
+        return res;
+    }
+    if (n=="fsetpos") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        std::fpos_t pos = static_cast<std::fpos_t>(a(1));
+        return std::fsetpos(fp, &pos);
+    }
+    if (n=="setvbuf") {
+        // Stub: return success
+        return 0;
+    }
+    if (n=="freopen") {
+        std::string path = read_guest_string(a(0));
+        std::string mode = read_guest_string(a(1));
+        FILE* fp = reinterpret_cast<FILE*>(a(2));
+        FILE* res = std::freopen(path.c_str(), mode.c_str(), fp);
+        return reinterpret_cast<std::uint64_t>(res);
+    }
+    if (n=="frexp" || n=="frexpf") {
+        // Stub: return 0.5, exponent in a(1)
+        double x = 0.0;
+        std::uint64_t arg0 = a(0);
+        if (n=="frexp") std::memcpy(&x, &arg0, sizeof(x));
+        else {
+            float xf = 0.0f;
+            std::memcpy(&xf, &arg0, sizeof(xf));
+            x = xf;
+        }
+        int exp = 0;
+        double frac = std::frexp(x, &exp);
+        if (a(1)) put<std::int32_t>(mem_, a(1), exp);
+        std::uint64_t bits = 0;
+        if (n=="frexp") std::memcpy(&bits, &frac, sizeof(bits));
+        else {
+            float ffrac = static_cast<float>(frac);
+            std::memcpy(&bits, &ffrac, sizeof(ffrac));
+        }
+        return bits;
+    }
+    if (n=="ldexp" || n=="ldexpf") {
+        double x = 0.0;
+        std::uint64_t arg0 = a(0);
+        if (n=="ldexp") std::memcpy(&x, &arg0, sizeof(x));
+        else {
+            float xf = 0.0f;
+            std::memcpy(&xf, &arg0, sizeof(xf));
+            x = xf;
+        }
+        int exp = static_cast<int>(a(1));
+        double res = std::ldexp(x, exp);
+        std::uint64_t bits = 0;
+        if (n=="ldexp") std::memcpy(&bits, &res, sizeof(bits));
+        else {
+            float fres = static_cast<float>(res);
+            std::memcpy(&bits, &fres, sizeof(fres));
+        }
+        return bits;
+    }
+    if (n=="modf" || n=="modff") {
+        double x = 0.0;
+        std::uint64_t arg0 = a(0);
+        if (n=="modf") std::memcpy(&x, &arg0, sizeof(x));
+        else {
+            float xf = 0.0f;
+            std::memcpy(&xf, &arg0, sizeof(xf));
+            x = xf;
+        }
+        double intpart = 0.0;
+        double frac = std::modf(x, &intpart);
+        if (a(1)) {
+            std::uint64_t bits = 0;
+            if (n=="modf") std::memcpy(&bits, &intpart, sizeof(bits));
+            else {
+                float fintpart = static_cast<float>(intpart);
+                std::memcpy(&bits, &fintpart, sizeof(fintpart));
+            }
+            put<std::uint64_t>(mem_, a(1), bits);
+        }
+        std::uint64_t bits = 0;
+        if (n=="modf") std::memcpy(&bits, &frac, sizeof(bits));
+        else {
+            float ffrac = static_cast<float>(frac);
+            std::memcpy(&bits, &ffrac, sizeof(ffrac));
+        }
+        return bits;
+    }
+    if (n=="exp2" || n=="exp2f") {
+        double x = 0.0;
+        std::uint64_t arg0 = a(0);
+        if (n=="exp2") std::memcpy(&x, &arg0, sizeof(x));
+        else {
+            float xf = 0.0f;
+            std::memcpy(&xf, &arg0, sizeof(xf));
+            x = xf;
+        }
+        double res = std::exp2(x);
+        std::uint64_t bits = 0;
+        if (n=="exp2") std::memcpy(&bits, &res, sizeof(bits));
+        else {
+            float fres = static_cast<float>(res);
+            std::memcpy(&bits, &fres, sizeof(fres));
+        }
+        return bits;
+    }
+    if (n=="acos" || n=="acosf") {
+        double x = 0.0;
+        std::uint64_t arg0 = a(0);
+        if (n=="acos") std::memcpy(&x, &arg0, sizeof(x));
+        else {
+            float xf = 0.0f;
+            std::memcpy(&xf, &arg0, sizeof(xf));
+            x = xf;
+        }
+        double res = std::acos(x);
+        std::uint64_t bits = 0;
+        if (n=="acos") std::memcpy(&bits, &res, sizeof(bits));
+        else {
+            float fres = static_cast<float>(res);
+            std::memcpy(&bits, &fres, sizeof(fres));
+        }
+        return bits;
+    }
+    if (n=="asin" || n=="asinf") {
+        double x = 0.0;
+        std::uint64_t arg0 = a(0);
+        if (n=="asin") std::memcpy(&x, &arg0, sizeof(x));
+        else {
+            float xf = 0.0f;
+            std::memcpy(&xf, &arg0, sizeof(xf));
+            x = xf;
+        }
+        double res = std::asin(x);
+        std::uint64_t bits = 0;
+        if (n=="asin") std::memcpy(&bits, &res, sizeof(bits));
+        else {
+            float fres = static_cast<float>(res);
+            std::memcpy(&bits, &fres, sizeof(fres));
+        }
+        return bits;
+    }
+    if (n=="atan" || n=="atanf") {
+        double x = 0.0;
+        std::uint64_t arg0 = a(0);
+        if (n=="atan") std::memcpy(&x, &arg0, sizeof(x));
+        else {
+            float xf = 0.0f;
+            std::memcpy(&xf, &arg0, sizeof(xf));
+            x = xf;
+        }
+        double res = std::atan(x);
+        std::uint64_t bits = 0;
+        if (n=="atan") std::memcpy(&bits, &res, sizeof(bits));
+        else {
+            float fres = static_cast<float>(res);
+            std::memcpy(&bits, &fres, sizeof(fres));
+        }
+        return bits;
+    }
+    if (n=="tanhf") {
+        float x = 0.0f;
+        std::uint64_t arg0 = a(0);
+        std::memcpy(&x, &arg0, sizeof(x));
+        float res = std::tanh(x);
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &res, sizeof(bits));
+        return bits;
+    }
+    if (n=="srand") {
+        std::srand(static_cast<unsigned>(a(0)));
+        return 0;
+    }
+    if (n=="rand") {
+        return std::rand();
+    }
+    if (n=="gettimeofday") {
+        if (a(0)) {
+            auto now = std::chrono::system_clock::now().time_since_epoch();
+            auto secs = std::chrono::duration_cast<std::chrono::seconds>(now);
+            auto usecs = std::chrono::duration_cast<std::chrono::microseconds>(now - secs);
+            put<std::int64_t>(mem_, a(0), secs.count());
+            put<std::int64_t>(mem_, a(0) + 8, usecs.count());
+        }
+        return 0;
+    }
+    if (n=="localtime_s") {
+        // Stub
+        return 0;
+    }
+    if (n=="strerror") {
+        int errnum = static_cast<int>(a(0));
+        std::string msg = std::strerror(errnum);
+        std::uint64_t buf = next_heap_;
+        next_heap_ += msg.size() + 1;
+        mem_.map(buf, msg.size() + 1, read | write);
+        mem_.store(buf, msg.data(), msg.size() + 1);
+        return buf;
+    }
+    if (n=="strcoll") {
+        // Use strcmp for now
+        return handle("strcmp", c);
+    }
+    if (n=="strcspn" || n=="strspn" || n=="strpbrk" || n=="strtok") {
+        // Stubs
+        return 0;
+    }
+    if (n=="setlocale") {
+        // Stub
+        return 0;
+    }
+    if (n=="perror") {
+        // Stub
+        return 0;
+    }
+    if (n=="fscanf" || n=="sscanf" || n=="swscanf") {
+        // Stubs
+        return 0;
+    }
+    if (n=="fgetpos") {
+        // Already handled above
+    }
+    if (n=="ungetc") {
+        int c = static_cast<int>(a(0));
+        FILE* fp = reinterpret_cast<FILE*>(a(1));
+        return std::ungetc(c, fp);
+    }
+    if (n=="fscanf") {
+        // Stub
+        return 0;
+    }
+    if (n=="setvbuf") {
+        // Stub
+        return 0;
+    }
+    if (n=="freopen") {
+        // Already handled above
+    }
+    if (n=="getc") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        return std::getc(fp);
+    }
+    if (n=="fputc") {
+        // Already handled above
+    }
+    if (n=="putchar") {
+        // Already handled above
+    }
+    if (n=="fgets") {
+        // Already handled above
+    }
+    if (n=="fputs") {
+        // Already handled above
+    }
+    if (n=="feof") {
+        // Already handled above
+    }
+    if (n=="ferror") {
+        // Already handled above
+    }
+    if (n=="clearerr") {
+        // Already handled above
+    }
+    if (n=="fileno") {
+        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        return _fileno(fp);
+    }
+    if (n=="isatty") {
+        // Stub
+        return 0;
+    }
+    if (n=="ttyname") {
+        // Stub
+        return 0;
+    }
+    if (n=="ctermid") {
+        // Stub
+        return 0;
+    }
+    if (n=="tmpnam") {
+        // Stub
+        return 0;
+    }
+    if (n=="tmpfile") {
+        // Stub
+        return 0;
+    }
+    if (n=="fstat" || n=="stat") {
+        // Stub
+        return 0;
+    }
+    if (n=="lstat") {
+        // Stub
+        return 0;
+    }
+    if (n=="access") {
+        // Stub
+        return 0;
+    }
+    if (n=="chmod" || n=="fchmod") {
+        // Stub
+        return 0;
+    }
+    if (n=="chown" || n=="fchown" || n=="lchown") {
+        // Stub
+        return 0;
+    }
+    if (n=="link" || n=="symlink" || n=="readlink") {
+        // Stub
+        return 0;
+    }
+    if (n=="unlink") {
+        std::string path = read_guest_string(a(0));
+        return std::remove(path.c_str());
+    }
+    // POSIX I/O functions (libc low-level)
+    if (n=="_write" || n=="write") {
+        int fd = static_cast<int>(a(0));
+        std::uint64_t buf = a(1);
+        std::size_t count = static_cast<std::size_t>(a(2));
+        if (count > 1024*1024) count = 1024*1024;
+        std::vector<char> data(count);
+        if (mem_.load(buf, data.data(), count) != MemoryError::ok) return static_cast<std::uint64_t>(-1);
+        if (fd == 1 || fd == 2) {
+            std::fwrite(data.data(), 1, count, fd == 1 ? stdout : stderr);
+            return count;
+        }
+        return static_cast<std::uint64_t>(::write(fd, data.data(), static_cast<unsigned int>(count)));
+    }
+    if (n=="_read" || n=="read") {
+        int fd = static_cast<int>(a(0));
+        std::uint64_t buf = a(1);
+        std::size_t count = static_cast<std::size_t>(a(2));
+        if (count > 1024*1024) count = 1024*1024;
+        std::vector<char> data(count);
+        int res = ::read(fd, data.data(), static_cast<unsigned int>(count));
+        if (res > 0 && mem_.store(buf, data.data(), res) != MemoryError::ok) return static_cast<std::uint64_t>(-1);
+        return static_cast<std::uint64_t>(res);
+    }
+    if (n=="_open" || n=="open") {
+        std::string path = read_guest_string(a(0));
+        int oflag = static_cast<int>(a(1));
+        int mode = static_cast<int>(a(2));
+        int fd = ::open(path.c_str(), oflag, mode);
+        return static_cast<std::uint64_t>(fd);
+    }
+    if (n=="_close" || n=="close") {
+        int fd = static_cast<int>(a(0));
+        return static_cast<std::uint64_t>(::close(fd));
+    }
+    if (n=="_lseek" || n=="lseek") {
+        int fd = static_cast<int>(a(0));
+        long offset = static_cast<long>(a(1));
+        int whence = static_cast<int>(a(2));
+        return static_cast<std::uint64_t>(::lseek(fd, offset, whence));
+    }
+    if (n=="getcwd") {
+        // Stub
+        return 0;
+    }
+    if (n=="chdir" || n=="fchdir") {
+        // Stub
+        return 0;
+    }
+    if (n=="opendir" || n=="readdir" || n=="closedir") {
+        // Stub
+        return 0;
+    }
+    if (n=="getpid") {
+        return static_cast<std::uint64_t>(_getpid());
+    }
+    if (n=="getppid") {
+        return 1;
+    }
+    if (n=="getuid" || n=="geteuid" || n=="getgid" || n=="getegid") {
+        return 0;
+    }
+    if (n=="sysctl") {
+        // Stub
+        return 0;
+    }
+    if (n=="mmap" || n=="munmap") {
+        // Use sceKernelMmap/sceKernelMunmap
+        return handle(n=="mmap" ? "sceKernelMmap" : "sceKernelMunmap", c);
+    }
+    if (n=="msync") {
+        return 0;
+    }
+    if (n=="mlock" || n=="munlock" || n=="mlockall" || n=="munlockall") {
+        return 0;
+    }
+    if (n=="sched_yield") {
+        return 0;
+    }
+    if (n=="sleep") {
+        // Stub
+        return 0;
+    }
+    if (n=="usleep") {
+        return 0;
+    }
+    if (n=="getrusage") {
+        // Stub
+        return 0;
+    }
+    if (n=="srand48" || n=="drand48" || n=="lrand48" || n=="mrand48") {
+        // Stubs
+        return 0;
+    }
+    if (n=="qsort" || n=="bsearch") {
+        // Already implemented above
+    }
+
+    std::printf("HLE handle: unhandled import: %s\n", n.c_str());
     throw std::runtime_error("import não implementado: " + n);
 }
 } // namespace bb

@@ -374,9 +374,10 @@ bool GnmMetalBridge::bind_buffer_table(ShaderStage stage, std::uint32_t base_slo
     }
     if (!bindings) return false;
 
+    GnmContext ctx(memory_);
     for (std::uint32_t i = 0; i < count; ++i) {
         BufferDescriptor desc;
-        if (memory_.load(table_addr + i * 16, &desc, sizeof(desc)) != MemoryError::ok) {
+        if (!ctx.read_buffer_descriptor(table_addr + i * 16, desc)) {
             return false;
         }
         if (!desc.is_valid()) continue;
@@ -395,9 +396,10 @@ bool GnmMetalBridge::bind_texture_table(ShaderStage stage, std::uint32_t base_sl
     }
     if (!bindings) return false;
 
+    GnmContext ctx(memory_);
     for (std::uint32_t i = 0; i < count; ++i) {
         TextureDescriptor desc;
-        if (memory_.load(table_addr + i * 32, &desc, sizeof(desc)) != MemoryError::ok) {
+        if (!ctx.read_texture_descriptor(table_addr + i * 32, desc)) {
             return false;
         }
         if (!desc.is_valid()) continue;
@@ -416,9 +418,10 @@ bool GnmMetalBridge::bind_sampler_table(ShaderStage stage, std::uint32_t base_sl
     }
     if (!bindings) return false;
 
+    GnmContext ctx(memory_);
     for (std::uint32_t i = 0; i < count; ++i) {
         SamplerDescriptor desc;
-        if (memory_.load(table_addr + i * 16, &desc, sizeof(desc)) != MemoryError::ok) {
+        if (!ctx.read_sampler_descriptor(table_addr + i * 16, desc)) {
             return false;
         }
         if (!bindings->bind_sampler(base_slot + i, desc)) return false;

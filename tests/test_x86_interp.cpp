@@ -466,6 +466,28 @@ int main() {
             CHECK(m6.cpu.state.xmm[0][0] == 0xA1B2C3D4E5F60718ULL);
             CHECK(m6.cpu.state.xmm[0][1] == 0);
             CHECK(m6.cpu.state.ymm_hi[0][0] == 0 && m6.cpu.state.ymm_hi[0][1] == 0);
+
+            // pp=1 (66 0F D6): vmovq [rbx], xmm0 (0xD6)
+            Machine m7{0xC5, 0xF9, 0xD6, 0x03, 0xC3}; // vmovq [rbx], xmm0; ret
+            m7.cpu.state.gpr[3] = DATA;
+            m7.cpu.state.xmm[0][0] = 0x1234567890ABCDEFULL;
+            CHECK(m7.run().stop == CpuStop::trap);
+            std::uint64_t v_d6_mem = 0;
+            CHECK(m7.mem.load(DATA, &v_d6_mem, 8) == MemoryError::ok);
+            CHECK(v_d6_mem == 0x1234567890ABCDEFULL);
+            const std::uint8_t d_vmovq_d6[] = {0xC5, 0xF9, 0xD6, 0x03};
+            CHECK(decode_x86(d_vmovq_d6, sizeof(d_vmovq_d6)).length == 4);
+            CHECK(decode_x86(d_vmovq_d6, sizeof(d_vmovq_d6)).supported);
+
+            // pp=1 (66 0F D6): vmovq xmm1, xmm0 (0xD6 reg-reg: dest=rm=xmm1, src=reg=xmm0)
+            Machine m8{0xC5, 0xF9, 0xD6, 0xC1, 0xC3}; // vmovq xmm1, xmm0; ret
+            m8.cpu.state.xmm[0][0] = 0xCAFEBABE11223344ULL;
+            m8.cpu.state.xmm[1][0] = ~0ULL; m8.cpu.state.xmm[1][1] = ~0ULL;
+            m8.cpu.state.ymm_hi[1][0] = ~0ULL; m8.cpu.state.ymm_hi[1][1] = ~0ULL;
+            CHECK(m8.run().stop == CpuStop::trap);
+            CHECK(m8.cpu.state.xmm[1][0] == 0xCAFEBABE11223344ULL);
+            CHECK(m8.cpu.state.xmm[1][1] == 0);
+            CHECK(m8.cpu.state.ymm_hi[1][0] == 0 && m8.cpu.state.ymm_hi[1][1] == 0);
         }
         {   // VCVTSI2SS / VCVTSI2SD (0x2A): r32/r64/mem -> xmm, merges with src1 (vvvv)
             // vcvtsi2ss xmm0, xmm1, ebx (W=0)
@@ -1010,6 +1032,117 @@ int main() {
             CHECK(m6.run().stop == CpuStop::trap);
             CHECK(m6.cpu.state.xmm[0][0] == 11 && m6.cpu.state.xmm[0][1] == 22);
             CHECK(m6.cpu.state.ymm_hi[0][0] == 33 && m6.cpu.state.ymm_hi[0][1] == 44);
+        }
+        {   // VPCMPGT family (pp=3, op=0x7C..0x7F: Q, W, D, B)
+            // Blocking instruction: c5 f3 7c c9 = vpcmpgtq xmm1, xmm1, xmm1
+            Machine m_blocking{0xC5, 0xF3, 0x7C, 0xC9, 0xC3};
+            m_blocking.cpu.state.xmm[1][0] = 0x123456789ABCDEF0ULL;
+            m_blocking.cpu.state.xmm[1][1] = 0x0FEDCBA987654321ULL;
+            m_blocking.cpu.state.ymm_hi[1][0] = ~0ULL;
+            m_blocking.cpu.state.ymm_hi[1][1] = ~0ULL;
+            CHECK(m_blocking.run().stop == CpuStop::trap);
+            CHECK(m_blocking.cpu.state.xmm[1][0] == 0);
+            CHECK(m_blocking.cpu.state.xmm[1][1] == 0);
+            CHECK(m_blocking.cpu.state.ymm_hi[1][0] == 0 && m_blocking.cpu.state.ymm_hi[1][1] == 0);
+            const std::uint8_t d_blocking[] = {0xC5, 0xF3, 0x7C, 0xC9};
+            CHECK(decode_x86(d_blocking, sizeof(d_blocking)).length == 4);
+            CHECK(decode_x86(d_blocking, sizeof(d_blocking)).supported);
+
+            // 128-bit VPCMPGTQ (0x7C): signed 64-bit comparison
+            // c5 f3 7c c2 = vpcmpgtq xmm0, xmm1, xmm2
+            Machine m_gtq128{0xC5, 0xF3, 0x7C, 0xC2, 0xC3};
+            m_gtq128.cpu.state.xmm[1][0] = static_cast<std::uint64_t>(100LL);
+            m_gtq128.cpu.state.xmm[1][1] = static_cast<std::uint64_t>(-50LL);
+            m_gtq128.cpu.state.xmm[2][0] = static_cast<std::uint64_t>(50LL);
+            m_gtq128.cpu.state.xmm[2][1] = static_cast<std::uint64_t>(0LL);
+            m_gtq128.cpu.state.ymm_hi[0][0] = ~0ULL;
+            CHECK(m_gtq128.run().stop == CpuStop::trap);
+            CHECK(m_gtq128.cpu.state.xmm[0][0] == ~0ULL); // 100 > 50 -> true
+            CHECK(m_gtq128.cpu.state.xmm[0][1] == 0ULL);  // -50 > 0 -> false
+            CHECK(m_gtq128.cpu.state.ymm_hi[0][0] == 0);
+
+            // 256-bit VPCMPGTQ (0x7C, L=1): 4 signed qwords
+            // c5 f7 7c c2 = vpcmpgtq ymm0, ymm1, ymm2
+            Machine m_gtq256{0xC5, 0xF7, 0x7C, 0xC2, 0xC3};
+            m_gtq256.cpu.state.xmm[1][0] = static_cast<std::uint64_t>(10LL);
+            m_gtq256.cpu.state.xmm[1][1] = static_cast<std::uint64_t>(-10LL);
+            m_gtq256.cpu.state.ymm_hi[1][0] = static_cast<std::uint64_t>(0LL);
+            m_gtq256.cpu.state.ymm_hi[1][1] = static_cast<std::uint64_t>(9223372036854775807LL);
+            m_gtq256.cpu.state.xmm[2][0] = static_cast<std::uint64_t>(5LL);
+            m_gtq256.cpu.state.xmm[2][1] = static_cast<std::uint64_t>(-5LL);
+            m_gtq256.cpu.state.ymm_hi[2][0] = static_cast<std::uint64_t>(0LL);
+            m_gtq256.cpu.state.ymm_hi[2][1] = static_cast<std::uint64_t>(-1LL);
+            CHECK(m_gtq256.run().stop == CpuStop::trap);
+            CHECK(m_gtq256.cpu.state.xmm[0][0] == ~0ULL); // 10 > 5 -> true
+            CHECK(m_gtq256.cpu.state.xmm[0][1] == 0ULL);  // -10 > -5 -> false
+            CHECK(m_gtq256.cpu.state.ymm_hi[0][0] == 0ULL); // 0 > 0 -> false
+            CHECK(m_gtq256.cpu.state.ymm_hi[0][1] == ~0ULL); // MAX > -1 -> true
+
+            // 128-bit VPCMPGTD (0x7E): signed 32-bit comparison
+            // c5 f3 7e c2 = vpcmpgtd xmm0, xmm1, xmm2
+            Machine m_gtd{0xC5, 0xF3, 0x7E, 0xC2, 0xC3};
+            const std::int32_t d1[4] = {10, -5, 0, 100};
+            const std::int32_t d2[4] = {5, 0, 0, 50};
+            std::memcpy(m_gtd.cpu.state.xmm[1], d1, 16);
+            std::memcpy(m_gtd.cpu.state.xmm[2], d2, 16);
+            CHECK(m_gtd.run().stop == CpuStop::trap);
+            std::uint32_t out_d[4] = {};
+            std::memcpy(out_d, m_gtd.cpu.state.xmm[0], 16);
+            CHECK(out_d[0] == 0xFFFFFFFFU); // 10 > 5
+            CHECK(out_d[1] == 0);           // -5 > 0
+            CHECK(out_d[2] == 0);           // 0 > 0
+            CHECK(out_d[3] == 0xFFFFFFFFU); // 100 > 50
+
+            // 128-bit VPCMPGTW (0x7D): signed 16-bit comparison
+            // c5 f3 7d c2 = vpcmpgtw xmm0, xmm1, xmm2
+            Machine m_gtw{0xC5, 0xF3, 0x7D, 0xC2, 0xC3};
+            const std::int16_t w1[8] = {1, -1, 300, -300, 0, 5, 10, -10};
+            const std::int16_t w2[8] = {0, 0, 200, -200, 0, 10, 5, -20};
+            std::memcpy(m_gtw.cpu.state.xmm[1], w1, 16);
+            std::memcpy(m_gtw.cpu.state.xmm[2], w2, 16);
+            CHECK(m_gtw.run().stop == CpuStop::trap);
+            std::uint16_t out_w[8] = {};
+            std::memcpy(out_w, m_gtw.cpu.state.xmm[0], 16);
+            CHECK(out_w[0] == 0xFFFFU); // 1 > 0
+            CHECK(out_w[1] == 0);       // -1 > 0
+            CHECK(out_w[2] == 0xFFFFU); // 300 > 200
+            CHECK(out_w[3] == 0);       // -300 > -200
+            CHECK(out_w[4] == 0);       // 0 > 0
+            CHECK(out_w[5] == 0);       // 5 > 10
+            CHECK(out_w[6] == 0xFFFFU); // 10 > 5
+            CHECK(out_w[7] == 0xFFFFU); // -10 > -20
+
+            // 128-bit VPCMPGTB (0x7F): signed 8-bit comparison
+            // c5 f3 7f c2 = vpcmpgtb xmm0, xmm1, xmm2
+            Machine m_gtb{0xC5, 0xF3, 0x7F, 0xC2, 0xC3};
+            const std::int8_t b1[16] = {127, -128, 0, -1, 50, -50, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+            const std::int8_t b2[16] = {0, 127, 0, -2, 20, -20, 0, 2, 4, 3, 5, 7, 6, 8, 10, 9};
+            std::memcpy(m_gtb.cpu.state.xmm[1], b1, 16);
+            std::memcpy(m_gtb.cpu.state.xmm[2], b2, 16);
+            CHECK(m_gtb.run().stop == CpuStop::trap);
+            std::uint8_t out_b[16] = {};
+            std::memcpy(out_b, m_gtb.cpu.state.xmm[0], 16);
+            CHECK(out_b[0] == 0xFF); // 127 > 0
+            CHECK(out_b[1] == 0);    // -128 > 127
+            CHECK(out_b[2] == 0);    // 0 > 0
+            CHECK(out_b[3] == 0xFF); // -1 > -2
+            CHECK(out_b[4] == 0xFF); // 50 > 20
+            CHECK(out_b[5] == 0);    // -50 > -20
+            CHECK(out_b[6] == 0xFF); // 1 > 0
+            CHECK(out_b[7] == 0);    // 2 > 2
+            CHECK(out_b[8] == 0);    // 3 > 4
+            CHECK(out_b[9] == 0xFF); // 4 > 3
+
+            // VPCMPGTQ with memory operand: vpcmpgtq xmm0, xmm1, [rbx]
+            Machine m_gtq_mem{0xC5, 0xF3, 0x7C, 0x03, 0xC3};
+            m_gtq_mem.cpu.state.gpr[3] = DATA;
+            const std::int64_t mem_q[2] = {50, 100};
+            CHECK(m_gtq_mem.mem.store(DATA, mem_q, 16) == MemoryError::ok);
+            m_gtq_mem.cpu.state.xmm[1][0] = static_cast<std::uint64_t>(100LL);
+            m_gtq_mem.cpu.state.xmm[1][1] = static_cast<std::uint64_t>(50LL);
+            CHECK(m_gtq_mem.run().stop == CpuStop::trap);
+            CHECK(m_gtq_mem.cpu.state.xmm[0][0] == ~0ULL); // 100 > 50 -> true
+            CHECK(m_gtq_mem.cpu.state.xmm[0][1] == 0ULL);  // 50 > 100 -> false
         }
         {   // ud2
             Machine m{0x0F, 0x0B};

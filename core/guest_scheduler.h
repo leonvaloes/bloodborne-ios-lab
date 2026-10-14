@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <vector>
+#include <unordered_map>
 
 namespace bb {
 // Single-host-thread, deterministic guest scheduler. All methods are called between
@@ -50,6 +51,22 @@ public:
     std::int32_t event_set(Id event, std::uint64_t bits);
     std::int32_t event_clear(Id event, std::uint64_t bits);
     std::uint64_t event_bits(Id event) const;
+
+    // Kernel Semaphores
+    Id sema_create(std::int32_t initial_count, std::int32_t max_count);
+    std::int32_t sema_wait(Id thread, Id sema, std::int32_t need, std::uint64_t timeout = 0);
+    std::int32_t sema_poll(Id sema, std::int32_t need);
+    std::int32_t sema_signal(Id sema, std::int32_t count);
+    std::int32_t sema_delete(Id sema);
+    std::int32_t sema_count(Id sema) const;
+    std::size_t sema_waiters(Id sema) const;
+
+    // TLS (Thread-Local Storage)
+    Id tls_create(std::uint64_t destructor = 0);
+    std::int32_t tls_delete(Id key);
+    std::int32_t tls_set(Id thread, Id key, std::uint64_t value);
+    std::uint64_t tls_get(Id thread, Id key) const;
+
     void set_resume(Id id, std::function<void(CpuState&, std::int32_t)> hook);
     // Trampolines: the driver must explicitly arrange a guest CALL to function,
     // then call complete_initializer after its return trap. Never invoke on host.
@@ -59,27 +76,35 @@ public:
     const std::vector<Callback>& atexit_callbacks() const { return atexit_; }
     Callback initializer(Id thread) const;
 private:
-    enum class Wait { none, join, mutex, cond, reacquire, event, sleep, init };
+    enum class Wait { none, join, mutex, cond, reacquire, event, sleep, init, sema };
     struct Thread {
         CpuState cpu;
         State state = State::created;
         Wait wait = Wait::none;
         Id object = 0, mutex = 0;
         std::uint64_t mask = 0, deadline = 0, result_value = 0;
+        std::int32_t need = 0;
         bool all = false, timed = false;
         std::int32_t result = ORBIS_OK;
         Callback callback{};
         std::function<void(CpuState&, std::int32_t)> on_resume;
         std::uint64_t stack_bottom = 0, stack_top = 0;
+        // Thread-local storage
+        std::unordered_map<std::uint32_t, std::uint64_t> tls_values;
     };
     struct Mutex { Id owner = 0; unsigned depth = 0; bool recursive = false; std::deque<Id> waiters; };
     struct Cond { std::deque<Id> waiters; };
     struct Event { std::uint64_t bits = 0; std::deque<Id> waiters; };
     struct Init { Id owner = 0; bool complete = false; std::deque<Id> waiters; };
+    struct Sema {
+        std::int32_t count = 0;
+        std::int32_t max_count = 0;
+        std::deque<Id> waiters; // each waiter has 'need' in Thread::need
+    };
     Thread* find(Id id);
     const Thread* find(Id id) const;
     void ready(Id id, std::int32_t result);
-    void block(Id id, Wait kind, Id object, std::uint64_t timeout);
+    void block(Id id, Wait kind, Id object, std::uint64_t timeout, std::int32_t need = 0);
     void acquire_next(Id mutex);
     void reacquire(Id thread, Id mutex, std::int32_t result);
     GuestMemory& mem_;
@@ -91,6 +116,8 @@ private:
     std::map<Id, Cond> conds_;
     std::map<Id, Event> events_;
     std::map<std::uint64_t, Init> inits_;
+    std::map<Id, Sema> semas_;
+    std::map<std::uint32_t, std::uint64_t> tls_destructors_; // key -> destructor function
     std::vector<Callback> atexit_;
     std::deque<Id> ready_;
     Trap trap_;

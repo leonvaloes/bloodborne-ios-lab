@@ -633,6 +633,13 @@ std::size_t KernelSyncManager::sema_waiters(std::uint32_t id) const {
     return it->second->active_waiters();
 }
 
+std::int32_t KernelSyncManager::sema_count(std::uint32_t id) const {
+    std::lock_guard<std::mutex> lock(registry_mutex_);
+    auto it = semaphores_.find(id);
+    if (it == semaphores_.end()) return -1;
+    return it->second->count();
+}
+
 std::int32_t KernelSyncManager::create_lw_mutex(std::uint32_t *out_id, const char *name, std::uint32_t attr,
                                                 std::int32_t initial_count, const void *) {
     if (!out_id || !name || initial_count < 0 || initial_count > 1) {
