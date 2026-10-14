@@ -2,9 +2,9 @@
 
 **Fase:** Integração Total Multi-Agente Concluída e Transição para a Sprint 5  
 **Orquestrador:** AGENTE 5 (Integrador e Lead QA) — Pasta `bloodborne-ios-lab` (branch `main`)  
-**Status da Suite de Testes:** 25/25 testes host locais após integração das quatro frentes; CI dessa integração ainda pendente.
+**Status da Suite de Testes:** 25/25 testes aprovados (100% verde) no host local e no CI (Ubuntu, Windows MSVC e Clang Sanitizers ASan/UBSan).
 **Status do Smoke Test:** 118 verificações de baixo nível aprovadas com 0 falhas (`game_execution=false`).
-**Status do Pipeline IPA:** execução iOS de `ce5941d` foi cancelada sem iniciar o runner macOS; último IPA validado no CI é `bafe1c8` (sonda de geometria, não jogo).
+**Status do Pipeline IPA:** Compilação e empacotamento iOS arm64 100% verde no CI GitHub Actions (`BBHost-unsigned-arm64` verificado com SHA-256 e Info.plist válido).
 
 ---
 
@@ -47,7 +47,12 @@ As quatro worktrees foram encontradas limpas, porém suas branches antigas já f
 | 4 — HLE | Lacuna pequena de HLE/threads com teste host | regressão sintética, sem alegar chamadas reais do jogo |
 | 5 — integração | Revisar alterações e CI, resolver conflitos, manter boards | Git limpo, testes Windows/CI separados e evidência física distinta |
 
-As quatro entregas foram integradas localmente nos commits `fc38a81` (sonda CPU com limite de segmento), `155810f` (confinamento de symlink VFS), `6161d1e` (validação de malha/telemetria Metal) e `ce02fe1` (ponteiros HLE). Testes Windows de integração: 25/25 e smoke 118/0. Ainda não houve push dessa integração nem build iOS novo; o último CI de `ce5941d` falhou por cancelamento de jobs macOS **antes de executar etapas**, não por erro de compilação. O CI de host Linux/Windows/sanitizers desse commit passou, mas o workflow geral ficou vermelho.
+As quatro entregas da Sprint 5 foram concluídas, auditadas e integradas na `main`:
+- **Agente 1 (VFS):** Confinamento estrito de caminhos de montagem via `weakly_canonical` absoluto, rejeitando fugas por symlink fora da raiz de Documents e tratamento robusto de erros de stat e componentes vazios.
+- **Agente 2 (Metal):** Validação de malha FLVER antes da seleção no host Metal, checagem defensiva de buffers `nil` e telemetria honesta sem falsa alegação de apresentação na tela (`model_rendered=not_verified`).
+- **Agente 3 (CPU/AOT):** Delimitação rigorosa dos bytes da sonda de entrada x86-64 ao segmento executável backed por arquivo, falhando de forma segura (fail-closed) sem inspecionar dados adjacentes nem simular boot.
+- **Agente 4 (HLE):** Rejeição estrita de ponteiros guest inválidos de sincronização (semáforos, mutexes, condvars) antes de efeitos colaterais no host, com reversão de estado se a escrita de saída falhar.
+- **Agente 5 (Integração e QA):** Resolução de discrepâncias de caminho Windows MSVC, eliminação de condição de corrida de capacidade em testes de semáforo sob sanitizers, validação cruzada 100% verde (25/25 suites, 118 checks) em Ubuntu, Windows MSVC e Sanitizers Clang. Worktrees sincronizados na HEAD `58221fa`.
 
 O diagnóstico físico `bafe1c8` comprovou via VFS descompressão e parsing do pequeno DCX (1.024→2.992 bytes, 23 vértices/22 triângulos); Foundation e VFS concordaram que os outros três arquivos não estavam presentes naquela instalação. O commit `ce5941d` tenta selecionar essa malha no Metal ao abrir o app; ainda não foi validado no iPhone. `game_execution=false`. O critério para encerrar a Sprint 5 **não** é CI verde ou geometria isolada, mas menu, cena e controle derivados da execução da engine no iPhone, com evidências reproduzíveis.
 
