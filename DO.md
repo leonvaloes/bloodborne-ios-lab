@@ -101,3 +101,8 @@ Este documento descreve o planejamento técnico dividido em entregas progressiva
 - [ ] **Atividade 5.4 — Controle Completo do Personagem e Frame Pacing 30 FPS:**
   - Movimentação com analógico virtual/físico, esquiva (Cruz), ataque (R1) e câmera fluida a 30 FPS estáveis.
 - **Critério de Conclusão da Sprint 5:** O usuário consegue controlar o Caçador caminhando e atacando na Clínica de Iosefka diretamente no iPhone 15 Pro Max.
+
+## Marco intermediario da Sprint 5: teste de Documents (validado)
+
+- [x] BB Lab `9fc9c98` leu `teste-bblab.txt` de Documents no iPhone e exportou `status: ok`, 42 bytes e o texto UTF-8. Evidencia: `docs/SPRINT5_DOCUMENTS_DEVICE.md` no laboratorio.
+- [ ] A atividade 5.1 de ingestao dos assets do jogo continua pendente; este teste usa apenas um arquivo de texto.

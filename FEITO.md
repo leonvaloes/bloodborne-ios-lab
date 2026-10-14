@@ -242,3 +242,7 @@ As 3 falhas pontuais ocorridas no iPhone no build `bd7bc24` foram identificadas 
 - **118 verificacoes de baixo nivel aprovadas com 0 falhas** no smoke test (`bb-smoke`).
 - **Pipeline de IPA (GitHub Actions):** Compilacao cruzada para iOS arm64 (`Apple A17 Pro`) e empacotamento do arquivo `BBHost-unsigned.ipa` 100% verde.
 
+
+## Marco Sprint 5: leitura de Documents no iPhone (14/10/2026)
+
+No build `9fc9c9852734e0157c9553c8802a786e6d05c388`, o diagnostico exportado no iPhone 15 Pro Max registrou `documents_test.status = ok`, `valid = true`, 42 bytes e o conteudo exato `Teste de transferencia BB Lab - Sprint 5\r\n`. `game_execution = false`. Detalhes, procedimento e limites: `docs/SPRINT5_DOCUMENTS_DEVICE.md` no laboratorio.

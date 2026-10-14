@@ -34,3 +34,7 @@
 
 ### 3. Loop de Jogabilidade e Entrada (Atividade 5.4)
 - Mapeamento analógico do DualShock 4 e controles virtuais de toque na tela integrados ao motor para movimentação, esquiva e ataque.
+
+## Evidencia recente e proximo criterio
+
+O arquivo de teste em Documents foi lido no iPhone pelo build `9fc9c98` e registrado no diagnostico. Segue pendente uma prova especifica de ingestao de assets reais e execucao do jogo; o teste de texto nao valida essas etapas.
