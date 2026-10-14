@@ -298,13 +298,116 @@ void Exec::avx(bool three) {
     const int map = three ? (v1 & 31) : 1;
     const int pp = v2 & 3, len = (v2 & 4) ? 4 : 2;
     const int src1 = (~(v2 >> 3)) & 15;
-    if (map != 1 || (three && (v2 & 0x80)) || p66 || rep || repne || rex) throw Unsupported{};
+    const bool w = three && ((v2 & 0x80) != 0);
+    if (map != 1 || p66 || rep || repne || rex) throw Unsupported{};
     rr = !(v1 & 0x80); rx = three && !(v1 & 0x40); rb = three && !(v1 & 0x20);
-    if (op == 0x77 && pp == 0 && len == 2 && src1 == 0) {
+    if (op == 0x77 && pp == 0 && len == 2 && src1 == 0 && !w) {
         for (int i = 0; i < 16; ++i) s.ymm_hi[i][0] = s.ymm_hi[i][1] = 0;
         return;
     }
-    const bool mov = op == 0x10 || op == 0x11 || op == 0x28 || op == 0x29;
+    if (op == 0x6E) { // vmovd / vmovq xmm, r/m
+        if (pp != 1 || len != 2 || src1 != 0) throw Unsupported{};
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        const int sz = w ? 8 : 4;
+        const std::uint64_t val = rd_rm(rm, sz);
+        s.xmm[rg][0] = val;
+        s.xmm[rg][1] = 0;
+        s.ymm_hi[rg][0] = 0;
+        s.ymm_hi[rg][1] = 0;
+        return;
+    }
+    if (op == 0x7E) { // vmovd / vmovq r/m, xmm OR vmovq xmm, xmm/m64
+        if (len != 2 || src1 != 0) throw Unsupported{};
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        if (pp == 1) {
+            const int sz = w ? 8 : 4;
+            wr_rm(rm, sz, s.xmm[rg][0]);
+            return;
+        }
+        if (pp == 2) {
+            const std::uint64_t val = rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 8);
+            s.xmm[rg][0] = val;
+            s.xmm[rg][1] = 0;
+            s.ymm_hi[rg][0] = 0;
+            s.ymm_hi[rg][1] = 0;
+            return;
+        }
+        throw Unsupported{};
+    }
+    if (op == 0x2A) { // vcvtsi2ss / vcvtsi2sd
+        if ((pp != 2 && pp != 3) || len != 2) throw Unsupported{};
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        const int sz = w ? 8 : 4;
+        const std::uint64_t raw = rd_rm(rm, sz);
+        const std::int64_t v = (sz == 8) ? static_cast<std::int64_t>(raw)
+                                         : static_cast<std::int64_t>(static_cast<std::int32_t>(raw));
+        const std::uint64_t dest0 = (pp == 2)
+            ? ((s.xmm[src1][0] & ~0xFFFFFFFFULL) | bits32(static_cast<float>(v)))
+            : bits64(static_cast<double>(v));
+        const std::uint64_t dest1 = s.xmm[src1][1];
+        s.xmm[rg][0] = dest0;
+        s.xmm[rg][1] = dest1;
+        s.ymm_hi[rg][0] = 0;
+        s.ymm_hi[rg][1] = 0;
+        return;
+    }
+    if (op == 0x2C) { // vcvttss2si / vcvttsd2si
+        if ((pp != 2 && pp != 3) || len != 2 || src1 != 0) throw Unsupported{};
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        const double d = (pp == 2)
+            ? static_cast<double>(f32(rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 4)))
+            : f64(rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 8));
+        const int sz = w ? 8 : 4;
+        std::int64_t out;
+        if (d != d || d >= 9223372036854775808.0 || d < -9223372036854775808.0) out = INT64_MIN;
+        else out = static_cast<std::int64_t>(d);
+        if (sz == 4 && (out > INT32_MAX || out < INT32_MIN)) out = INT32_MIN;
+        wr_reg(rg, sz, static_cast<std::uint64_t>(out));
+        return;
+    }
+    if ((op == 0x10 || op == 0x11) && pp >= 2) { // vmovss / vmovsd
+        if (len != 2) throw Unsupported{};
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        const int width = (pp == 2) ? 4 : 8;
+        if (op == 0x10) {
+            if (rm.reg) {
+                const std::uint64_t dest0 = (width == 4)
+                    ? ((s.xmm[src1][0] & ~0xFFFFFFFFULL) | (s.xmm[rm.r][0] & 0xFFFFFFFFULL))
+                    : s.xmm[rm.r][0];
+                const std::uint64_t dest1 = s.xmm[src1][1];
+                s.xmm[rg][0] = dest0;
+                s.xmm[rg][1] = dest1;
+            } else {
+                if (src1 != 0) throw Unsupported{};
+                s.xmm[rg][0] = rd_mem(rm.addr, width);
+                s.xmm[rg][1] = 0;
+            }
+            s.ymm_hi[rg][0] = 0;
+            s.ymm_hi[rg][1] = 0;
+            return;
+        } else { // op == 0x11
+            if (rm.reg) {
+                const std::uint64_t dest0 = (width == 4)
+                    ? ((s.xmm[src1][0] & ~0xFFFFFFFFULL) | (s.xmm[rg][0] & 0xFFFFFFFFULL))
+                    : s.xmm[rg][0];
+                const std::uint64_t dest1 = s.xmm[src1][1];
+                s.xmm[rm.r][0] = dest0;
+                s.xmm[rm.r][1] = dest1;
+                s.ymm_hi[rm.r][0] = 0;
+                s.ymm_hi[rm.r][1] = 0;
+            } else {
+                if (src1 != 0) throw Unsupported{};
+                wr_mem(rm.addr, width, s.xmm[rg][0]);
+            }
+            return;
+        }
+    }
+    const bool mov = (op == 0x10 || op == 0x11 || op == 0x28 || op == 0x29) && pp <= 1;
     const bool logic = op == 0x57 || (pp == 1 && (op == 0xEF || op == 0xDB || op == 0xEB));
     const bool arith = op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E;
     if ((!mov && !logic && !arith) || (pp > 1 && !arith) ||
@@ -1203,11 +1306,13 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
             !(b[p - 2] & 4) && !legacy_prefix && !rex_prefix) d.supported = true;
         if (vex && map == 1 && !legacy_prefix && !rex_prefix &&
             ((op == 0x77 && pp == 0 && !(b[p - 2] & 4)) ||
-             ((op == 0x10 || op == 0x11 || op == 0x28 || op == 0x29 ||
-               op == 0x57 || op == 0x58 || op == 0x59 || op == 0x5C ||
-               op == 0x5E || op == 0xEF || op == 0xDB || op == 0xEB) &&
-              (pp <= 1 || ((op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E) &&
-                           !(b[p - 2] & 4)))))) d.supported = true;
+             (op == 0x6E && pp == 1 && !(b[p - 2] & 4)) ||
+             (op == 0x7E && (pp == 1 || pp == 2) && !(b[p - 2] & 4)) ||
+             (op == 0x2A && (pp == 2 || pp == 3) && !(b[p - 2] & 4)) ||
+             (op == 0x2C && (pp == 2 || pp == 3) && !(b[p - 2] & 4)) ||
+             ((op == 0x10 || op == 0x11) && (pp <= 1 || !(b[p - 2] & 4))) ||
+             ((op == 0x28 || op == 0x29 || op == 0x57 || op == 0xEF || op == 0xDB || op == 0xEB) && pp <= 1) ||
+             ((op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E) && (pp <= 1 || !(b[p - 2] & 4))))) d.supported = true;
         if (!vex && map == 2 && pp == 1 && (op == 0x00 || op == 0x40)) d.supported = true;
         if (!vex && map == 3 && pp == 1 && op == 0x0F) d.supported = true;
     }
