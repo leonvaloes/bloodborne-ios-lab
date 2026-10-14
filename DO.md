@@ -107,6 +107,14 @@ Este documento descreve o planejamento técnico dividido em entregas progressiva
 - [x] BB Lab `9fc9c98` leu `teste-bblab.txt` de Documents no iPhone e exportou `status: ok`, 42 bytes e o texto UTF-8. Evidencia: `docs/SPRINT5_DOCUMENTS_DEVICE.md` no laboratorio.
 - [ ] A atividade 5.1 de ingestao dos assets do jogo continua pendente; este teste usa apenas um arquivo de texto.
 
+## Dependências verificáveis da Sprint 5 (antes de marcar jogável)
+
+- [x] `bafe1c8`: no iPhone, ler/descomprimir o pequeno DCX e interpretar 23 vértices/22 triângulos; isso não é renderização do modelo.
+- [ ] `ce5941d`: compilar no CI e comprovar visualmente no iPhone que os buffers Metal apresentam essa malha; diagnóstico deve indicar `model_source=documents_small_flver_dcx`, não fallback sintético.
+- [ ] Comprovar ingestão dos arquivos efetivamente necessários ao boot no mesmo container, sem enviá-los ao GitHub/CI; identificar ausências/erros por nome e sem dados sensíveis.
+- [ ] Mapear dependências da entrada x86-64 e demonstrar execução de fluxo real além da sonda de duas instruções, com limites, imports, memória e falhas reproduzíveis. O AOT que gera texto C++ não comprova execução da engine.
+- [ ] Demonstrar menu, primeira cena, controles e estabilidade em iPhone físico, originados pelo jogo e não por cena de laboratório.
+
 ## Marco intermediario Sprint 5: DCX no aparelho
 
 - [x] Ler `m29_00_00_00_408010.flver.dcx` pelo VFS e descomprimir no iPhone; 1.024 -> 2.992 bytes e CRC32 conferidos.

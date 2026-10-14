@@ -2,9 +2,9 @@
 
 **Fase:** Integração Total Multi-Agente Concluída e Transição para a Sprint 5  
 **Orquestrador:** AGENTE 5 (Integrador e Lead QA) — Pasta `bloodborne-ios-lab` (branch `main`)  
-**Status da Suite de Testes:** 22/22 testes aprovados (100% verde)  
-**Status do Smoke Test:** 118 verificações de baixo nível aprovadas com 0 falhas  
-**Status do Pipeline IPA:** Compilação e empacotamento iOS arm64 100% verde (`BBHost-unsigned-arm64`)  
+**Status da Suite de Testes:** 25/25 testes host locais no commit `ce5941d`; CI desse commit ainda em fila na última consulta.
+**Status do Smoke Test:** 118 verificações de baixo nível aprovadas com 0 falhas (`game_execution=false`).
+**Status do Pipeline IPA:** build iOS de `ce5941d` aguardando runner; último IPA validado no CI é `bafe1c8` (sonda de geometria, não jogo).
 
 ---
 
@@ -35,6 +35,18 @@
 ### 3. Loop de Jogabilidade e Entrada (Atividade 5.4)
 - Mapeamento analógico do DualShock 4 e controles virtuais de toque na tela integrados ao motor para movimentação, esquiva e ataque.
 
-## Evidencia recente e proximo criterio
+## Sprint 5 — ciclo de cinco frentes (14/10/2026)
 
-O arquivo de teste em Documents foi lido no iPhone pelo build `9fc9c98` e registrado no diagnostico. Segue pendente uma prova especifica de ingestao de assets reais e execucao do jogo; o teste de texto nao valida essas etapas.
+As quatro worktrees foram encontradas limpas, porém suas branches antigas já foram integradas; cada frente deve sincronizar `main` antes de novo trabalho. Agentes atuam **somente** em sua worktree, sem push ou merge em `main`. O Agente 5 revisa commits, testa a integração e atualiza os quadros. Não se repetem as Sprints 1–4.
+
+| Frente | Entrega pequena em andamento | Aceite antes de integrar |
+|---|---|---|
+| 1 — VFS | Robustez da ingestão Documents/DCX | testes sintéticos de limites e falha segura; nenhum arquivo comercial publicado |
+| 2 — Metal | Robustez/telemetria da seleção do FLVER real | CI iOS e indicação honesta de fallback; teste visual em aparelho ainda pendente |
+| 3 — CPU/AOT | Caracterização verificável dos limites da sonda de entrada | fixtures autorais e rejeição de opcode desconhecido; não chamar duas instruções de boot |
+| 4 — HLE | Lacuna pequena de HLE/threads com teste host | regressão sintética, sem alegar chamadas reais do jogo |
+| 5 — integração | Revisar alterações e CI, resolver conflitos, manter boards | Git limpo, testes Windows/CI separados e evidência física distinta |
+
+O diagnóstico físico `bafe1c8` comprovou via VFS descompressão e parsing do pequeno DCX (1.024→2.992 bytes, 23 vértices/22 triângulos); Foundation e VFS concordaram que os outros três arquivos não estavam presentes naquela instalação. O commit `ce5941d` tenta selecionar essa malha no Metal ao abrir o app; ainda não foi validado no iPhone. `game_execution=false`. O critério para encerrar a Sprint 5 **não** é CI verde ou geometria isolada, mas menu, cena e controle derivados da execução da engine no iPhone, com evidências reproduzíveis.
+
+Hipóteses antigas acima sobre montagem automática de todos os contêineres, shaders do jogo e loop de jogabilidade são descrições de plano/código parcial, não provas de boot do Bloodborne.
