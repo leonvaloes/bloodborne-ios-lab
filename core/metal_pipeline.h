@@ -1,6 +1,8 @@
 #pragma once
 
+#include "flver_parser.h"
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -108,6 +110,15 @@ struct alignas(8) Metal3ArgumentTable {
     void bind_buffer(uint32_t slot, uint64_t gpu_address);
     bool validate() const;
 };
+
+// CPU-side gate before conversion/allocation. Never claims a drawable was presented.
+// The byte limit applies independently to vertex and index buffers.
+enum class MeshPreparationStatus {
+    Ready, Empty, TooLarge, InvalidIndex, NonFinite, InvalidBuffer
+};
+MeshPreparationStatus prepare_metal_mesh(const FlverModel& model, MetalMeshBuffer& out,
+                                         size_t max_buffer_bytes);
+const char* mesh_preparation_status_string(MeshPreparationStatus status);
 
 class MetalPipelineManager {
 public:

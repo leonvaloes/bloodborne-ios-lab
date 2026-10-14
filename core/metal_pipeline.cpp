@@ -1,8 +1,60 @@
 #include "metal_pipeline.h"
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace bb {
+
+const char* mesh_preparation_status_string(MeshPreparationStatus status) {
+    switch (status) {
+    case MeshPreparationStatus::Ready: return "ready";
+    case MeshPreparationStatus::Empty: return "empty";
+    case MeshPreparationStatus::TooLarge: return "too_large";
+    case MeshPreparationStatus::InvalidIndex: return "invalid_index";
+    case MeshPreparationStatus::NonFinite: return "non_finite";
+    case MeshPreparationStatus::InvalidBuffer: return "invalid_buffer";
+    }
+    return "unknown";
+}
+
+MeshPreparationStatus prepare_metal_mesh(const FlverModel& model, MetalMeshBuffer& out,
+                                         size_t max_buffer_bytes) {
+    out = {};
+    // Validate before convert_to_metal_buffers: its counts and base-vertex offsets are uint32_t.
+    size_t vertices = 0, indices = 0;
+    for (const auto& submesh : model.submeshes) {
+        const size_t nv = submesh.vertices.size(), ni = submesh.indices.size();
+        const size_t vertex_limit = max_buffer_bytes / (12 * sizeof(float));
+        const size_t index_limit = max_buffer_bytes / sizeof(uint32_t);
+        if (vertices > vertex_limit || indices > index_limit ||
+            nv > static_cast<size_t>(UINT32_MAX) - vertices ||
+            ni > static_cast<size_t>(UINT32_MAX) - indices ||
+            nv > vertex_limit - vertices || ni > index_limit - indices)
+            return MeshPreparationStatus::TooLarge;
+        for (uint32_t index : submesh.indices)
+            if (index >= nv) return MeshPreparationStatus::InvalidIndex;
+        for (const auto& vertex : submesh.vertices) {
+            for (float value : vertex.position) if (!std::isfinite(value)) return MeshPreparationStatus::NonFinite;
+            for (float value : vertex.normal) if (!std::isfinite(value)) return MeshPreparationStatus::NonFinite;
+            for (float value : vertex.uv) if (!std::isfinite(value)) return MeshPreparationStatus::NonFinite;
+            for (float value : vertex.tangent) if (!std::isfinite(value)) return MeshPreparationStatus::NonFinite;
+        }
+        vertices += nv;
+        indices += ni;
+    }
+    if (!vertices || !indices || indices % 3) return MeshPreparationStatus::Empty;
+    auto candidate = FlverParser::convert_to_metal_buffers(model);
+    if (candidate.vertex_count != vertices || candidate.index_count != indices ||
+        candidate.vertex_stride_bytes != 12 * sizeof(float) ||
+        candidate.vertex_data.size() != vertices * 12 || candidate.index_data.size() != indices)
+        return MeshPreparationStatus::InvalidBuffer;
+    for (uint32_t index : candidate.index_data)
+        if (index >= vertices) return MeshPreparationStatus::InvalidBuffer;
+    for (float value : candidate.bounding_sphere)
+        if (!std::isfinite(value)) return MeshPreparationStatus::NonFinite;
+    out = std::move(candidate);
+    return MeshPreparationStatus::Ready;
+}
 
 bool RenderPipelineConfig::validate(std::string& out_error) const {
     if (color_format == MetalPixelFormat::Invalid) {

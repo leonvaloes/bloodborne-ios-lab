@@ -2,6 +2,7 @@
 #include "metal_pipeline.h"
 #include <iostream>
 #include <cmath>
+#include <limits>
 
 int main() {
     // 1. Pixel Format and Depth/Stencil Capabilities
@@ -70,6 +71,31 @@ int main() {
 
     table.bind_buffer(2, 0x80004003ULL); // Misaligned pointer!
     CHECK(!table.validate());
+
+    // CPU-only preparation tests: no Metal device or presentation implied.
+    bb::FlverModel meshModel;
+    bb::FlverSubmesh part;
+    part.vertices.resize(3);
+    part.vertices[0].position[0] = -1.0f;
+    part.vertices[1].position[0] = 1.0f;
+    part.vertices[2].position[1] = 1.0f;
+    part.indices = {0, 1, 2};
+    meshModel.submeshes.push_back(part);
+    bb::MetalMeshBuffer prepared;
+    constexpr size_t budget = 1024;
+    CHECK(bb::prepare_metal_mesh(meshModel, prepared, budget) == bb::MeshPreparationStatus::Ready);
+    CHECK(prepared.vertex_count == 3 && prepared.index_count == 3);
+    CHECK(bb::prepare_metal_mesh(meshModel, prepared, 100) == bb::MeshPreparationStatus::TooLarge);
+    CHECK(prepared.vertex_data.empty());
+    meshModel.submeshes[0].indices[2] = 3;
+    CHECK(bb::prepare_metal_mesh(meshModel, prepared, budget) == bb::MeshPreparationStatus::InvalidIndex);
+    meshModel.submeshes[0].indices[2] = 2;
+    meshModel.submeshes[0].vertices[0].position[0] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(bb::prepare_metal_mesh(meshModel, prepared, budget) == bb::MeshPreparationStatus::NonFinite);
+    meshModel.submeshes[0].vertices[0].position[0] = -1.0f;
+    meshModel.submeshes[0].indices.clear();
+    CHECK(bb::prepare_metal_mesh(meshModel, prepared, budget) == bb::MeshPreparationStatus::Empty);
+    CHECK(std::string(bb::mesh_preparation_status_string(bb::MeshPreparationStatus::TooLarge)) == "too_large");
 
     std::cout << "All Metal pipeline tests passed successfully!" << std::endl;
     return 0;

@@ -15,6 +15,7 @@
 #include <sys/utsname.h>
 #include <simd/simd.h>
 #include <chrono>
+#include <algorithm>
 #include <vector>
 #include <cstring>
 
@@ -35,7 +36,6 @@
     id<MTLBuffer> _vertexBuffer;
     id<MTLBuffer> _indexBuffer;
     uint32_t _indexCount;
-    id<MTLBuffer> _mvpBuffer;
     id<MTLBuffer> _lightingBuffer;
     id<MTLTexture> _diffuseTexture;
     id<MTLSamplerState> _samplerState;
@@ -260,14 +260,13 @@
     _report[@"small_flver_render_status"] = @"not_found";
     _report[@"map_flver_selection_status"] = @"not_attempted";
     _report[@"metal_mesh_status"] = @"not_ready";
-    auto validMesh = [](const bb::MetalMeshBuffer& candidate) {
-        if (!candidate.vertex_count || !candidate.index_count || candidate.index_count % 3 ||
-            candidate.vertex_data.size() != static_cast<size_t>(candidate.vertex_count) * 12 ||
-            candidate.index_data.size() != candidate.index_count) return false;
-        for (uint32_t index : candidate.index_data) {
-            if (index >= candidate.vertex_count) return false;
-        }
-        return true;
+    // Bound each GPU allocation even when the device advertises a larger limit.
+    const size_t meshLimit = std::min<size_t>(32 * 1024 * 1024, device.maxBufferLength);
+    bb::MetalMeshBuffer mesh;
+    auto prepare = [&](const bb::FlverModel& source) {
+        auto status = bb::prepare_metal_mesh(source, mesh, meshLimit);
+        _report[@"mesh_preparation_status"] = @(bb::mesh_preparation_status_string(status));
+        return status == bb::MeshPreparationStatus::Ready;
     };
     NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
         inDomains:NSUserDomainMask] firstObject];
@@ -278,14 +277,17 @@
             NSString *path = [documents.path stringByAppendingPathComponent:@"m29_00_00_00_408010.flver.dcx"];
             if (probe.geometry_status == "ok" &&
                 bb::FlverParser::parse_file(path.UTF8String, model, parseErr)) {
-                const auto candidate = bb::FlverParser::convert_to_metal_buffers(model);
-                if (validMesh(candidate) && candidate.vertex_count == probe.vertex_count &&
-                    candidate.index_count / 3 == probe.triangle_count) {
+                if (prepare(model) && mesh.vertex_count == probe.vertex_count &&
+                    mesh.index_count / 3 == probe.triangle_count) {
                     loadedFromDisk = true;
                     modelSource = @"documents_small_flver_dcx";
                     _report[@"small_flver_render_status"] = @"mesh_ready";
                 } else {
                     _report[@"small_flver_render_status"] = @"invalid_mesh";
+                    _report[@"small_flver_mesh_reason"] = mesh.vertex_count &&
+                        mesh.vertex_count != probe.vertex_count ? @"probe_vertex_mismatch" :
+                        mesh.index_count / 3 != probe.triangle_count ? @"probe_triangle_mismatch" :
+                        _report[@"mesh_preparation_status"];
                 }
             } else {
                 _report[@"small_flver_render_status"] = @"parse_failed";
@@ -299,8 +301,9 @@
             _report[@"map_flver_selection_status"] = @"not_found";
         } else if (!bb::FlverParser::parse_file(mapPath.UTF8String, model, parseErr)) {
             _report[@"map_flver_selection_status"] = @"parse_failed";
-        } else if (!validMesh(bb::FlverParser::convert_to_metal_buffers(model))) {
+        } else if (!prepare(model)) {
             _report[@"map_flver_selection_status"] = @"invalid_mesh";
+            _report[@"map_flver_mesh_reason"] = _report[@"mesh_preparation_status"];
         } else {
             loadedFromDisk = true;
             modelSource = @"documents_map_flver_dcx";
@@ -316,8 +319,7 @@
         }
     }
 
-    bb::MetalMeshBuffer mesh = bb::FlverParser::convert_to_metal_buffers(model);
-    if (!validMesh(mesh)) {
+    if (!prepare(model)) {
         [self gpuError:@"Malha FLVER selecionada inválida"];
         return;
     }
@@ -336,13 +338,12 @@
                                        length:mesh.index_data.size() * sizeof(uint32_t)
                                       options:MTLResourceStorageModeShared];
 
-    _mvpBuffer = [device newBufferWithLength:sizeof(bb::ModelViewProjectionUniforms)
-                                     options:MTLResourceStorageModeShared];
+    // Per-draw uniforms use command-owned inline storage.
 
     _lightingBuffer = [device newBufferWithLength:sizeof(bb::LightingUniforms)
                                           options:MTLResourceStorageModeShared];
 
-    if (!_vertexBuffer || !_indexBuffer || !_mvpBuffer || !_lightingBuffer) {
+    if (!_vertexBuffer || !_indexBuffer || !_lightingBuffer) {
         _report[@"metal_mesh_status"] = @"buffer_allocation_failed";
         [self gpuError:@"Falha ao alocar buffers Metal para malha/uniformes"];
         return;
@@ -588,11 +589,11 @@
     mvpUniforms.mvp = bb::Matrix4x4::multiply(proj, modelView);
     mvpUniforms.normal_matrix = bb::Matrix4x4::normal_matrix(modelView);
 
-    std::memcpy(_mvpBuffer.contents, &mvpUniforms, sizeof(mvpUniforms));
 
     id<MTLCommandBuffer> command = [_queue commandBuffer];
+    if (!command) { [self gpuError:@"Falha ao criar command buffer"]; return; }
     id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
-    if (!command || !encoder) { [self gpuError:@"Falha ao criar command buffer"]; return; }
+    if (!encoder) { [self gpuError:@"Falha ao criar render encoder"]; return; }
 
     [encoder setRenderPipelineState:_pipeline];
     if (_depthState) {
@@ -601,7 +602,7 @@
     [encoder setCullMode:MTLCullModeNone];
 
     [encoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
-    [encoder setVertexBuffer:_mvpBuffer offset:0 atIndex:1];
+    [encoder setVertexBytes:&mvpUniforms length:sizeof(mvpUniforms) atIndex:1];
 
     [encoder setFragmentBuffer:_lightingBuffer offset:0 atIndex:1];
     if (_diffuseTexture) {
