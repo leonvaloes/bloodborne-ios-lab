@@ -7,6 +7,8 @@ namespace bb {
 SmokeReport smoke() {
     SmokeReport report{0, 0};
     const auto check = [&report](bool passed) { ++report.checks; if (!passed) ++report.failures; };
+
+    // Legacy baseline checks (6 checks)
     check(fixture_add(1, 2).value == 3);
     const auto carry = fixture_add(std::numeric_limits<std::uint64_t>::max(), 1);
     check(carry.value == 0 && (carry.flags & (CF | ZF)) == (CF | ZF));
@@ -15,9 +17,72 @@ SmokeReport smoke() {
     check(fixture_sub(0, 1).value == std::numeric_limits<std::uint64_t>::max());
     check((fixture_sub(0, 1).flags & CF) != 0);
     check(fixture_xor(0xff, 0xff).value == 0);
+
+    // F1: Arithmetic & flags (expanded, 19 checks)
+    check(fixture_add8(1, 2).value == 3);
+    check(fixture_add16(0xFF, 1).value == 0x100);
+    check(fixture_add32(0xFFFFFFFF, 1).value == 0);
+    check(fixture_add64(std::numeric_limits<std::uint64_t>::max(), 1).value == 0);
+
+    check(fixture_adc8(0xFE, 1).value == 0xFF);
+    check((fixture_adc64(std::numeric_limits<std::uint64_t>::max(), 0).flags & CF) != 0);
+
+    check(fixture_sub8(0, 1).value == 0xFF);
+    check(fixture_sub16(0, 1).value == 0xFFFF);
+    check(fixture_sub32(0, 1).value == 0xFFFFFFFF);
+    check(fixture_sub64(0, 1).value == std::numeric_limits<std::uint64_t>::max());
+
+    check((fixture_sbb64(0, 0).flags & CF) != 0);
+
+    check(fixture_and8(0xF0, 0x0F).value == 0);
+    check(fixture_or64(0xF0, 0x0F).value == 0xFF);
+    check(fixture_xor8(0xFF, 0xFF).value == 0);
+    check(fixture_xor64(0xFFFFFFFFFFFFFFFFULL, 0).value == 0xFFFFFFFFFFFFFFFFULL);
+
+    check(fixture_shl8(1, 3).value == 8);
+    check(fixture_shr64(0x8000000000000000ULL, 1).value == 0x4000000000000000ULL);
+
+    check((fixture_cmp32(5, 3).flags & ZF) == 0);
+    check((fixture_cmp32(5, 5).flags & ZF) != 0);
+    check((fixture_test64(0xFF, 0).flags & ZF) != 0);
+
+    // F2: Control flow (6 checks)
+    check(fixture_call_direct(10, 20).value == 30);
+    check(fixture_call_indirect(0xABCD, 0x1234).value == (0xABCD ^ 0x1234));
+
+    auto fact5 = fixture_recursion(5, 0);
+    check(fact5.value == 120);
+
+    check(fixture_jump_table(0, 0).value == 10);
+    check(fixture_jump_table(2, 0).value == 30);
+    check(fixture_jump_table(5, 0).value == 20);
+
+    // F3: ABI (9 checks)
+    check(fixture_abi_0args(0, 0).value == 0xDEAD);
+    check(fixture_abi_1arg(0, 42).value == 42);
+
+    auto six = fixture_abi_6args(1, 2, 3, 4, 5, 6);
+    check(six.value == 21);
+
+    auto twelve = fixture_abi_12args(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    check(twelve.value == 78);
+
+    struct Pair { std::uint64_t x, y; };
+    Pair p{0x100, 0x200};
+    check(fixture_abi_struct_byval(0, reinterpret_cast<std::uint64_t>(&p)).value == 0x300);
+
+    Pair out{};
+    fixture_abi_struct_ret(reinterpret_cast<std::uint64_t>(&out), 0);
+    check(out.x == 0xABCD && out.y == 0x1234);
+
+    check(fixture_abi_fp_args(1.5, 2.5).value == 4);
+    check((fixture_abi_align16(0x123, 0).value & 0xF) == 0);
+    check(fixture_abi_callee_saved(0x10, 0x20).value == 0x130);
+
+    // Guest memory checks (8 checks)
     GuestMemory memory(64);
     check(memory.map(0x400000, 64, read | write) == MemoryError::ok);
-    const auto expected = fixture_add(0xBB00, 0x15).value;
+    const auto expected = fixture_add64(0xBB00, 0x15).value;
     check(memory.store(0x400038, &expected, sizeof expected) == MemoryError::ok);
     std::uint64_t observed = 0;
     check(memory.load(0x400038, &observed, sizeof observed) == MemoryError::ok);
@@ -26,6 +91,7 @@ SmokeReport smoke() {
     check(memory.protect(0x400000, read) == MemoryError::ok);
     check(memory.store(0x400000, &expected, sizeof expected) == MemoryError::denied);
     check(memory.unmap(0x400000) == MemoryError::ok && memory.used() == 0);
+
     return report;
 }
 }

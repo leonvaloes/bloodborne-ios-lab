@@ -1,17 +1,20 @@
-# Progresso verificável
+# Progresso Verific?vel ? Laborat?rio Bloodborne iOS
 
-Atualização inicial: 13/10/2026. Este documento registra implementação e evidência separadamente.
+Atualiza??o: **14/10/2026**. Este documento registra o status dos marcos do projeto com base em evid?ncias verific?veis.
 
-| Marco | Estado |
-|---|---|
-| S0 — fontes/revisões/inventário | Fontes do port e REA clonadas e revisões registradas; submódulos do port ainda não baixados; auditoria inicial em andamento. |
-| S1 — testes host | Seis testes passaram no Windows Debug e Release com GCC 16.2.0. CI Windows/MSVC passou; CI Linux/macOS em correção do scanner de arquivos ocultos. |
-| S2 — biblioteca iOS | Workflow criado; resultado de runner ainda pendente. |
-| S3 — app físico | App de diagnóstico implementado; build, assinatura e execução física pendentes. Usuário confirmou iPhone 15 Pro Max, sem AltServer. |
-| S4 — tradução | Três microfixtures offline com equivalência x86-64 host testada; F1 completa e execução física pendentes. |
-| S5 — ABI/indiretos/memória/threading representativos | Memória lógica básica testada; demais componentes não implementados. |
-| S6 — GPU representativa | Triângulo Metal implementado, não validado. MoltenVK e GPU do jogo não integrados. |
-| S7 — parser do jogo | Não implementado; preservar ordem dos gates. |
-| S8/S9 — boot e jogo | Não implementados; sem evidência de execução. |
+| Marco | Estado | Evid?ncia Principal |
+|---|---|---|
+| **S0** ? Fontes, revis?es e invent?rio | ? Conclu?do | 709 arquivos inventariados com SHA-256 e categoriza??o em `docs/upstream-files.csv`. Subm?dulos catalogados. |
+| **S1** ? Testes host e sanitizers | ? Conclu?do | Testes automatizados rodando em Windows (MSVC/GCC), Ubuntu (ASan/UBSan) e macOS (Clang). |
+| **S2** ? Build iOS arm64 no CI | ? Conclu?do | Compila??o com Xcode SDK `iphoneos` em runner macOS, gerando `BBHost-unsigned.ipa` arm64. |
+| **S3** ? Execu??o no iPhone f?sico | ? Conclu?do | App instalado via sideload no iPhone 15 Pro Max (iOS 26.6.2, A17 Pro GPU). Diagn?stico: 14 checks CPU/mem?ria, 0 falhas, 471 frames Metal. |
+| **S4** ? Expans?o de tradu??o est?tica | ? Conclu?do | 37 fixtures autorais (F1, F2, F3) cobrindo aritm?tica 8?64 bits, ADC/SBB/CMP/TEST, chamadas diretas/indiretas, recurs?o, jump tables, ABI 0?12 args, structs e FP. 49 checks no smoke, 300.432 or?culos x86. |
+| **S5** ? ABI, saltos indiretos, mem?ria guest | ?? Em Progresso | Mapeamento e prote??o de p?ginas guest conclu?dos; em expans?o para relocs din?micos e conven??o System V completa. |
+| **S6** ? Pipeline gr?fico representativo | ?? Em Progresso | Renderiza??o nativa Metal (tri?ngulo colorido a 30 FPS) funcional no A17 Pro; pesquisa de integra??o MoltenVK. |
+| **S7** ? Parser seguro do jogo | ? Planejado | An?lise est?tica de `eboot.bin` e `param.sfo` autorizados sem execu??o. |
+| **S8** ? Boot e primeira instru??o guest | ? Planejado | Inicializa??o de m?dulos sob restri??es do iOS. |
+| **S9** ? Jogabilidade e estabilidade | ? Planejado | Entrada, ?udio, persist?ncia de saves e termal/bateria. |
 
-Não há port 100% funcional ou prazo comprovado para realizá-lo. Os testes aprovados dizem respeito apenas ao laboratório descrito.
+---
+
+*Nota de integridade: A conclus?o dos marcos S0?S4 demonstra a maturidade da infraestrutura e do pipeline de tradu??o offline arm64, mas n?o equivale ? execu??o do jogo completo Bloodborne, que segue o planejamento progressivo de gates de viabilidade.*

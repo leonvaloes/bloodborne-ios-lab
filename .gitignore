@@ -11,3 +11,5 @@ eboot.bin
 *.pkg
 *.xcuserstate
 .DS_Store
+
+ios-artifact/

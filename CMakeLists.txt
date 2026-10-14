@@ -24,12 +24,18 @@ if(BB_SANITIZERS)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
+set(ALL_FIXTURES
+    add sub xor
+    add8 add16 add32 add64 adc8 adc64 sub8 sub16 sub32 sub64 sbb64 and8 or64 xor8 xor64 shl8 shr64 cmp32 test64
+    call_direct call_indirect recursion jump_table vtable_call callback
+    abi_0args abi_1arg abi_6args abi_12args abi_struct_byval abi_struct_ret abi_fp_args abi_align16 abi_callee_saved)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     if(NOT BB_GENERATED_DIR)
         message(FATAL_ERROR "Set BB_GENERATED_DIR to fixtures produced by a host build")
     endif()
     set(generated_dir "${BB_GENERATED_DIR}")
-    foreach(name add sub xor)
+    foreach(name ${ALL_FIXTURES})
         if(NOT EXISTS "${generated_dir}/${name}.cpp")
             message(FATAL_ERROR "Missing translated fixture: ${name}.cpp")
         endif()
@@ -41,15 +47,20 @@ else()
     target_link_libraries(bb-aot PRIVATE bb_decoder)
     set(generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
     file(MAKE_DIRECTORY "${generated_dir}")
-    foreach(name add sub xor)
+    foreach(name ${ALL_FIXTURES})
         add_custom_command(OUTPUT "${generated_dir}/${name}.cpp"
             COMMAND bb-aot "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/${name}.hex" "fixture_${name}" "${generated_dir}/${name}.cpp"
             DEPENDS bb-aot "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/${name}.hex"
             VERBATIM)
     endforeach()
 endif()
-add_library(bb_core STATIC core/guest_memory.cpp core/smoke.cpp
-    "${generated_dir}/add.cpp" "${generated_dir}/sub.cpp" "${generated_dir}/xor.cpp")
+
+set(CORE_SOURCES core/guest_memory.cpp core/smoke.cpp)
+foreach(name ${ALL_FIXTURES})
+    list(APPEND CORE_SOURCES "${generated_dir}/${name}.cpp")
+endforeach()
+
+add_library(bb_core STATIC ${CORE_SOURCES})
 target_include_directories(bb_core PUBLIC core)
 find_package(Threads REQUIRED)
 target_link_libraries(bb_core PUBLIC Threads::Threads)
