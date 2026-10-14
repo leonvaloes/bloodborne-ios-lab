@@ -60,10 +60,10 @@ Este documento descreve o planejamento técnico dividido em entregas progressiva
 **Objetivo:** Emular o sistema operacional do PS4 para permitir que o jogo toque sons, vídeos e gerencie threads.  
 **Agente Responsável:** Agente 4 (worktrees/agent4-hle — branch `feature/hle-audio-threads`)
 
-- [ ] **Atividade 4.1 — Primitivas de Concorrência e Multithreading:**
-  - Implementar os semáforos, mutexes leves e variáveis de condição do Orbis OS sobre o subsistema pthreads do iOS.
-- [ ] **Atividade 4.2 — Decodificação de Áudio ATRAC9:**
-  - Integrar o descompressor LibAtrac9 para converter os streams de áudio do jogo para o ring buffer PCM de 48.000 Hz.
+- [x] **Atividade 4.1 — Primitivas de Concorrência e Multithreading:** (Concluído pelo Agente 4)
+  - Implementar os semáforos, mutexes leves e variáveis de condição do Orbis OS sobre o subsistema pthreads do iOS (`core/kernel_threads.h/.cpp`).
+- [x] **Atividade 4.2 — Decodificação de Áudio ATRAC9:** (Concluído pelo Agente 4)
+  - Integrar o descompressor LibAtrac9 para converter os streams de áudio do jogo para o ring buffer PCM de 48.000 Hz (`third_party/LibAtrac9/`, `core/atrac9_decoder.h/.cpp`, `core/audio.h/.cpp`).
 - [ ] **Atividade 4.3 — Cinemática de Abertura:**
   - Implementar reprodutor de vídeo H.264 integrado ao Metal para exibir o vídeo de introdução da FromSoftware.
 - [ ] **Atividade 4.4 — Orçamento de Memória e Garbage Collection:**
