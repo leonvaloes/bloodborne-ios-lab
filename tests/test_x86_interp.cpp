@@ -732,6 +732,285 @@ int main() {
                 CHECK(m.cpu.state.rip == CODE + d.length);
             }
         }
+        {   // BMI1 ANDN (0xF2): dest = ~src1 & src2
+            // 64-bit reg-reg (W=1): andn rax, rbx, rcx
+            // C4 E2 E0 F2 C1: W=1, vvvv=rbx(3), ModRM: reg=rax(0), rm=rcx(1)
+            Machine m1{0xC4, 0xE2, 0xE0, 0xF2, 0xC1, 0xC3};
+            m1.cpu.state.gpr[3] = 0x0000FFFF0000FFFFULL; // rbx (src1)
+            m1.cpu.state.gpr[1] = 0x123456789ABCDEF0ULL; // rcx (src2)
+            m1.cpu.state.rflags |= FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF;
+            CHECK(m1.run().stop == CpuStop::trap);
+            CHECK(m1.cpu.state.gpr[0] == 0x123400009ABC0000ULL);
+            CHECK((m1.cpu.state.rflags & (FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF)) == 0);
+            const std::uint8_t d_andn64[] = {0xC4, 0xE2, 0xE0, 0xF2, 0xC1};
+            CHECK(decode_x86(d_andn64, sizeof(d_andn64)).length == 5);
+            CHECK(decode_x86(d_andn64, sizeof(d_andn64)).supported);
+
+            // 64-bit negative result sets SF: andn rax, rbx, rcx
+            Machine m2{0xC4, 0xE2, 0xE0, 0xF2, 0xC1, 0xC3};
+            m2.cpu.state.gpr[3] = 0; // rbx -> ~rbx = ~0
+            m2.cpu.state.gpr[1] = 0x8000000000000001ULL; // rcx
+            CHECK(m2.run().stop == CpuStop::trap);
+            CHECK(m2.cpu.state.gpr[0] == 0x8000000000000001ULL);
+            CHECK((m2.cpu.state.rflags & (FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF)) == FLAG_SF);
+
+            // 64-bit zero result sets ZF: andn rax, rbx, rcx
+            Machine m3{0xC4, 0xE2, 0xE0, 0xF2, 0xC1, 0xC3};
+            m3.cpu.state.gpr[3] = ~0ULL; // rbx -> ~rbx = 0
+            m3.cpu.state.gpr[1] = 0x1234ULL; // rcx
+            CHECK(m3.run().stop == CpuStop::trap);
+            CHECK(m3.cpu.state.gpr[0] == 0);
+            CHECK((m3.cpu.state.rflags & (FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF)) == FLAG_ZF);
+
+            // 32-bit mem (W=0): andn eax, ebx, [rcx]
+            Machine m4{0xC4, 0xE2, 0x60, 0xF2, 0x01, 0xC3};
+            m4.cpu.state.gpr[3] = 0x0F0F0F0FULL; // ebx
+            m4.cpu.state.gpr[1] = DATA;
+            const std::uint32_t mem_v = 0xF0F0F0F0U;
+            CHECK(m4.mem.store(DATA, &mem_v, 4) == MemoryError::ok);
+            m4.cpu.state.gpr[0] = ~0ULL;
+            CHECK(m4.run().stop == CpuStop::trap);
+            CHECK(m4.cpu.state.gpr[0] == 0xF0F0F0F0ULL);
+            CHECK((m4.cpu.state.rflags & (FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF)) == FLAG_SF);
+            const std::uint8_t d_andn32[] = {0xC4, 0xE2, 0x60, 0xF2, 0x01};
+            CHECK(decode_x86(d_andn32, sizeof(d_andn32)).length == 5);
+            CHECK(decode_x86(d_andn32, sizeof(d_andn32)).supported);
+
+            // Actual libc.prx sequence: c4 e2 f8 f2 c6 = andn rax, rax, rsi
+            Machine m5{0xC4, 0xE2, 0xF8, 0xF2, 0xC6, 0xC3};
+            m5.cpu.state.gpr[0] = 0x00FF00FF00FF00FFULL;
+            m5.cpu.state.gpr[6] = 0xAAAAAAAAAAAAAAAAULL;
+            CHECK(m5.run().stop == CpuStop::trap);
+            CHECK(m5.cpu.state.gpr[0] == (~0x00FF00FF00FF00FFULL & 0xAAAAAAAAAAAAAAAAULL));
+            const std::uint8_t d_libc_andn[] = {0xC4, 0xE2, 0xF8, 0xF2, 0xC6};
+            CHECK(decode_x86(d_libc_andn, sizeof(d_libc_andn)).length == 5);
+            CHECK(decode_x86(d_libc_andn, sizeof(d_libc_andn)).supported);
+        }
+        {   // BMI1 BEXTR (0xF7): dest = (src >> start) & mask
+            // 32-bit: bextr eax, ebx, ecx (W=0, vvvv=ecx(1), reg=eax(0), rm=ebx(3))
+            Machine m1{0xC4, 0xE2, 0x70, 0xF7, 0xC3, 0xC3};
+            m1.cpu.state.gpr[3] = 0x12345678ULL;
+            m1.cpu.state.gpr[1] = 0x0808ULL; // start=8, len=8
+            CHECK(m1.run().stop == CpuStop::trap);
+            CHECK(m1.cpu.state.gpr[0] == 0x56ULL);
+            CHECK((m1.cpu.state.rflags & (FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF)) == 0);
+            const std::uint8_t d_bextr32[] = {0xC4, 0xE2, 0x70, 0xF7, 0xC3};
+            CHECK(decode_x86(d_bextr32, sizeof(d_bextr32)).length == 5);
+            CHECK(decode_x86(d_bextr32, sizeof(d_bextr32)).supported);
+
+            // 64-bit: bextr rax, rbx, rcx (W=1)
+            Machine m2{0xC4, 0xE2, 0xF0, 0xF7, 0xC3, 0xC3};
+            m2.cpu.state.gpr[3] = 0x0123456789ABCDEFULL;
+            m2.cpu.state.gpr[1] = 0x1020ULL; // start=32, len=16
+            CHECK(m2.run().stop == CpuStop::trap);
+            CHECK(m2.cpu.state.gpr[0] == 0x4567ULL);
+        }
+        {   // VMOVDQU (pp=2) and VMOVDQA (pp=1): 128-bit (L=0) and 256-bit (L=1)
+            // vmovdqu xmm0, xmm1 (128-bit reg-reg, zeroes ymm_hi)
+            Machine m1{0xC5, 0xFA, 0x6F, 0xC1, 0xC3}; // vmovdqu xmm0, xmm1; ret
+            m1.cpu.state.xmm[1][0] = 0x1111222233334444ULL;
+            m1.cpu.state.xmm[1][1] = 0x5555666677778888ULL;
+            m1.cpu.state.ymm_hi[0][0] = ~0ULL; m1.cpu.state.ymm_hi[0][1] = ~0ULL;
+            CHECK(m1.run().stop == CpuStop::trap);
+            CHECK(m1.cpu.state.xmm[0][0] == 0x1111222233334444ULL);
+            CHECK(m1.cpu.state.xmm[0][1] == 0x5555666677778888ULL);
+            CHECK(m1.cpu.state.ymm_hi[0][0] == 0 && m1.cpu.state.ymm_hi[0][1] == 0);
+            const std::uint8_t d_vmovdqu128[] = {0xC5, 0xFA, 0x6F, 0xC1};
+            CHECK(decode_x86(d_vmovdqu128, sizeof(d_vmovdqu128)).length == 4);
+            CHECK(decode_x86(d_vmovdqu128, sizeof(d_vmovdqu128)).supported);
+
+            // vmovdqu [rbx], xmm0 (128-bit store)
+            Machine m2{0xC5, 0xFA, 0x7F, 0x03, 0xC3}; // vmovdqu [rbx], xmm0; ret
+            m2.cpu.state.gpr[3] = DATA;
+            m2.cpu.state.xmm[0][0] = 0x0102030405060708ULL;
+            m2.cpu.state.xmm[0][1] = 0x090A0B0C0D0E0F10ULL;
+            CHECK(m2.run().stop == CpuStop::trap);
+            std::uint64_t mem128[2] = {};
+            CHECK(m2.mem.load(DATA, mem128, 16) == MemoryError::ok);
+            CHECK(mem128[0] == 0x0102030405060708ULL && mem128[1] == 0x090A0B0C0D0E0F10ULL);
+
+            // vmovdqa xmm0, [rbx] (128-bit load, pp=1)
+            Machine m3{0xC5, 0xF9, 0x6F, 0x03, 0xC3}; // vmovdqa xmm0, [rbx]; ret
+            m3.cpu.state.gpr[3] = DATA;
+            const std::uint64_t v_dqa[2] = {0x0102030405060708ULL, 0x090A0B0C0D0E0F10ULL};
+            CHECK(m3.mem.store(DATA, v_dqa, 16) == MemoryError::ok);
+            m3.cpu.state.ymm_hi[0][0] = ~0ULL; m3.cpu.state.ymm_hi[0][1] = ~0ULL;
+            CHECK(m3.run().stop == CpuStop::trap);
+            CHECK(m3.cpu.state.xmm[0][0] == 0x0102030405060708ULL && m3.cpu.state.xmm[0][1] == 0x090A0B0C0D0E0F10ULL);
+            CHECK(m3.cpu.state.ymm_hi[0][0] == 0 && m3.cpu.state.ymm_hi[0][1] == 0);
+            const std::uint8_t d_vmovdqa128[] = {0xC5, 0xF9, 0x6F, 0x03};
+            CHECK(decode_x86(d_vmovdqa128, sizeof(d_vmovdqa128)).length == 4);
+            CHECK(decode_x86(d_vmovdqa128, sizeof(d_vmovdqa128)).supported);
+
+            // vmovdqu ymm0, [rbx] (256-bit load, L=1, pp=2)
+            Machine m4{0xC5, 0xFE, 0x6F, 0x03, 0xC3}; // vmovdqu ymm0, [rbx]; ret
+            m4.cpu.state.gpr[3] = DATA;
+            const std::uint64_t mem256[4] = {0x1111ULL, 0x2222ULL, 0x3333ULL, 0x4444ULL};
+            CHECK(m4.mem.store(DATA, mem256, 32) == MemoryError::ok);
+            CHECK(m4.run().stop == CpuStop::trap);
+            CHECK(m4.cpu.state.xmm[0][0] == 0x1111ULL && m4.cpu.state.xmm[0][1] == 0x2222ULL);
+            CHECK(m4.cpu.state.ymm_hi[0][0] == 0x3333ULL && m4.cpu.state.ymm_hi[0][1] == 0x4444ULL);
+            const std::uint8_t d_vmovdqu256[] = {0xC5, 0xFE, 0x6F, 0x03};
+            CHECK(decode_x86(d_vmovdqu256, sizeof(d_vmovdqu256)).length == 4);
+            CHECK(decode_x86(d_vmovdqu256, sizeof(d_vmovdqu256)).supported);
+
+            // vmovdqa ymm1, ymm0 (256-bit reg-reg, L=1, pp=1)
+            Machine m5{0xC5, 0xFD, 0x6F, 0xC8, 0xC3}; // vmovdqa ymm1, ymm0; ret
+            m5.cpu.state.xmm[0][0] = 0xAAAAULL; m5.cpu.state.xmm[0][1] = 0xBBBBULL;
+            m5.cpu.state.ymm_hi[0][0] = 0xCCCCULL; m5.cpu.state.ymm_hi[0][1] = 0xDDDDULL;
+            CHECK(m5.run().stop == CpuStop::trap);
+            CHECK(m5.cpu.state.xmm[1][0] == 0xAAAAULL && m5.cpu.state.xmm[1][1] == 0xBBBBULL);
+            CHECK(m5.cpu.state.ymm_hi[1][0] == 0xCCCCULL && m5.cpu.state.ymm_hi[1][1] == 0xDDDDULL);
+
+            // vmovdqu [rbx], ymm1 (256-bit store, L=1, pp=2)
+            Machine m6{0xC5, 0xFE, 0x7F, 0x0B, 0xC3}; // vmovdqu [rbx], ymm1; ret
+            m6.cpu.state.gpr[3] = DATA;
+            m6.cpu.state.xmm[1][0] = 0x5555ULL; m6.cpu.state.xmm[1][1] = 0x6666ULL;
+            m6.cpu.state.ymm_hi[1][0] = 0x7777ULL; m6.cpu.state.ymm_hi[1][1] = 0x8888ULL;
+            CHECK(m6.run().stop == CpuStop::trap);
+            std::uint64_t out256[4] = {};
+            CHECK(m6.mem.load(DATA, out256, 32) == MemoryError::ok);
+            CHECK(out256[0] == 0x5555ULL && out256[1] == 0x6666ULL && out256[2] == 0x7777ULL && out256[3] == 0x8888ULL);
+        }
+        {   // Unpacks (map 0F, pp=1, L=0 e L=1)
+            // vpunpcklqdq xmm0, xmm1, xmm2 (0x6C, L=0): low qwords from src1 and src2
+            Machine m1{0xC5, 0xF1, 0x6C, 0xC2, 0xC3}; // vpunpcklqdq xmm0, xmm1, xmm2; ret
+            m1.cpu.state.xmm[1][0] = 0x1111111111111111ULL; m1.cpu.state.xmm[1][1] = 0x2222222222222222ULL;
+            m1.cpu.state.xmm[2][0] = 0x3333333333333333ULL; m1.cpu.state.xmm[2][1] = 0x4444444444444444ULL;
+            m1.cpu.state.ymm_hi[0][0] = ~0ULL; m1.cpu.state.ymm_hi[0][1] = ~0ULL;
+            CHECK(m1.run().stop == CpuStop::trap);
+            CHECK(m1.cpu.state.xmm[0][0] == 0x1111111111111111ULL);
+            CHECK(m1.cpu.state.xmm[0][1] == 0x3333333333333333ULL);
+            CHECK(m1.cpu.state.ymm_hi[0][0] == 0 && m1.cpu.state.ymm_hi[0][1] == 0);
+            const std::uint8_t d_vpunpcklqdq[] = {0xC5, 0xF1, 0x6C, 0xC2};
+            CHECK(decode_x86(d_vpunpcklqdq, sizeof(d_vpunpcklqdq)).length == 4);
+            CHECK(decode_x86(d_vpunpcklqdq, sizeof(d_vpunpcklqdq)).supported);
+
+            // Actual eboot.bin sequence: c5 f9 6c c1 = vpunpcklqdq xmm0, xmm0, xmm1
+            Machine m1_eboot{0xC5, 0xF9, 0x6C, 0xC1, 0xC3};
+            m1_eboot.cpu.state.xmm[0][0] = 0xAAAAAAAAAAAAAAAAULL; m1_eboot.cpu.state.xmm[0][1] = 0xBBBBBBBBBBBBBBBBULL;
+            m1_eboot.cpu.state.xmm[1][0] = 0xCCCCCCCCCCCCCCCCULL; m1_eboot.cpu.state.xmm[1][1] = 0xDDDDDDDDDDDDDDDDULL;
+            CHECK(m1_eboot.run().stop == CpuStop::trap);
+            CHECK(m1_eboot.cpu.state.xmm[0][0] == 0xAAAAAAAAAAAAAAAAULL);
+            CHECK(m1_eboot.cpu.state.xmm[0][1] == 0xCCCCCCCCCCCCCCCCULL);
+
+            // vpunpckhqdq xmm0, xmm1, xmm2 (0x6D, L=0): high qwords from src1 and src2
+            Machine m2{0xC5, 0xF1, 0x6D, 0xC2, 0xC3};
+            m2.cpu.state.xmm[1][0] = 0x1111ULL; m2.cpu.state.xmm[1][1] = 0x2222ULL;
+            m2.cpu.state.xmm[2][0] = 0x3333ULL; m2.cpu.state.xmm[2][1] = 0x4444ULL;
+            CHECK(m2.run().stop == CpuStop::trap);
+            CHECK(m2.cpu.state.xmm[0][0] == 0x2222ULL);
+            CHECK(m2.cpu.state.xmm[0][1] == 0x4444ULL);
+
+            // vpunpckldq xmm0, xmm1, xmm2 (0x62, L=0): low dwords
+            Machine m3{0xC5, 0xF1, 0x62, 0xC2, 0xC3};
+            m3.cpu.state.xmm[1][0] = 0x0000000200000001ULL; m3.cpu.state.xmm[1][1] = 0;
+            m3.cpu.state.xmm[2][0] = 0x0000000400000003ULL; m3.cpu.state.xmm[2][1] = 0;
+            CHECK(m3.run().stop == CpuStop::trap);
+            CHECK(m3.cpu.state.xmm[0][0] == 0x0000000300000001ULL);
+            CHECK(m3.cpu.state.xmm[0][1] == 0x0000000400000002ULL);
+
+            // vpunpckhdq xmm0, xmm1, xmm2 (0x6A, L=0): high dwords
+            Machine m4{0xC5, 0xF1, 0x6A, 0xC2, 0xC3};
+            m4.cpu.state.xmm[1][0] = 0; m4.cpu.state.xmm[1][1] = 0x0000000600000005ULL;
+            m4.cpu.state.xmm[2][0] = 0; m4.cpu.state.xmm[2][1] = 0x0000000800000007ULL;
+            CHECK(m4.run().stop == CpuStop::trap);
+            CHECK(m4.cpu.state.xmm[0][0] == 0x0000000700000005ULL);
+            CHECK(m4.cpu.state.xmm[0][1] == 0x0000000800000006ULL);
+
+            // vpunpcklbw xmm0, xmm1, xmm2 (0x60, L=0): low bytes
+            Machine m5{0xC5, 0xF1, 0x60, 0xC2, 0xC3};
+            m5.cpu.state.xmm[1][0] = 0x04030201ULL;
+            m5.cpu.state.xmm[2][0] = 0x08070605ULL;
+            CHECK(m5.run().stop == CpuStop::trap);
+            CHECK((m5.cpu.state.xmm[0][0] & 0xFFFFFFFFULL) == 0x06020501ULL);
+
+            // vpunpcklwd xmm0, xmm1, xmm2 (0x61, L=0): low words
+            Machine m6{0xC5, 0xF1, 0x61, 0xC2, 0xC3};
+            m6.cpu.state.xmm[1][0] = 0x00020001ULL;
+            m6.cpu.state.xmm[2][0] = 0x00040003ULL;
+            CHECK(m6.run().stop == CpuStop::trap);
+            CHECK(m6.cpu.state.xmm[0][0] == 0x0004000200030001ULL);
+
+            // 256-bit unpack (L=1): vpunpcklqdq ymm0, ymm1, ymm2
+            Machine m7{0xC5, 0xF5, 0x6C, 0xC2, 0xC3}; // L=1
+            m7.cpu.state.xmm[1][0] = 1; m7.cpu.state.xmm[1][1] = 2;
+            m7.cpu.state.ymm_hi[1][0] = 5; m7.cpu.state.ymm_hi[1][1] = 6;
+            m7.cpu.state.xmm[2][0] = 3; m7.cpu.state.xmm[2][1] = 4;
+            m7.cpu.state.ymm_hi[2][0] = 7; m7.cpu.state.ymm_hi[2][1] = 8;
+            CHECK(m7.run().stop == CpuStop::trap);
+            CHECK(m7.cpu.state.xmm[0][0] == 1 && m7.cpu.state.xmm[0][1] == 3);
+            CHECK(m7.cpu.state.ymm_hi[0][0] == 5 && m7.cpu.state.ymm_hi[0][1] == 7);
+        }
+        {   // VPADD and VPSUB (map 0F, pp=1, L=0 and L=1)
+            // vpaddq xmm0, xmm1, xmm2 (0xD4, L=0)
+            Machine m1{0xC5, 0xF1, 0xD4, 0xC2, 0xC3};
+            m1.cpu.state.xmm[1][0] = 100ULL; m1.cpu.state.xmm[1][1] = 200ULL;
+            m1.cpu.state.xmm[2][0] = 50ULL;  m1.cpu.state.xmm[2][1] = 30ULL;
+            m1.cpu.state.ymm_hi[0][0] = ~0ULL; m1.cpu.state.ymm_hi[0][1] = ~0ULL;
+            CHECK(m1.run().stop == CpuStop::trap);
+            CHECK(m1.cpu.state.xmm[0][0] == 150ULL);
+            CHECK(m1.cpu.state.xmm[0][1] == 230ULL);
+            CHECK(m1.cpu.state.ymm_hi[0][0] == 0 && m1.cpu.state.ymm_hi[0][1] == 0);
+            const std::uint8_t d_vpaddq[] = {0xC5, 0xF1, 0xD4, 0xC2};
+            CHECK(decode_x86(d_vpaddq, sizeof(d_vpaddq)).length == 4);
+            CHECK(decode_x86(d_vpaddq, sizeof(d_vpaddq)).supported);
+
+            // Actual eboot.bin sequence: c4 c1 79 d4 46 18 = vpaddq xmm0, xmm0, [r14+0x18]
+            Machine m_eboot_add{0xC4, 0xC1, 0x79, 0xD4, 0x46, 0x18, 0xC3};
+            m_eboot_add.cpu.state.gpr[14] = DATA;
+            const std::uint64_t mem_qwords[2] = {111ULL, 222ULL};
+            CHECK(m_eboot_add.mem.store(DATA + 0x18, mem_qwords, 16) == MemoryError::ok);
+            m_eboot_add.cpu.state.xmm[0][0] = 10ULL; m_eboot_add.cpu.state.xmm[0][1] = 20ULL;
+            CHECK(m_eboot_add.run().stop == CpuStop::trap);
+            CHECK(m_eboot_add.cpu.state.xmm[0][0] == 121ULL);
+            CHECK(m_eboot_add.cpu.state.xmm[0][1] == 242ULL);
+
+            // vpaddd xmm0, xmm1, xmm2 (0xFE, L=0)
+            Machine m2{0xC5, 0xF1, 0xFE, 0xC2, 0xC3};
+            m2.cpu.state.xmm[1][0] = 0x0000000A00000005ULL;
+            m2.cpu.state.xmm[2][0] = 0x0000000300000002ULL;
+            CHECK(m2.run().stop == CpuStop::trap);
+            CHECK(m2.cpu.state.xmm[0][0] == 0x0000000D00000007ULL);
+
+            // vpaddw (0xFD)
+            Machine m3{0xC5, 0xF1, 0xFD, 0xC2, 0xC3};
+            m3.cpu.state.xmm[1][0] = 0x00100020ULL;
+            m3.cpu.state.xmm[2][0] = 0x00050002ULL;
+            CHECK(m3.run().stop == CpuStop::trap);
+            CHECK(m3.cpu.state.xmm[0][0] == 0x00150022ULL);
+
+            // vpaddb (0xFC)
+            Machine m3b{0xC5, 0xF1, 0xFC, 0xC2, 0xC3};
+            m3b.cpu.state.xmm[1][0] = 0x01020304ULL;
+            m3b.cpu.state.xmm[2][0] = 0x05060708ULL;
+            CHECK(m3b.run().stop == CpuStop::trap);
+            CHECK(m3b.cpu.state.xmm[0][0] == 0x06080A0CULL);
+
+            // vpsubq xmm0, xmm1, xmm2 (0xFB, L=0)
+            Machine m4{0xC5, 0xF1, 0xFB, 0xC2, 0xC3};
+            m4.cpu.state.xmm[1][0] = 500ULL; m4.cpu.state.xmm[1][1] = 300ULL;
+            m4.cpu.state.xmm[2][0] = 200ULL; m4.cpu.state.xmm[2][1] = 100ULL;
+            CHECK(m4.run().stop == CpuStop::trap);
+            CHECK(m4.cpu.state.xmm[0][0] == 300ULL && m4.cpu.state.xmm[0][1] == 200ULL);
+
+            // vpsubd (0xFA), vpsubw (0xF9), vpsubb (0xF8)
+            Machine m5{0xC5, 0xF1, 0xFA, 0xC2, 0xC3};
+            m5.cpu.state.xmm[1][0] = 0x0000001000000020ULL;
+            m5.cpu.state.xmm[2][0] = 0x0000000500000008ULL;
+            CHECK(m5.run().stop == CpuStop::trap);
+            CHECK(m5.cpu.state.xmm[0][0] == 0x0000000B00000018ULL);
+
+            // 256-bit vpaddq (L=1)
+            Machine m6{0xC5, 0xF5, 0xD4, 0xC2, 0xC3}; // L=1
+            m6.cpu.state.xmm[1][0] = 1; m6.cpu.state.xmm[1][1] = 2;
+            m6.cpu.state.ymm_hi[1][0] = 3; m6.cpu.state.ymm_hi[1][1] = 4;
+            m6.cpu.state.xmm[2][0] = 10; m6.cpu.state.xmm[2][1] = 20;
+            m6.cpu.state.ymm_hi[2][0] = 30; m6.cpu.state.ymm_hi[2][1] = 40;
+            CHECK(m6.run().stop == CpuStop::trap);
+            CHECK(m6.cpu.state.xmm[0][0] == 11 && m6.cpu.state.xmm[0][1] == 22);
+            CHECK(m6.cpu.state.ymm_hi[0][0] == 33 && m6.cpu.state.ymm_hi[0][1] == 44);
+        }
         {   // ud2
             Machine m{0x0F, 0x0B};
             CHECK(m.run().stop == CpuStop::undefined);
