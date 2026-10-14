@@ -52,8 +52,9 @@ HleManager HleManager::create_standard() {
     // Args: arg0 = target address, arg1 = size, arg2 = pointer to write allocated address
     manager.register_handler(0x2003, "sceKernelAllocateDirectMemory", [](GuestMemory& memory, std::uint64_t arg0, std::uint64_t arg1, std::uint64_t arg2) -> std::int64_t {
         if (memory.map(arg0, arg1, read | write) != MemoryError::ok) return -1;
-        if (arg2) {
-            if (memory.store(arg2, &arg0, sizeof(arg0)) != MemoryError::ok) return -1;
+        if (arg2 && memory.store(arg2, &arg0, sizeof(arg0)) != MemoryError::ok) {
+            memory.unmap(arg0); // Do not retain a mapping when the guest output is invalid.
+            return -1;
         }
         return 0; // Success
     });
@@ -65,19 +66,22 @@ HleManager HleManager::create_standard() {
     // sceKernelCreateSema (NID 0x2010)
     // Args: arg0 = out_id pointer, arg1 = name pointer, arg2 = (initial | (maximum << 16))
     manager.register_handler(0x2010, "sceKernelCreateSema", [](GuestMemory& memory, std::uint64_t arg0, std::uint64_t arg1, std::uint64_t arg2) -> std::int64_t {
+        // Validate guest outputs before allocating a host-side semaphore.
+        std::uint32_t id = 0;
+        if (memory.store(arg0, &id, sizeof(id)) != MemoryError::ok) return ORBIS_KERNEL_ERROR_EINVAL;
         char name_buf[32] = "sema";
         if (arg1) {
-            memory.load(arg1, name_buf, sizeof(name_buf) - 1);
+            if (memory.load(arg1, name_buf, sizeof(name_buf) - 1) != MemoryError::ok) return ORBIS_KERNEL_ERROR_EINVAL;
             name_buf[sizeof(name_buf) - 1] = '\0';
         }
         std::int32_t initial = static_cast<std::int32_t>(arg2 & 0xFFFF);
         std::int32_t maximum = static_cast<std::int32_t>((arg2 >> 16) & 0xFFFF);
         if (maximum == 0) maximum = std::max(1, initial);
 
-        std::uint32_t id = 0;
         std::int32_t res = KernelSyncManager::instance().create_sema(&id, name_buf, SCE_KERNEL_SEMA_ATTR_TH_FIFO, initial, maximum);
-        if (res == ORBIS_OK && arg0) {
-            if (memory.store(arg0, &id, sizeof(id)) != MemoryError::ok) return ORBIS_KERNEL_ERROR_EINVAL;
+        if (res == ORBIS_OK && memory.store(arg0, &id, sizeof(id)) != MemoryError::ok) {
+            KernelSyncManager::instance().delete_sema(id);
+            return ORBIS_KERNEL_ERROR_EINVAL;
         }
         return res;
     });
@@ -90,9 +94,10 @@ HleManager HleManager::create_standard() {
         std::uint32_t timeout_val = 0;
         std::uint32_t *p_timeout = nullptr;
         if (arg2) {
-            if (memory.load(arg2, &timeout_val, sizeof(timeout_val)) == MemoryError::ok) {
-                p_timeout = &timeout_val;
-            }
+            if (memory.load(arg2, &timeout_val, sizeof(timeout_val)) != MemoryError::ok ||
+                memory.store(arg2, &timeout_val, sizeof(timeout_val)) != MemoryError::ok)
+                return ORBIS_KERNEL_ERROR_EINVAL;
+            p_timeout = &timeout_val;
         }
         std::int32_t res = KernelSyncManager::instance().wait_sema(id, need, p_timeout);
         if (p_timeout && arg2) {
@@ -133,7 +138,7 @@ HleManager HleManager::create_standard() {
     manager.register_handler(0x2020, "sceKernelCreateLwMutex", [](GuestMemory& memory, std::uint64_t arg0, std::uint64_t arg1, std::uint64_t arg2) -> std::int64_t {
         char name_buf[32] = "lwmutex";
         if (arg1) {
-            memory.load(arg1, name_buf, sizeof(name_buf) - 1);
+            if (memory.load(arg1, name_buf, sizeof(name_buf) - 1) != MemoryError::ok) return ORBIS_KERNEL_ERROR_EINVAL;
             name_buf[sizeof(name_buf) - 1] = '\0';
         }
         return KernelSyncManager::instance().create_lw_mutex(memory, arg0, name_buf, static_cast<std::uint32_t>(arg2), 0);
@@ -146,9 +151,10 @@ HleManager HleManager::create_standard() {
         std::uint32_t timeout_val = 0;
         std::uint32_t *p_timeout = nullptr;
         if (arg2) {
-            if (memory.load(arg2, &timeout_val, sizeof(timeout_val)) == MemoryError::ok) {
-                p_timeout = &timeout_val;
-            }
+            if (memory.load(arg2, &timeout_val, sizeof(timeout_val)) != MemoryError::ok ||
+                memory.store(arg2, &timeout_val, sizeof(timeout_val)) != MemoryError::ok)
+                return ORBIS_KERNEL_ERROR_EINVAL;
+            p_timeout = &timeout_val;
         }
         std::int32_t res = KernelSyncManager::instance().lock_lw_mutex(memory, arg0, count, p_timeout);
         if (p_timeout && arg2) {
@@ -185,13 +191,14 @@ HleManager HleManager::create_standard() {
     // Args: arg0 = out_id pointer, arg1 = attr pointer
     manager.register_handler(0x2030, "scePthreadMutexInit", [](GuestMemory& memory, std::uint64_t arg0, std::uint64_t arg1, std::uint64_t) -> std::int64_t {
         std::uint32_t attr_val = SCE_PTHREAD_MUTEX_NORMAL;
-        if (arg1) {
-            memory.load(arg1, &attr_val, sizeof(attr_val));
-        }
         std::uint32_t id = 0;
+        if (memory.store(arg0, &id, sizeof(id)) != MemoryError::ok ||
+            (arg1 && memory.load(arg1, &attr_val, sizeof(attr_val)) != MemoryError::ok))
+            return ORBIS_KERNEL_ERROR_EINVAL;
         std::int32_t res = KernelSyncManager::instance().pthread_mutex_init(&id, &attr_val);
-        if (res == ORBIS_OK && arg0) {
-            memory.store(arg0, &id, sizeof(id));
+        if (res == ORBIS_OK && memory.store(arg0, &id, sizeof(id)) != MemoryError::ok) {
+            KernelSyncManager::instance().pthread_mutex_destroy(id);
+            return ORBIS_KERNEL_ERROR_EINVAL;
         }
         return res;
     });
@@ -214,9 +221,11 @@ HleManager HleManager::create_standard() {
     // scePthreadCondInit (NID 0x2040)
     manager.register_handler(0x2040, "scePthreadCondInit", [](GuestMemory& memory, std::uint64_t arg0, std::uint64_t, std::uint64_t) -> std::int64_t {
         std::uint32_t id = 0;
+        if (memory.store(arg0, &id, sizeof(id)) != MemoryError::ok) return ORBIS_KERNEL_ERROR_EINVAL;
         std::int32_t res = KernelSyncManager::instance().pthread_cond_init(&id, nullptr);
-        if (res == ORBIS_OK && arg0) {
-            memory.store(arg0, &id, sizeof(id));
+        if (res == ORBIS_OK && memory.store(arg0, &id, sizeof(id)) != MemoryError::ok) {
+            KernelSyncManager::instance().pthread_cond_destroy(id);
+            return ORBIS_KERNEL_ERROR_EINVAL;
         }
         return res;
     });

@@ -4,7 +4,7 @@
 
 int main() { return run([] {
     using namespace bb;
-    GuestMemory mem(512);
+    GuestMemory mem(528);
     CHECK(mem.map(0x1000, 512, read | write) == MemoryError::ok);
 
     auto hle = HleManager::create_standard();
@@ -88,6 +88,31 @@ int main() { return run([] {
     CHECK(mem.load(p_cond_addr, &p_cond_id, sizeof(p_cond_id)) == MemoryError::ok);
     CHECK(hle.invoke(0x2042, mem, p_cond_id, 0, 0) == ORBIS_OK); // signal
     CHECK(hle.invoke(0x2044, mem, p_cond_id, 0, 0) == ORBIS_OK); // destroy
+
+    // Synthetic guest pointers: reject invalid/readonly outputs without returning orphan IDs.
+    CHECK(hle.invoke(0x2010, mem, 0, 0, packed_counts) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(hle.invoke(0x2030, mem, 0, 0, 0) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(hle.invoke(0x2040, mem, 0, 0, 0) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(hle.invoke(0x2010, mem, 0x1080, 0xDEAD, packed_counts) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(hle.invoke(0x2030, mem, 0x1080, 0xDEAD, 0) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(mem.unmap(0x1000) == MemoryError::ok);
+    CHECK(mem.map(0x1000, 512, read) == MemoryError::ok);
+    CHECK(hle.invoke(0x2010, mem, 0x1080, 0, packed_counts) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(hle.invoke(0x2030, mem, 0x1080, 0, 0) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(hle.invoke(0x2040, mem, 0x1080, 0, 0) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(mem.unmap(0x1000) == MemoryError::ok);
+    CHECK(mem.map(0x1000, 512, read | write) == MemoryError::ok);
+    CHECK(mem.map(0x3000, 16, read) == MemoryError::ok);
+    CHECK(hle.invoke(0x2011, mem, 0xFFFFFFFF, 1, 0x3000) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(mem.unmap(0x3000) == MemoryError::ok);
+    CHECK(hle.invoke(0x2011, mem, 0xFFFFFFFF, 1, 0xDEAD) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(hle.invoke(0x2021, mem, 0x1040, 1, 0xDEAD) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(mem.used() == 512);
+    // An invalid output must roll back a successfully mapped direct-memory request.
+    CHECK(hle.invoke(0x2003, mem, 0x2000, 16, 0xDEAD) == -1);
+    CHECK(mem.used() == 512);
+    CHECK(hle.invoke(0x2003, mem, 0x2000, 16, 0) == 0);
+    CHECK(mem.used() == 528);
 
     // Test custom HLE registration
     hle.register_handler(0x7777, "custom_add", [](GuestMemory&, std::uint64_t a, std::uint64_t b, std::uint64_t) -> std::int64_t {
