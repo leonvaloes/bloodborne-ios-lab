@@ -1,7 +1,8 @@
 # Marco S4 ? Expans?o de Tradu??o Est?tica (Fixtures F1, F2 e F3)
 
 **Data:** 14/10/2026  
-**Status:** ? **CONCLU?DO (VERIFICADO NO HOST COM TESTES UNIT?RIOS E DE INTEGRA??O)**
+**Commit:** `52d3441267302274dad7c23c0cdb2c547b6a0b4e`  
+**Status:** ? **CONCLU?DO (HOST VERIFICADO + CI COMPILADO PARA iOS arm64)**
 
 ---
 
@@ -43,7 +44,7 @@ Nesta etapa, o tradutor AOT est?tico (`bb-aot`) e o pipeline de execu??o e teste
 
 ---
 
-## Resultados dos Testes no Host
+## Resultados dos Testes no Host (Windows GCC 16.2.0)
 
 A su?te completa de testes passou com 100% de sucesso sob Windows com GCC 16.2.0:
 
@@ -70,6 +71,24 @@ Test project bloodborne-ios-lab/build-s4
   "game_execution": false
 }
 ```
+
+---
+
+## Resultados do CI no GitHub Actions
+
+| Pipeline | Run ID | Status | Detalhes |
+|---|---|---|---|
+| **Host tests** (Ubuntu, Windows MSVC, macOS Clang, Sanitizers) | [38497368343](https://github.com/leonvaloes/bloodborne-ios-lab/actions/runs/38497368343) | ? Sucesso (Verde) | Ubuntu (16s), Windows (50s), macOS (13s), ASan/UBSan (19s) |
+| **iOS unsigned laboratory** (Xcode arm64) | [38497368323](https://github.com/leonvaloes/bloodborne-ios-lab/actions/runs/38497368323) | ? Sucesso (Verde) | Build arm64 com SDK iOS 26.5, packaging do IPA conclu?do em 39s |
+
+### Artefatos de Build Produzidos (Run 3849736823)
+
+| Arquivo | Verifica??o |
+|---|---|
+| `BBHost-unsigned.ipa` | SHA-256: `a8c3140fa852808811a98afc8ef16d4d71f1c9e7ecbbfc8736478f088c2ea398` |
+| `architecture.txt` | `Non-fat file... arm64` |
+| `platform.txt` | `platform IOS, minos 17.0, sdk 26.5` |
+| `revision.txt` | `52d3441267302274dad7c23c0cdb2c547b6a0b4e` |
 
 ---
 
