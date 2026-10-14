@@ -40,6 +40,7 @@ public:
     Id mutex_create(bool recursive = false);
     std::int32_t lock(Id thread, Id mutex, std::uint64_t timeout = 0);
     std::int32_t unlock(Id thread, Id mutex);
+    std::int32_t try_lock(Id thread, Id mutex);
     Id cond_create();
     std::int32_t cond_wait(Id thread, Id cond, Id mutex, std::uint64_t timeout = 0);
     std::int32_t cond_signal(Id cond, bool broadcast = false);
@@ -48,6 +49,8 @@ public:
                             std::uint64_t timeout = 0);
     std::int32_t event_set(Id event, std::uint64_t bits);
     std::int32_t event_clear(Id event, std::uint64_t bits);
+    std::uint64_t event_bits(Id event) const;
+    void set_resume(Id id, std::function<void(CpuState&, std::int32_t)> hook);
     // Trampolines: the driver must explicitly arrange a guest CALL to function,
     // then call complete_initializer after its return trap. Never invoke on host.
     std::int32_t begin_initializer(Id thread, std::uint64_t key, Callback callback);
@@ -66,6 +69,7 @@ private:
         bool all = false, timed = false;
         std::int32_t result = ORBIS_OK;
         Callback callback{};
+        std::function<void(CpuState&, std::int32_t)> on_resume;
         std::uint64_t stack_bottom = 0, stack_top = 0;
     };
     struct Mutex { Id owner = 0; unsigned depth = 0; bool recursive = false; std::deque<Id> waiters; };

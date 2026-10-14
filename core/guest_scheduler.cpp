@@ -86,6 +86,12 @@ std::int32_t GuestScheduler::lock(Id tid, Id id, std::uint64_t timeout) {
     if (m.owner==tid) { if (!m.recursive || m.depth==UINT_MAX) return ORBIS_KERNEL_ERROR_EDEADLK; ++m.depth; return ORBIS_OK; }
     block(tid,Wait::mutex,id,timeout); m.waiters.push_back(tid); return ORBIS_OK;
 }
+std::int32_t GuestScheduler::try_lock(Id tid, Id id) {
+    auto* t=find(tid); auto it=mutexes_.find(id);
+    if (!t || t->state!=State::ready || it==mutexes_.end()) return ORBIS_KERNEL_ERROR_EINVAL;
+    if (it->second.owner && it->second.owner!=tid) return ORBIS_KERNEL_ERROR_EBUSY;
+    return lock(tid,id);
+}
 void GuestScheduler::acquire_next(Id id) {
     auto& m=mutexes_.at(id);
     while (!m.waiters.empty()) {
@@ -146,6 +152,13 @@ std::int32_t GuestScheduler::event_set(Id id, std::uint64_t bits) {
     return ORBIS_OK;
 }
 std::int32_t GuestScheduler::event_clear(Id id, std::uint64_t bits) { auto it=events_.find(id); if (it==events_.end()) return ORBIS_KERNEL_ERROR_EINVAL; it->second.bits&=~bits; return ORBIS_OK; }
+std::uint64_t GuestScheduler::event_bits(Id id) const {
+    auto it=events_.find(id); return it==events_.end()?0:it->second.bits;
+}
+void GuestScheduler::set_resume(Id id, std::function<void(CpuState&, std::int32_t)> hook) {
+    auto* t=find(id); if (!t) throw std::logic_error("unknown thread for resume");
+    t->on_resume=std::move(hook);
+}
 std::int32_t GuestScheduler::begin_initializer(Id tid, std::uint64_t key, Callback cb) {
     auto* t=find(tid); if (!t || t->state!=State::ready || !key || !cb.function) return ORBIS_KERNEL_ERROR_EINVAL;
     auto& init=inits_[key]; if (init.complete) return ORBIS_OK;
@@ -169,6 +182,10 @@ GuestScheduler::Result GuestScheduler::run(std::uint64_t max_steps) {
     while (out.steps<max_steps && !ready_.empty()) {
         Id id=ready_.front(); ready_.pop_front(); auto& t=threads_.at(id);
         if (t.state!=State::ready) continue;
+        if (t.on_resume) {
+            auto hook=std::move(t.on_resume); t.on_resume=nullptr;
+            hook(t.cpu,t.result);
+        }
         interpreter_.state=t.cpu;
         const auto slice=std::min(quantum_,max_steps-out.steps);
         auto res=interpreter_.run(slice); t.cpu=interpreter_.state;

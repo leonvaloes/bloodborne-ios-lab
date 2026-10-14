@@ -68,7 +68,8 @@ OrbisRuntime::OrbisRuntime(GuestMemory& memory) : mem_(memory) {
 #include "orbis_import_names.h"
         "scePthreadMutexattrInit", "scePthreadMutexattrSettype", "scePthreadMutexattrDestroy",
         "scePthreadMutexInit", "scePthreadMutexLock", "scePthreadMutexUnlock", "scePthreadMutexDestroy",
-        "scePthreadMutexTrylock", "sceKernelMmap", "sceKernelMunmap", "sceKernelVirtualQuery"
+        "scePthreadMutexTrylock", "sceKernelMmap", "sceKernelMunmap", "sceKernelVirtualQuery",
+        "__cxa_guard_abort"
     };
     for (const char* s : symbols) names_.emplace(orbis_nid(s), s);
 }
@@ -93,9 +94,319 @@ std::uint64_t OrbisRuntime::invoke(const std::string& import, const CpuState& cp
         throw std::runtime_error("guest scheduler trap adapter unavailable for " + name);
     return handle(name,cpu);
 }
+OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& import, CpuState& cpu,
+                                                           GuestScheduler::Id tid, std::uint64_t return_trap) {
+    if (!scheduler_) {
+        return InvocationResult{InvocationResult::Action::returned, handle(resolve(import), cpu), 0, 0};
+    }
+    const auto n = resolve(import);
+    auto a = [&](unsigned i) { return arg(cpu, i); };
+    auto result = [&](std::uint64_t value) {
+        return InvocationResult{InvocationResult::Action::returned, value, 0, 0};
+    };
+
+    if (n == "scePthreadCreate") {
+        if (!a(0) || !a(2) || !return_trap || thread_stack_next_ > UINT64_MAX - 0x10000) return result(invalid);
+        const auto bottom = thread_stack_next_;
+        if (mem_.map(bottom, 0x10000, read | write) != MemoryError::ok) return result(no_memory);
+        auto id = scheduler_->create(a(2), bottom, bottom + 0x10000, return_trap, a(3));
+        if (!id) { mem_.unmap(bottom); return result(invalid); }
+        if (mem_.store(a(0), &id, sizeof(id)) != MemoryError::ok) { mem_.unmap(bottom); return result(invalid); }
+        thread_stack_next_ += 0x10000;
+        return result(static_cast<std::uint32_t>(scheduler_->start(id)));
+    }
+
+    if (n == "scePthreadExit") {
+        scheduler_->exit(tid, a(0));
+        return {InvocationResult::Action::exited, 0, 0, 0};
+    }
+
+    if (n == "scePthreadJoin") {
+        if (a(1)) {
+            std::uint64_t probe = 0;
+            if (mem_.load(a(1), &probe, 8) != MemoryError::ok || mem_.store(a(1), &probe, 8) != MemoryError::ok)
+                return result(invalid);
+        }
+        const auto target = static_cast<GuestScheduler::Id>(a(0));
+        auto status = scheduler_->join(tid, target);
+        if (status) return result(static_cast<std::uint32_t>(status));
+        if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+            std::uint64_t ret = 0;
+            if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+            cpu.gpr[4] += 8;
+            cpu.rip = ret;
+            cpu.gpr[0] = 0;
+            auto out_val = a(1);
+            scheduler_->set_resume(tid, [this, out_val, target](CpuState& state, std::int32_t res) {
+                state.gpr[0] = static_cast<std::uint32_t>(res);
+                if (res == ORBIS_OK && out_val) {
+                    std::uint64_t val = scheduler_->value(target);
+                    mem_.store(out_val, &val, 8);
+                }
+            });
+            return {InvocationResult::Action::blocked, 0, 0, 0};
+        }
+        if (a(1)) {
+            std::uint64_t val = scheduler_->value(target);
+            put(mem_, a(1), val);
+        }
+        return result(0);
+    }
+
+    if (n == "scePthreadMutexInit" || n == "pthread_mutex_init") {
+        if (!a(0)) return result(invalid);
+        bool recursive = false;
+        if (a(1)) {
+            auto attr = get<std::uint64_t>(mem_, a(1));
+            if (!attrs_.count(attr)) return result(invalid);
+            recursive = (attrs_.at(attr) == 2);
+        }
+        const auto id = scheduler_->mutex_create(recursive);
+        const auto handle = next_handle_++;
+        guest_mutexes_[handle] = id;
+        put(mem_, a(0), handle);
+        return result(0);
+    }
+
+    if (n == "scePthreadMutexLock" || n == "pthread_mutex_lock" ||
+        n == "scePthreadMutexUnlock" || n == "pthread_mutex_unlock" ||
+        n == "scePthreadMutexTrylock" || n == "scePthreadMutexDestroy" || n == "pthread_mutex_destroy") {
+        if (!a(0)) return result(invalid);
+        auto handle = get<std::uint64_t>(mem_, a(0));
+        if (!handle && n != "scePthreadMutexUnlock" && n != "pthread_mutex_unlock" &&
+            n != "scePthreadMutexDestroy" && n != "pthread_mutex_destroy") {
+            handle = next_handle_++;
+            guest_mutexes_[handle] = scheduler_->mutex_create(false);
+            put(mem_, a(0), handle);
+        }
+        if (!guest_mutexes_.count(handle)) return result(invalid);
+        const auto id = guest_mutexes_.at(handle);
+        if (n == "scePthreadMutexDestroy" || n == "pthread_mutex_destroy") {
+            guest_mutexes_.erase(handle);
+            put<std::uint64_t>(mem_, a(0), 0);
+            return result(0);
+        }
+        if (n == "scePthreadMutexUnlock" || n == "pthread_mutex_unlock") {
+            return result(static_cast<std::uint32_t>(scheduler_->unlock(tid, id)));
+        }
+        const auto status = (n == "scePthreadMutexTrylock") ? scheduler_->try_lock(tid, id) : scheduler_->lock(tid, id);
+        if (status) return result(static_cast<std::uint32_t>(status));
+        if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+            std::uint64_t ret = 0;
+            if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+            cpu.gpr[4] += 8;
+            cpu.rip = ret;
+            cpu.gpr[0] = 0;
+            scheduler_->set_resume(tid, [](CpuState& state, std::int32_t res) {
+                state.gpr[0] = static_cast<std::uint32_t>(res);
+            });
+            return {InvocationResult::Action::blocked, 0, 0, 0};
+        }
+        return result(0);
+    }
+
+    if (n == "scePthreadCondInit" || n == "pthread_cond_init") {
+        if (!a(0)) return result(invalid);
+        const auto handle = next_handle_++;
+        guest_conds_[handle] = scheduler_->cond_create();
+        put(mem_, a(0), handle);
+        return result(0);
+    }
+
+    if (n == "scePthreadCondDestroy" || n == "pthread_cond_destroy") {
+        if (!a(0)) return result(invalid);
+        auto handle = get<std::uint64_t>(mem_, a(0));
+        if (!guest_conds_.erase(handle)) return result(invalid);
+        put<std::uint64_t>(mem_, a(0), 0);
+        return result(0);
+    }
+
+    if (n == "scePthreadCondSignal" || n == "pthread_cond_signal" ||
+        n == "scePthreadCondBroadcast" || n == "pthread_cond_broadcast") {
+        if (!a(0)) return result(invalid);
+        auto handle = get<std::uint64_t>(mem_, a(0));
+        if (!guest_conds_.count(handle)) return result(invalid);
+        bool broadcast = (n.find("Broadcast") != std::string::npos || n == "pthread_cond_broadcast");
+        return result(static_cast<std::uint32_t>(scheduler_->cond_signal(guest_conds_.at(handle), broadcast)));
+    }
+
+    if (n == "scePthreadCondWait" || n == "pthread_cond_wait" ||
+        n == "scePthreadCondTimedwait" || n == "pthread_cond_timedwait") {
+        if (!a(0) || !a(1)) return result(invalid);
+        auto ch = get<std::uint64_t>(mem_, a(0));
+        auto mh = get<std::uint64_t>(mem_, a(1));
+        if (!guest_conds_.count(ch) || !guest_mutexes_.count(mh)) return result(invalid);
+        std::uint64_t timeout = 0;
+        if (n.find("Timedwait") != std::string::npos || n == "pthread_cond_timedwait") {
+            if (!a(2)) return result(invalid);
+            timeout = get<std::uint64_t>(mem_, a(2));
+        }
+        auto status = scheduler_->cond_wait(tid, guest_conds_.at(ch), guest_mutexes_.at(mh), timeout);
+        if (status) return result(static_cast<std::uint32_t>(status));
+        if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+            std::uint64_t ret = 0;
+            if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+            cpu.gpr[4] += 8;
+            cpu.rip = ret;
+            cpu.gpr[0] = 0;
+            scheduler_->set_resume(tid, [](CpuState& state, std::int32_t res) {
+                state.gpr[0] = static_cast<std::uint32_t>(res);
+            });
+            return {InvocationResult::Action::blocked, 0, 0, 0};
+        }
+        return result(0);
+    }
+
+    if (n == "sceKernelCreateEventFlag") {
+        if (!a(0) || a(2) > 3) return result(invalid);
+        const auto handle = next_handle_++;
+        guest_events_[handle] = scheduler_->event_create(a(3));
+        put<std::uint32_t>(mem_, a(0), static_cast<std::uint32_t>(handle));
+        return result(0);
+    }
+
+    if (n == "sceKernelDeleteEventFlag") {
+        if (!guest_events_.erase(a(0))) return result(invalid);
+        return result(0);
+    }
+
+    if (n == "sceKernelSetEventFlag") {
+        if (!guest_events_.count(a(0))) return result(invalid);
+        return result(static_cast<std::uint32_t>(scheduler_->event_set(guest_events_.at(a(0)), a(1))));
+    }
+
+    if (n == "sceKernelClearEventFlag") {
+        if (!guest_events_.count(a(0))) return result(invalid);
+        return result(static_cast<std::uint32_t>(scheduler_->event_clear(guest_events_.at(a(0)), a(1))));
+    }
+
+    if (n == "sceKernelWaitEventFlag" || n == "sceKernelPollEventFlag") {
+        if (!guest_events_.count(a(0))) return result(invalid);
+        const auto eid = guest_events_.at(a(0));
+        const auto mask = a(1), mode = a(2);
+        if (!mask || (mode & ~0x33)) return result(invalid);
+        const bool poll = (n == "sceKernelPollEventFlag");
+        const auto bits = scheduler_->event_bits(eid) & mask;
+        const bool match = (mode & 1) ? (bits == mask) : (bits != 0);
+        if (match) {
+            if (!a(3)) return result(invalid);
+            put(mem_, a(3), scheduler_->event_bits(eid));
+            if (mode & 0x10) scheduler_->event_clear(eid, bits);
+            if (mode & 0x20) scheduler_->event_clear(eid, ~0ULL);
+            return result(0);
+        }
+        if (poll) return result(0x80020010); // EBUSY
+        if (!a(3)) return result(invalid);
+        std::uint64_t timeout = 0;
+        if (a(4)) timeout = get<std::uint64_t>(mem_, a(4));
+        auto status = scheduler_->event_wait(tid, eid, mask, (mode & 1) != 0, timeout);
+        if (status) return result(static_cast<std::uint32_t>(status));
+        if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+            std::uint64_t ret = 0;
+            if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+            cpu.gpr[4] += 8;
+            cpu.rip = ret;
+            cpu.gpr[0] = 0;
+            auto out_ptr = a(3);
+            scheduler_->set_resume(tid, [this, out_ptr, eid, mode, mask](CpuState& state, std::int32_t res) {
+                state.gpr[0] = static_cast<std::uint32_t>(res);
+                if (res == ORBIS_OK && out_ptr) {
+                    auto b = scheduler_->event_bits(eid);
+                    mem_.store(out_ptr, &b, 8);
+                    if (mode & 0x10) scheduler_->event_clear(eid, b & mask);
+                    if (mode & 0x20) scheduler_->event_clear(eid, ~0ULL);
+                }
+            });
+            return {InvocationResult::Action::blocked, 0, 0, 0};
+        }
+        return result(0);
+    }
+
+    if (n == "scePthreadOnce") {
+        if (!a(0) || !a(1) || !return_trap) return result(invalid);
+        std::uint32_t done = 0;
+        if (mem_.load(a(0), &done, 4) != MemoryError::ok) return result(invalid);
+        if (done) return result(0);
+        auto status = scheduler_->begin_initializer(tid, a(0), {a(1), 0});
+        if (status) return result(static_cast<std::uint32_t>(status));
+        if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+            std::uint64_t ret = 0;
+            if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+            cpu.gpr[4] += 8;
+            cpu.rip = ret;
+            cpu.gpr[0] = 0;
+            scheduler_->set_resume(tid, [](CpuState& state, std::int32_t res) {
+                state.gpr[0] = static_cast<std::uint32_t>(res);
+            });
+            return {InvocationResult::Action::blocked, 0, 0, 0};
+        }
+        std::uint64_t ret = 0;
+        if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+        callbacks_[tid] = {a(0), ret, return_trap};
+        put(mem_, cpu.gpr[4], return_trap);
+        cpu.rip = a(1);
+        return {InvocationResult::Action::callback, 0, a(1), 0};
+    }
+
+    if (n == "__cxa_guard_acquire") {
+        if (!a(0)) return result(invalid);
+        std::uint8_t done = 0;
+        if (mem_.load(a(0), &done, 1) != MemoryError::ok) return result(invalid);
+        if (done) return result(0);
+        auto status = scheduler_->begin_initializer(tid, a(0), {1, 0});
+        if (status) return result(static_cast<std::uint32_t>(status));
+        if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+            std::uint64_t ret = 0;
+            if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+            cpu.gpr[4] += 8;
+            cpu.rip = ret;
+            cpu.gpr[0] = 0;
+            auto guard_ptr = a(0);
+            scheduler_->set_resume(tid, [this, guard_ptr](CpuState& state, std::int32_t res) {
+                (void)res;
+                std::uint8_t d = 0;
+                mem_.load(guard_ptr, &d, 1);
+                state.gpr[0] = d ? 0 : 1;
+            });
+            return {InvocationResult::Action::blocked, 0, 0, 0};
+        }
+        return result(1);
+    }
+
+    if (n == "__cxa_guard_release" || n == "__cxa_guard_abort") {
+        if (!a(0)) return result(invalid);
+        if (n == "__cxa_guard_release") {
+            std::uint8_t one = 1;
+            mem_.store(a(0), &one, 1);
+            scheduler_->complete_initializer(tid, a(0), true);
+        } else {
+            scheduler_->complete_initializer(tid, a(0), false);
+        }
+        return result(0);
+    }
+
+    return result(handle(n, cpu));
+}
+OrbisRuntime::InvocationResult OrbisRuntime::complete_callback(CpuState& cpu, GuestScheduler::Id tid) {
+    auto it = callbacks_.find(tid);
+    if (it == callbacks_.end()) throw std::runtime_error("unexpected guest callback return");
+    const auto pending = it->second;
+    const auto status = scheduler_->complete_initializer(tid, pending.key, true);
+    std::uint32_t one = 1;
+    mem_.store(pending.key, &one, 4);
+    cpu.rip = pending.return_address;
+    cpu.gpr[0] = static_cast<std::uint32_t>(status);
+    callbacks_.erase(it);
+    return {InvocationResult::Action::returned, static_cast<std::uint32_t>(status), 0, 0};
+}
 std::uint64_t OrbisRuntime::handle(const std::string& n, const CpuState& c) {
     auto a=[&](unsigned i){return arg(c,i);};
     if (n=="_init_env") return 0;
+    if (n=="sceKernelGetProcParam") {
+        if (!a(0) || !procparam_) return invalid;
+        if (mem_.store(a(0),&procparam_,sizeof procparam_)!=MemoryError::ok) return invalid;
+        return 0;
+    }
     if (n=="atexit" || n=="__cxa_atexit") {
         if (!a(0)) return invalid;
         exit_callbacks_.push_back(a(0)); // registrados, mas não executados sem trampoline guest
