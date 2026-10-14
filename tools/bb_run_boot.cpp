@@ -15,7 +15,8 @@ using namespace bb;
 
 namespace {
 constexpr std::uint64_t IMAGE_BASE = 0x10000000ULL, STACK_BASE = 0x70000000ULL, STACK_SIZE = 8u << 20,
-                        PARAM_BASE = 0x6F000000ULL, CODE_TRAPS = 0x7F000000ULL, DATA_TRAPS = 0x7E000000ULL,
+                        PARAM_BASE = 0x6F000000ULL, TLS_BASE = 0x6E000000ULL, TLS_SIZE = 16u << 20,
+                        CODE_TRAPS = 0x7F000000ULL, DATA_TRAPS = 0x7E000000ULL,
                         EXIT_TRAP = 0x7D000000ULL, PAGE = 4096;
 
 struct Reader {
@@ -65,6 +66,7 @@ int main(int argc, char** argv) {
         mem.store(IMAGE_BASE, image.data(), size) != MemoryError::ok ||
         mem.map(STACK_BASE, STACK_SIZE, Permission::read | Permission::write) != MemoryError::ok ||
         mem.map(PARAM_BASE, PAGE, Permission::read | Permission::write) != MemoryError::ok ||
+        mem.map(TLS_BASE, TLS_SIZE, Permission::read | Permission::write) != MemoryError::ok ||
         (ni && mem.map(DATA_TRAPS, PAGE * ni, Permission::read | Permission::write) != MemoryError::ok)) {
         std::fprintf(stderr, "falha ao mapear a memoria do guest\n"); return 2;
     }
@@ -75,11 +77,22 @@ int main(int argc, char** argv) {
     mem.store(PARAM_BASE + 16, &zero, 8);
     mem.store(argv0, path, sizeof(path));
 
+    const std::uint64_t tcb = TLS_BASE + 0x10000;
+    const std::uint64_t dtv = tcb + 64;
+    const std::uint64_t thread_rec = tcb + 256;
+    const std::uint64_t dtv_gen = 1, dtv_tls0 = TLS_BASE;
+    mem.store(tcb, &tcb, 8);
+    mem.store(tcb + 8, &dtv, 8);
+    mem.store(tcb + 16, &thread_rec, 8);
+    mem.store(dtv, &dtv_gen, 8);
+    mem.store(dtv + 8, &dtv_tls0, 8);
+
     X86Interpreter cpu(mem);
     cpu.add_trap_range(CODE_TRAPS, 32 * (ni + 1));
     cpu.add_trap_range(DATA_TRAPS, PAGE * (ni + 1));
     cpu.add_trap_range(EXIT_TRAP, 32);
     cpu.state.rip = IMAGE_BASE + entry;
+    cpu.state.fs_base = tcb;
     cpu.state.gpr[7] = PARAM_BASE;  // rdi = params
     cpu.state.gpr[6] = EXIT_TRAP;   // rsi = exit
     cpu.state.gpr[4] = STACK_BASE + STACK_SIZE - 64;
