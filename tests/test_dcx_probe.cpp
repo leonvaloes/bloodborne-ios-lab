@@ -24,9 +24,9 @@ int main() { return run([] {
     };
     std::vector<std::uint8_t> raw(128, 0);
     std::memcpy(raw.data(), "FLVER\0", 6);
-    mz_ulong compressed_size = mz_compressBound(raw.size());
+    mz_ulong compressed_size = mz_compressBound(static_cast<mz_ulong>(raw.size()));
     std::vector<std::uint8_t> compressed(compressed_size);
-    CHECK(mz_compress(compressed.data(), &compressed_size, raw.data(), raw.size()) == MZ_OK);
+    CHECK(mz_compress(compressed.data(), &compressed_size, raw.data(), static_cast<mz_ulong>(raw.size())) == MZ_OK);
     compressed.resize(compressed_size);
     std::vector<std::uint8_t> dcx(76 + compressed.size(), 0);
     std::memcpy(dcx.data(), "DCX\0", 4);
