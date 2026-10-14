@@ -9,6 +9,7 @@
 #include "metal_pipeline.h"
 #include "flver_parser.h"
 #include "game_asset_probe.h"
+#include "boot_probe.h"
 #include <exception>
 #include <sys/utsname.h>
 #include <simd/simd.h>
@@ -25,6 +26,7 @@
     UILabel *_documentStatus;
     UILabel *_assetStatus;
     UILabel *_dcxStatus;
+    UILabel *_bootStatus;
     MTKView *_metal;
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
@@ -104,6 +106,13 @@
     [dcxButton setTitle:@"Verificar pequeno FLVER.DCX via VFS" forState:UIControlStateNormal];
     [dcxButton addTarget:self action:@selector(checkDcx) forControlEvents:UIControlEventTouchUpInside];
 
+    _bootStatus = [UILabel new];
+    _bootStatus.numberOfLines = 0;
+    _bootStatus.text = @"Entry probe: aguardando eboot.elf em Documents.";
+    UIButton *bootButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [bootButton setTitle:@"Testar entrada x86-64 (2 instrucoes)" forState:UIControlStateNormal];
+    [bootButton addTarget:self action:@selector(checkBootEntry) forControlEvents:UIControlEventTouchUpInside];
+
     UIButton *run = [UIButton buttonWithType:UIButtonTypeSystem];
     [run setTitle:@"Executar testes completos (CPU, VFS, Áudio, Entrada)" forState:UIControlStateNormal];
     [run addTarget:self action:@selector(runTests) forControlEvents:UIControlEventTouchUpInside];
@@ -145,7 +154,7 @@
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
         title, scope, _status, run, _metal, _gpuStatus, _subsystemStatus,
-        documentButton, _documentStatus, assetButton, _assetStatus, dcxButton, _dcxStatus, dpadRow, actionsRow, exportButton]];
+        documentButton, _documentStatus, assetButton, _assetStatus, dcxButton, _dcxStatus, bootButton, _bootStatus, dpadRow, actionsRow, exportButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -471,6 +480,23 @@
         status, probe.size_bytes, probe.decoded_bytes];
 }
 
+- (void)checkBootEntry {
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    const auto probe = bb::probe_eboot_entry(documents.path ? documents.path.UTF8String : "");
+    NSString *status = [NSString stringWithUTF8String:probe.status.c_str()];
+    _report[@"boot_probe"] = @{@"path": @"Documents/eboot.elf",
+        @"status": status, @"entry_reached": @(probe.entry_reached),
+        @"file_size": @(probe.file_size), @"entry_rip": @(probe.entry_rip),
+        @"stop_rip": @(probe.stop_rip), @"stack_pointer": @(probe.stack_pointer),
+        @"instructions_executed": @(probe.instructions_executed),
+        @"stop_opcode": @(probe.stop_opcode),
+        @"game_execution": @NO,
+        @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]};
+    _bootStatus.text = [NSString stringWithFormat:@"Entry x86-64: %@, %u instrucoes, parada em 0x%llx.",
+        status, probe.instructions_executed, probe.stop_rip];
+}
+
 - (void)drawInMTKView:(MTKView *)view {
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
     id<CAMetalDrawable> drawable = view.currentDrawable;
@@ -565,6 +591,7 @@
     [self checkDocument];
     [self checkGameAsset];
     [self checkDcx];
+    [self checkBootEntry];
     _report[@"timestamp"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     auto pacing = _pacingTracker.get_stats();
     _report[@"frame_pacing_p50_ms"] = @(pacing.p50_ms);

@@ -92,6 +92,7 @@ set(CORE_SOURCES
     core/elf_parser.cpp
     core/game_asset_probe.cpp
     core/guest_loader.cpp
+    core/boot_probe.cpp
     core/input.cpp
     core/vfs.cpp
     core/binder.cpp
@@ -133,7 +134,7 @@ else()
     target_link_libraries(bb-smoke PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe audio stability engine shader_translator metal_pipeline flver_parser)
+        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe boot_probe audio stability engine shader_translator metal_pipeline flver_parser)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
