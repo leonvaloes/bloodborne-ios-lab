@@ -1,4 +1,4 @@
-#include "smoke.h"
+﻿#include "smoke.h"
 #include "fixtures.h"
 #include "guest_memory.h"
 #include "simd.h"
@@ -7,9 +7,15 @@
 #include "manifest.h"
 #include "elf_parser.h"
 #include "guest_loader.h"
+#include "input.h"
+#include "vfs.h"
+#include "audio.h"
+#include "stability.h"
+#include "engine_loop.h"
 #include <limits>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 
 namespace bb {
 SmokeReport smoke() {
@@ -181,7 +187,6 @@ SmokeReport smoke() {
     check(insp.is_valid && insp.machine == EM_X86_64);
     check(insp.code_size == 0x1000);
 
-
     // S8: Guest Loader & First Instruction Execution (4 checks)
     GuestMemory boot_mem(256 * 1024);
     auto boot_rep = GuestLoader::load_and_boot(boot_mem, elf_min.data(), elf_min.size(), dispatcher, hle);
@@ -189,6 +194,82 @@ SmokeReport smoke() {
     check(boot_rep.first_instruction_executed);
     check(boot_rep.entry_point == 0x400000);
     check((boot_rep.stack_pointer & 0xF) == 0);
+
+    // S9: Input Subsystem (5 checks)
+    InputManager input;
+    input.set_button(PAD_CROSS, true);
+    check((input.poll().buttons & PAD_CROSS) != 0);
+    check(InputManager::apply_deadzone(0.05f, 0.15f) == 0.0f);
+    check(InputManager::apply_deadzone(1.0f, 0.15f) == 1.0f);
+    input.set_triggers(0.9f, 0.0f);
+    check((input.poll().buttons & PAD_L2) != 0);
+    check(boot_mem.map(0x600000, 64, read | write) == MemoryError::ok);
+    check(input.write_hle_pad_data(boot_mem, 0x600000) == MemoryError::ok);
+
+    // S9: Virtual File System & Path Sanitization (6 checks)
+    check(VirtualFileSystem::normalize_path("/app0\\sub//") == "/app0/sub");
+    check(VirtualFileSystem::contains_traversal("/app0/../hack"));
+    check(!VirtualFileSystem::contains_traversal("/app0/data/file.bin"));
+    check(VirtualFileSystem::compute_crc32("123456789", 9) == 0xCBF43926u);
+    VirtualFileSystem vfs;
+    check(vfs.mount("/app0", ".", true));
+    std::string resolved;
+    bool ro = false;
+    check(vfs.resolve("/app0/file", resolved, ro) == VfsError::ok && ro);
+
+    // S9: Audio HLE & Ring Buffer (6 checks)
+    AudioRingBuffer ring(32, 2);
+    std::int16_t smp[4] = {1, 2, 3, 4};
+    check(ring.write(smp, 2) == 2);
+    std::int16_t out_smp[4] = {0};
+    check(ring.read(out_smp, 2) == 2 && out_smp[0] == 1);
+    check(ring.read(out_smp, 10) == 0); // Underflow intencional
+    check(ring.get_stats().underflow_count >= 1);
+    AudioManager audio;
+    check(audio.init({48000, 2, 64}));
+    audio.set_master_volume(0.5f);
+    check(audio.get_master_volume() == 0.5f);
+    auto sine = audio.generate_sine_wave(440.0f, 0.01f);
+    check(!sine.empty());
+
+    // S9: Stability & Frame Pacing percentiles (5 checks)
+    std::vector<double> perc_vals = {10.0, 20.0, 30.0, 40.0, 50.0};
+    check(FramePacingTracker::calculate_percentile(perc_vals, 50.0) == 30.0);
+    FramePacingTracker tracker(30);
+    tracker.record_frame_ms(33.33);
+    check(tracker.get_stats().total_frames == 1);
+    check(tracker.get_stats().p50_ms == 33.33);
+    MemoryMonitor mem_mon;
+    check(mem_mon.get_budget_bytes() > 0);
+    bool trim_called = false;
+    mem_mon.register_trim_callback([&trim_called]() { trim_called = true; });
+    mem_mon.trigger_low_memory_warning();
+    check(trim_called);
+
+    // S9: Engine Coordinator & Save Integrity (7 checks)
+    std::filesystem::path sbox = std::filesystem::current_path() / "smoke_s9_box";
+    std::filesystem::path sapp = sbox / "app";
+    std::filesystem::path ssave = sbox / "save";
+    std::error_code sec;
+    std::filesystem::create_directories(sapp, sec);
+    std::filesystem::create_directories(ssave, sec);
+
+    EngineConfig eng_cfg{};
+    eng_cfg.app0_dir = sapp.string();
+    eng_cfg.savedata_dir = ssave.string();
+    EngineCoordinator engine(eng_cfg);
+    check(engine.initialize());
+    auto f_res = engine.tick(33.33);
+    check(f_res.frame_index == 1);
+    check(f_res.frame_time_ms == 33.33);
+    std::uint32_t save_val = 0x12345678;
+    check(engine.save_game_state("smoke_slot", &save_val, sizeof(save_val)));
+    std::vector<std::uint8_t> load_val;
+    check(engine.load_game_state("smoke_slot", load_val));
+    check(load_val.size() == sizeof(save_val) && *reinterpret_cast<std::uint32_t*>(load_val.data()) == 0x12345678);
+    engine.shutdown();
+    check(!engine.is_initialized());
+    std::filesystem::remove_all(sbox, sec);
 
     // Cleanup
     check(memory.unmap(0x500000) == MemoryError::ok);
