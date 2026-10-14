@@ -48,10 +48,14 @@ Pm4Status GnmPm4::buffer(std::uint64_t a, std::uint32_t n, std::uint32_t depth) 
         if (type == 0) {
             const auto base = h & 0xffff;
             if (base >= context_.size() || count > context_.size() - base) return Pm4Status::invalid;
-            for (std::uint32_t i = 0; i < count; ++i)
+            for (std::uint32_t i = 0; i < count; ++i) {
                 if (!word(body + std::uint64_t(i) * 4, context_[base + i])) return Pm4Status::unmapped;
+                sink_.on_context_reg(base + i, context_[base + i]);
+            }
         } else if (type == 3) {
-            const auto result = packet((h >> 8) & 255, (h & 2) != 0, body, count, depth);
+            const auto op = (h >> 8) & 255;
+            const auto compute = (h & 2) != 0;
+            const auto result = packet(op, compute, body, count, depth);
             if (result != Pm4Status::ok) return result;
         }
         pos += count + 1;
@@ -67,7 +71,18 @@ Pm4Status GnmPm4::packet(std::uint32_t op, bool compute, std::uint64_t body,
                      op == 0x68 ? uconfig_ : compute ? shader_compute_ : shader_graphics_;
         const auto offset = get(0) & 0xffff;
         if (offset >= regs.size() || count - 1 > regs.size() - offset) return Pm4Status::invalid;
-        for (std::uint32_t i = 1; i < count; ++i) regs[offset + i - 1] = get(i);
+        for (std::uint32_t i = 1; i < count; ++i) {
+            const auto val = get(i);
+            const auto reg_idx = offset + i - 1;
+            regs[reg_idx] = val;
+            if (op == 0x69) {
+                sink_.on_context_reg(reg_idx, val);
+            } else if (op == 0x76) {
+                sink_.on_sh_reg(reg_idx, val, compute);
+            } else {
+                sink_.on_uconfig_reg(reg_idx, val);
+            }
+        }
         return Pm4Status::ok;
     }
     if (op == 0x3f || op == 0x33) {

@@ -13,13 +13,16 @@ struct Pm4Event {
     Pm4Kind kind;
     std::uint32_t opcode = 0;
     std::uint64_t address = 0;
-    std::array<std::uint32_t, 4> args{};
+    std::array<std::uint32_t, 8> args{};
     std::uint32_t words = 0; // payload original, não copiado para o host
 };
 class Pm4Sink {
 public:
     virtual ~Pm4Sink() = default;
     virtual void on_pm4_event(const Pm4Event& event) = 0;
+    virtual void on_context_reg(std::uint32_t /*offset*/, std::uint32_t /*value*/) {}
+    virtual void on_sh_reg(std::uint32_t /*offset*/, std::uint32_t /*value*/, bool /*compute*/) {}
+    virtual void on_uconfig_reg(std::uint32_t /*offset*/, std::uint32_t /*value*/) {}
 };
 struct Pm4Limits {
     std::uint32_t max_words = 1'048'576; // soma de todos os IBs
