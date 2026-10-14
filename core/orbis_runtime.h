@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace bb {
 // NID textual Orbis (11 caracteres base64, sem padding). Implementação local
@@ -24,7 +25,13 @@ private:
     GuestMemory& mem_;
     std::unordered_map<std::string, std::string> names_;
     std::map<std::uint64_t, std::uint64_t> physical_, mappings_, heap_;
+    std::map<std::uint64_t, std::uint64_t> direct_mappings_; // virtual -> physical offset
     std::unordered_map<std::uint64_t, unsigned> mutexes_, attrs_;
+    std::unordered_map<std::uint64_t, unsigned> conds_;
+    std::unordered_map<std::uint64_t, std::uint64_t> keys_, key_values_;
+    std::unordered_map<std::uint64_t, std::uint64_t> event_flags_;
+    std::unordered_map<std::uint64_t, bool> guards_;
+    std::vector<std::uint64_t> exit_callbacks_;
     std::unordered_map<std::uint64_t, int> rwlocks_; // positivo: leitores, -1: escritor
     std::uint64_t next_virtual_ = 0x1000000000ULL, next_heap_ = 0x2000000000ULL;
     std::uint64_t next_handle_ = 0x10000, physical_used_ = 0;
