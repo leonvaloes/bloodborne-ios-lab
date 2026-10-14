@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <vector>
 #include <mutex>
+#include <memory>
 #include "guest_memory.h"
 
 namespace bb {
@@ -47,9 +48,12 @@ private:
     AudioStats stats_{};
 };
 
+class Atrac9Decoder;
+
 class AudioManager {
 public:
     AudioManager();
+    ~AudioManager();
 
     bool init(const AudioConfig &config = AudioConfig{});
     void shutdown();
@@ -66,6 +70,13 @@ public:
     // HLE: Submete áudio a partir da memória do guest
     MemoryError submit_hle_audio(const GuestMemory &mem, std::uint64_t guest_addr, std::size_t frames);
 
+    // ATRAC9 Decoding & Stream Submission
+    bool init_atrac9(const std::uint8_t config[4]);
+    std::size_t submit_atrac9(const std::uint8_t *stream, std::size_t size);
+    MemoryError submit_hle_atrac9(const GuestMemory &mem, std::uint64_t guest_addr, std::size_t size, const std::uint8_t config[4] = nullptr);
+    bool has_atrac9_decoder() const;
+    Atrac9Decoder *atrac9_decoder();
+
     // Gerador de onda senoidal de teste para calibração
     std::vector<std::int16_t> generate_sine_wave(float freq_hz, float duration_s, float amplitude = 0.5f);
 
@@ -77,6 +88,7 @@ private:
     float master_volume_{1.0f};
     bool muted_{false};
     mutable std::mutex config_mutex_;
+    std::unique_ptr<Atrac9Decoder> atrac9_decoder_;
 };
 
 } // namespace bb

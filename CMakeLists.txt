@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.24)
-project(BloodborneIOSLab VERSION 0.1.0 LANGUAGES CXX)
+project(BloodborneIOSLab VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -56,16 +56,41 @@ else()
     endforeach()
 endif()
 
+set(LIBATRAC9_SOURCES
+    third_party/LibAtrac9/src/band_extension.c
+    third_party/LibAtrac9/src/bit_allocation.c
+    third_party/LibAtrac9/src/bit_reader.c
+    third_party/LibAtrac9/src/decinit.c
+    third_party/LibAtrac9/src/decoder.c
+    third_party/LibAtrac9/src/huffCodes.c
+    third_party/LibAtrac9/src/imdct.c
+    third_party/LibAtrac9/src/libatrac9.c
+    third_party/LibAtrac9/src/quantization.c
+    third_party/LibAtrac9/src/scale_factors.c
+    third_party/LibAtrac9/src/tables.c
+    third_party/LibAtrac9/src/unpack.c
+    third_party/LibAtrac9/src/utility.c)
+add_library(bb_atrac9 STATIC ${LIBATRAC9_SOURCES})
+target_include_directories(bb_atrac9 PUBLIC third_party/LibAtrac9/src)
+set_target_properties(bb_atrac9 PROPERTIES C_STANDARD 99)
+if(MSVC)
+    target_compile_options(bb_atrac9 PRIVATE /w)
+else()
+    target_compile_options(bb_atrac9 PRIVATE -w)
+endif()
+
 set(CORE_SOURCES
     core/guest_memory.cpp
     core/smoke.cpp
     core/dispatcher.cpp
     core/hle.cpp
+    core/kernel_threads.cpp
     core/manifest.cpp
     core/elf_parser.cpp
     core/guest_loader.cpp
     core/input.cpp
     core/vfs.cpp
+    core/atrac9_decoder.cpp
     core/audio.cpp
     core/stability.cpp
     core/engine_loop.cpp)
@@ -74,9 +99,9 @@ foreach(name ${ALL_FIXTURES})
 endforeach()
 
 add_library(bb_core STATIC ${CORE_SOURCES})
-target_include_directories(bb_core PUBLIC core)
+target_include_directories(bb_core PUBLIC core third_party/LibAtrac9/src)
 find_package(Threads REQUIRED)
-target_link_libraries(bb_core PUBLIC Threads::Threads)
+target_link_libraries(bb_core PUBLIC Threads::Threads bb_atrac9)
 if(WIN32)
     target_link_libraries(bb_core PUBLIC psapi)
 endif()

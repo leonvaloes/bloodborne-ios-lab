@@ -1,4 +1,5 @@
 ﻿#include "audio.h"
+#include "atrac9_decoder.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -97,6 +98,51 @@ std::size_t AudioRingBuffer::read(std::int16_t *out_frames, std::size_t count) {
 
 AudioManager::AudioManager()
     : ring_buffer_(4096, 2) {}
+
+AudioManager::~AudioManager() = default;
+
+bool AudioManager::init_atrac9(const std::uint8_t config[4]) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    atrac9_decoder_ = std::make_unique<Atrac9Decoder>();
+    return atrac9_decoder_->init(config);
+}
+
+bool AudioManager::has_atrac9_decoder() const {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    return atrac9_decoder_ && atrac9_decoder_->is_initialized();
+}
+
+Atrac9Decoder *AudioManager::atrac9_decoder() {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    return atrac9_decoder_.get();
+}
+
+std::size_t AudioManager::submit_atrac9(const std::uint8_t *stream, std::size_t size) {
+    if (!stream || size == 0) return 0;
+    std::vector<std::int16_t> stereo_pcm;
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        if (!atrac9_decoder_ || !atrac9_decoder_->is_initialized()) {
+            return 0;
+        }
+        atrac9_decoder_->decode_stream_to_stereo_48k(stream, size, stereo_pcm);
+    }
+    if (stereo_pcm.empty()) return 0;
+    return submit_pcm16(stereo_pcm.data(), stereo_pcm.size() / 2);
+}
+
+MemoryError AudioManager::submit_hle_atrac9(const GuestMemory &mem, std::uint64_t guest_addr, std::size_t size, const std::uint8_t config[4]) {
+    if (size == 0) return MemoryError::invalid;
+    if (config) {
+        init_atrac9(config);
+    }
+    std::vector<std::uint8_t> at9_buf(size);
+    MemoryError err = mem.load(guest_addr, at9_buf.data(), size);
+    if (err != MemoryError::ok) return err;
+
+    submit_atrac9(at9_buf.data(), size);
+    return MemoryError::ok;
+}
 
 bool AudioManager::init(const AudioConfig &config) {
     std::lock_guard<std::mutex> lock(config_mutex_);

@@ -109,3 +109,36 @@ As 3 falhas pontuais ocorridas no iPhone no build `bd7bc24` foram identificadas 
 - **Suite de 18 Testes Host:** 18/18 testes unitários e de integração executados e aprovados com 100% de sucesso localmente e na matriz de CI (Windows MinGW/MSVC, Linux Clang, macOS Clang).
 - **Pipeline de IPA (GitHub Actions):** Compilação cruzada para iOS arm64 (`Apple A17 Pro`) e empacotamento do arquivo `BBHost-unsigned.ipa` mantidos 100% verdes no workflow `iOS unsigned laboratory`.
 
+---
+
+## 5. Entregas da Sprint 4 pelo Terminal 4 (Agente 4 — branch `feature/hle-audio-threads`)
+
+### 5.1 Primitivas de Multithreading do Orbis OS sobre Pthreads (Atividade 4.1)
+- **Módulo Central:** `core/kernel_threads.h` e `core/kernel_threads.cpp`.
+- **Semáforos Contados do Orbis OS (`OrbisSemaphore`):**
+  - Implementação completa com IDs de 32 bits, contagem inicial e máxima, atributos FIFO/Prioridade.
+  - Operações de espera com timeout em microsegundos (`wait_sema`), aquisição imediata (`poll_sema`), sinalização em lote (`signal_sema`), cancelamento com código `0x80020055` (`ECANCELED`) e exclusão atômica (`delete_sema`).
+- **Mutexes Leves do Orbis OS (`OrbisLwMutex`):**
+  - Mutexes leves com fast-path atômico sem contenção no espaço do usuário e fallback seguro para variáveis de condição pthreads.
+  - Suporte a reentrância recursiva (`SCE_KERNEL_LW_MUTEX_ATTR_RECURSIVE`) e estrutura de memória guest `SceKernelLwMutexWork` para integração direta com código do jogo.
+- **Mutexes e Variáveis de Condição Pthread (`OrbisPthreadMutex`, `OrbisPthreadCond`):**
+  - Suporte completo aos modos normal, recursivo e verificação de erro.
+  - Implementação de `pthread_cond_wait`, `pthread_cond_timedwait`, `pthread_cond_signal` e `pthread_cond_broadcast`.
+- **Gerenciador Central de Sincronização (`KernelSyncManager`):**
+  - Registro thread-safe unificado e controle estrito de ciclo de vida sem vazamentos de memória ou travamentos.
+- **Integração HLE com Despachante NID (`core/hle.cpp`):**
+  - Mapeamento e exportação de NIDs para todas as primitivas de semáforos (0x2010 a 0x2015), mutexes leves (0x2020 a 0x2024) e mutexes/condvars pthread (0x2030 a 0x2044).
+- **Validação de Testes:** Suíte `tests/test_threads.cpp` e `tests/test_hle.cpp` expandidas e validadas com 8 threads concorrentes sob contenção intensa (100% aprovadas).
+
+### 5.2 Decodificação de Áudio ATRAC9 com LibAtrac9 para Ring Buffer Estéreo de 48.000 Hz (Atividade 4.2)
+- **Integração de Terceiros:** Biblioteca `LibAtrac9` (C99, licença MIT de Alex Barney) incorporada em `third_party/LibAtrac9/`, compilada como biblioteca estática `bb_atrac9` com flags limpas e sem avisos de compilação.
+- **Decodificador de Alto Nível (`core/atrac9_decoder.h/.cpp`):**
+  - Classe `Atrac9Decoder` encapsulando decodificação de superframes/frames ATRAC9 em amostras PCM16 intercaladas.
+  - Suporte a inicialização via bytes de configuração (4 bytes) e cabeçalhos de contêineres de áudio RIFF WAVE (chunk `fmt `).
+  - Conversão inteligente de canais: mono para estéreo (duplicação) e downmix surround 5.1/7.1 com coeficientes ITU padronizados.
+  - Reamostragem linear contínua para a taxa de amostragem canônica de **48.000 Hz**.
+- **Acoplamento com AudioManager e Ring Buffer Circular:**
+  - Método `decode_to_ring_buffer` que alimenta diretamente o `AudioRingBuffer` estéreo de 48.000 Hz.
+  - Métodos `AudioManager::submit_atrac9` e `AudioManager::submit_hle_atrac9` a partir da memória física/guest.
+- **Validação de Testes:** Teste unitário e de integração em `tests/test_audio.cpp` cobrindo configuração, extração de metadados, inicialização via RIFF, injeção no ring buffer e submissão HLE (100% aprovado).
+
