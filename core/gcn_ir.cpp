@@ -1,4 +1,5 @@
 #include "gcn_ir.h"
+#include "gcn_msl.h"
 
 #include <algorithm>
 #include <map>
@@ -30,7 +31,7 @@ void classify(const Instruction& i, Node& n) {
         } else if (i.opcode == 12) { n.operation = Operation::Wait; n.effect = Effect::Barrier; }
         break;
     case Format::SOP1: case Format::VOP1:
-        if ((i.format == Format::SOP1 && i.opcode == 0) ||
+        if ((i.format == Format::SOP1 && i.opcode == 3) ||
             (i.format == Format::VOP1 && i.opcode == 1)) {
             n.operation = Operation::Move; n.effect = Effect::Pure;
         }
@@ -39,7 +40,10 @@ void classify(const Instruction& i, Node& n) {
         if (i.opcode == 0) { n.operation = Operation::Add; n.effect = Effect::Pure; }
         break;
     case Format::VOP2:
-        // Floating-point VOP2 semantics and modifiers need separate verification.
+        if (i.opcode == 3 || i.opcode == 8) {
+            n.operation = i.opcode == 3 ? Operation::FloatAdd : Operation::FloatMultiply;
+            n.effect = Effect::Pure;
+        }
         break;
     case Format::SMRD: n.operation = Operation::Load; n.effect = Effect::ReadMemory; break;
     case Format::DS: case Format::MUBUF: case Format::MTBUF:
@@ -92,8 +96,12 @@ ProgramIR lower(const Program& decoded, size_t max_nodes) {
     for (const auto& i : decoded.instructions) {
         auto it = blocks.find(i.word_offset);
         if (it != blocks.end()) { current = it->second; versions.clear(); }
-        Node n; n.word_offset = i.word_offset;
+        Node n; n.word_offset = i.word_offset; n.format = i.format; n.opcode = i.opcode;
         classify(i, n);
+        if (i.format == Format::SOP1 && (i.opcode == 32 || i.opcode == 33 || i.opcode == 34)) {
+            n.diagnostic = location(i, "indirect branch unsupported");
+            ir.diagnostics.push_back(n.diagnostic);
+        }
         n.async_memory_hazard = n.effect == Effect::ReadMemory || n.effect == Effect::Texture ||
                                 n.effect == Effect::Atomic;
         n.ordering_barrier = n.effect == Effect::Barrier;
@@ -133,8 +141,6 @@ ProgramIR lower(const Program& decoded, size_t max_nodes) {
     return ir;
 }
 MslResult emit_msl(const ProgramIR& ir, bool vertex) {
-    (void)vertex;
-    if (!ir.complete) return {"", "IR has diagnostics"};
-    return {"", "MSL unavailable: register types, stage IO and export routing are not inferred"};
+    return translate_msl(ir, vertex);
 }
 } // namespace bb::gcn

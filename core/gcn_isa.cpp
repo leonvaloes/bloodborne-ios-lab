@@ -36,11 +36,11 @@ Format format(uint32_t w) {
 // A listed opcode only validates the opcode slot, not its full semantics.
 bool known(Format f, uint32_t op) {
     switch (f) {
-    case Format::SOP1: return op <= 7 || (op >= 32 && op <= 39);
+    case Format::SOP1: return op <= 53;
     case Format::SOP2: return op <= 44;
     case Format::SOPK: return op <= 21;
     case Format::SOPC: return op <= 15;
-    case Format::SOPP: return op <= 12 || (op >= 16 && op <= 26);
+    case Format::SOPP: return op <= 26 && op != 3;
     case Format::SMRD: return op <= 4 || (op >= 8 && op <= 12);
     case Format::VOP1: return op <= 17 || (op >= 32 && op <= 69);
     case Format::VOP2: return op <= 36;
@@ -61,6 +61,9 @@ bool valid_fields(const Instruction& i) {
         if (i.destinations[n].kind == OperandKind::Special && i.format != Format::VOPC)
             return false;
     if (i.format == Format::SMRD && i.sources[1].kind == OperandKind::Special) return false;
+    // A single trailing dword cannot stand for two independent literal operands.
+    if (i.format == Format::SOP2 && i.sources[0].kind == OperandKind::Literal &&
+        i.sources[1].kind == OperandKind::Literal) return false;
     // VOP3 src modifiers are not yet modelled. Refuse them rather than dropping bits.
     if (i.format == Format::VOP3 && ((i.raw[0] & 0x0000ff00u) != 0 ||
                                       (i.raw[1] & 0xf8000000u) != 0)) return false;

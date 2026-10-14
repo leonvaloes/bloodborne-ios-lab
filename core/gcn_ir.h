@@ -9,13 +9,15 @@
 namespace bb::gcn {
 // Static, bounded analysis. SSA versions are local to straight-line blocks; no phi nodes.
 enum class Effect { Pure, Control, ReadMemory, WriteMemory, Atomic, Texture, Export, Barrier, Unknown };
-enum class Operation { Unsupported, Move, Add, Multiply, Load, Store, Atomic, Sample, Export, Branch, End, Wait };
+enum class Operation { Unsupported, Move, Add, Multiply, FloatAdd, FloatMultiply, Load, Store, Atomic, Sample, Export, Branch, End, Wait };
 struct Value {
     Operand operand{};
     uint32_t version = 0; // zero denotes live-in or non-register value
 };
 struct Node {
     size_t word_offset = 0;
+    Format format = Format::Unknown;
+    uint32_t opcode = 0;
     Operation operation = Operation::Unsupported;
     Effect effect = Effect::Unknown;
     std::vector<Value> sources;

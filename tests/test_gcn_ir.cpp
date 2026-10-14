@@ -43,8 +43,9 @@ int main() { return run([] {
     const uint32_t simple[] = {0x80010000u, 0xbf810000u};
     ir = lower(decode(simple, 2));
     CHECK(ir.complete);
-    CHECK(emit_msl(ir, true).text.empty());
-    CHECK(emit_msl(ir, false).error.find("stage IO") != std::string::npos);
+    const auto msl_res = emit_msl(ir, true);
+    CHECK(!msl_res.text.empty());
+    CHECK(msl_res.error.empty());
     const uint32_t invalid[] = {0xbe800000u | (1u << 8) | (127u << 16)};
     CHECK(decode(invalid, 1).instructions[0].diagnostic == Diagnostic::InvalidField);
     });

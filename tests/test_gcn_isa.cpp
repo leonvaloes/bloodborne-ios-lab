@@ -69,5 +69,17 @@ int main() {
     CHECK(p.instructions[2].diagnostic == Diagnostic::UnsupportedExtension);
     CHECK(p.instructions[2].word_count == 2);
     CHECK(decode(nullptr, 4).instructions.empty());
+    // SOP1 S_MOV_B32 (op 3)
+    const uint32_t sop1_mov[] = {0xbe800000u | (3u << 8) | (5u << 16) | 4u};
+    const auto r_sop1 = decode(sop1_mov, 1);
+    CHECK(r_sop1.instructions.size() == 1);
+    CHECK(r_sop1.instructions[0].format == Format::SOP1);
+    CHECK(r_sop1.instructions[0].opcode == 3);
+    CHECK(r_sop1.instructions[0].diagnostic == Diagnostic::None);
+
+    // SOP2 with two literals rejected
+    const uint32_t two_lits[] = {0x80000000u | (255u << 8) | 255u, 0x12345678u};
+    CHECK(decode(two_lits, 2).instructions[0].diagnostic == Diagnostic::InvalidField);
+
     return 0;
 }
