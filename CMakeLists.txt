@@ -87,6 +87,7 @@ set(CORE_SOURCES
     core/smoke.cpp
     core/dispatcher.cpp
     core/hle.cpp
+    core/orbis_runtime.cpp
     core/kernel_threads.cpp
     core/manifest.cpp
     core/elf_parser.cpp
@@ -144,6 +145,9 @@ else()
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
         endforeach()
+        add_executable(test_orbis_runtime tests/test_orbis_runtime.cpp)
+        target_link_libraries(test_orbis_runtime PRIVATE bb_core)
+        add_test(NAME orbis_runtime COMMAND test_orbis_runtime)
         add_executable(test_dcx_probe tests/test_dcx_probe.cpp)
         target_link_libraries(test_dcx_probe PRIVATE bb_core)
         add_test(NAME dcx_probe COMMAND test_dcx_probe)

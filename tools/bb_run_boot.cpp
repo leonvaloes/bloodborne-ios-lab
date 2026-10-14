@@ -3,6 +3,7 @@
 // Uso local apenas: o boot.bin deriva de dados comerciais e nunca vai ao repositorio.
 #include "../core/guest_memory.h"
 #include "../core/x86_interp.h"
+#include "../core/orbis_runtime.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,7 +49,7 @@ int main(int argc, char** argv) {
     std::vector<Reloc> relocs(nr);
     for (auto& x : relocs) { x.target = r.u64(); x.kind = r.u64(); x.value = r.u64(); x.addend = static_cast<std::int64_t>(r.u64()); }
 
-    GuestMemory mem(static_cast<std::size_t>(size) + (64u << 20) + (ni + 1) * PAGE);
+    GuestMemory mem(static_cast<std::size_t>(3ULL << 30)); // teto lógico total, com alocação física sob demanda
     std::vector<std::uint8_t> image(size);
     r.f.read(reinterpret_cast<char*>(image.data()), static_cast<std::streamsize>(size));
     if (!r.f) { std::fprintf(stderr, "imagem truncada\n"); return 2; }
@@ -89,9 +90,11 @@ int main(int argc, char** argv) {
     std::printf("imagem=0x%llx bytes, entrada=0x%llx, imports=%llu, relocacoes=%llu\n",
                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(entry),
                 static_cast<unsigned long long>(ni), static_cast<unsigned long long>(nr));
-    // Modo "stub": cada import chamado e registrado e retorna 0 (nao e HLE real; serve para
-    // descobrir a ordem em que o jogo precisa de cada servico).
-    const bool stub_imports = argc > 3 && std::strcmp(argv[3], "--stub-imports") == 0;
+    if (argc > 3 && std::strcmp(argv[3], "--hle") != 0) {
+        std::fprintf(stderr, "opcao desconhecida: use --hle\n"); return 2;
+    }
+    const bool hle = argc > 3;
+    OrbisRuntime runtime(mem);
     std::uint64_t total_steps = 0, import_calls = 0;
     std::vector<std::uint64_t> call_counts(ni, 0);
     CpuRunResult res;
@@ -99,16 +102,19 @@ int main(int argc, char** argv) {
         res = cpu.run(max_steps - total_steps);
         total_steps += res.steps;
         const bool code_trap = res.stop == CpuStop::trap && res.rip >= CODE_TRAPS && res.rip < CODE_TRAPS + 32 * ni;
-        if (!(stub_imports && code_trap) || total_steps >= max_steps) break;
+        if (!(hle && code_trap) || total_steps >= max_steps) break;
         const std::uint64_t idx = (res.rip - CODE_TRAPS) / 32;
         if (call_counts[idx]++ == 0)
-            std::printf("[import #%llu apos %llu passos] %s\n", static_cast<unsigned long long>(import_calls),
-                        static_cast<unsigned long long>(total_steps), names[idx].c_str());
+            std::printf("[import #%llu apos %llu passos] %s -> %s\n", static_cast<unsigned long long>(import_calls),
+                        static_cast<unsigned long long>(total_steps), names[idx].c_str(), runtime.resolve(names[idx]).c_str());
         ++import_calls;
+        std::uint64_t value = 0;
+        try { value = runtime.invoke(names[idx], cpu.state); }
+        catch (const std::exception& e) { std::printf("HLE: %s\n", e.what()); break; }
         std::uint64_t back = 0;
         if (mem.load(cpu.state.gpr[4], &back, 8) != MemoryError::ok) break;
         cpu.state.gpr[4] += 8;
-        cpu.state.gpr[0] = 0;
+        cpu.state.gpr[0] = value;
         cpu.state.rip = back;
     }
     std::printf("parou: %s (passos totais=%llu, chamadas a imports=%llu)\n", res.describe().c_str(),
