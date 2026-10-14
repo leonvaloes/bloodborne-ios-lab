@@ -248,10 +248,13 @@ SmokeReport smoke() {
     check(trim_called);
 
     // S9: Engine Coordinator & Save Integrity (7 checks)
-    std::filesystem::path sbox = std::filesystem::current_path() / "smoke_s9_box";
+    std::error_code sec;
+    std::filesystem::path temp_base = std::filesystem::temp_directory_path(sec);
+    if (sec || temp_base.empty()) temp_base = "/tmp";
+    std::filesystem::path sbox = temp_base / "smoke_s9_box";
+    std::filesystem::remove_all(sbox, sec);
     std::filesystem::path sapp = sbox / "app";
     std::filesystem::path ssave = sbox / "save";
-    std::error_code sec;
     std::filesystem::create_directories(sapp, sec);
     std::filesystem::create_directories(ssave, sec);
 

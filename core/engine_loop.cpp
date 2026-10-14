@@ -1,4 +1,5 @@
-﻿#include "engine_loop.h"
+﻿#include <filesystem>
+#include "engine_loop.h"
 #include <cstring>
 #include <vector>
 
@@ -29,7 +30,10 @@ bool EngineCoordinator::initialize() {
     // Monta sistemas de arquivos vitais da sandbox
     vfs_.mount("/app0", config_.app0_dir, true);
     vfs_.mount("/user/home/savedata", config_.savedata_dir, false);
-    vfs_.mount("/temp", "./tmp", false);
+    std::error_code sec;
+    std::filesystem::path tmp_base = std::filesystem::temp_directory_path(sec);
+    if (sec || tmp_base.empty()) tmp_base = "./tmp";
+    vfs_.mount("/temp", tmp_base.string(), false);
 
     // Inicializa subsistema de áudio
     AudioConfig audio_cfg{};
