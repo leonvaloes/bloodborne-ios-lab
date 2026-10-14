@@ -2,6 +2,9 @@ param([ValidateSet('Debug','Release')][string]$Configuration = 'Debug')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $portable = Join-Path (Split-Path $root -Parent) '.tools/w64devkit/bin'
+if (-not (Test-Path (Join-Path $portable 'cmake.exe'))) {
+    $portable = Join-Path (Split-Path (Split-Path $root -Parent) -Parent) '.tools/w64devkit/bin'
+}
 if (Test-Path (Join-Path $portable 'cmake.exe')) {
     $env:PATH = "$portable;$env:PATH"
     $generator = 'MinGW Makefiles'
