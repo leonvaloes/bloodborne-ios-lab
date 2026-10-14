@@ -65,7 +65,7 @@ std::string orbis_nid(const std::string& symbol) {
 }
 OrbisRuntime::OrbisRuntime(GuestMemory& memory) : mem_(memory) {
     static const char* const symbols[] = {
-#include "orbis_import_names.inc"
+#include "orbis_import_names.h"
         "scePthreadMutexattrInit", "scePthreadMutexattrSettype", "scePthreadMutexattrDestroy",
         "scePthreadMutexInit", "scePthreadMutexLock", "scePthreadMutexUnlock", "scePthreadMutexDestroy",
         "scePthreadMutexTrylock", "sceKernelMmap", "sceKernelMunmap", "sceKernelVirtualQuery"
