@@ -21,6 +21,12 @@
 - CI macOS: compilador Apple Clang; se arm64, só vetores fixos, não oráculo x86.
 - iOS: o mesmo smoke de 14 verificações, compilado antecipadamente para arm64; Metal e exportação manual. Nenhum resultado de aparelho deve ser inferido dos jobs host.
 
+## Consolidação local em 14/10/2026
+
+No checkout de trabalho desta data, `tools/test-windows.ps1 -Configuration Release` compilou e executou **50/50 testes CTest**; o smoke host registrou 118 verificações, nenhuma falha e `game_execution=false`. Os novos testes `host_bridge` cobrem principalmente estados sem inicialização; `video_out_manager` usa pixels autorais para verificar leitura completa, limites de tamanho e ausência de frames fabricados. Os testes AVX adicionais são sintéticos. Estes resultados são **Windows host**, não build iOS desta revisão, instalação no iPhone, apresentação Metal de pixels do guest nem execução do motor no dispositivo.
+
+O alvo iOS `BBHost` em `host/ios/` continua independente do protótipo diagnóstico `bb-ios-lab` em `ios/`. O workflow `.github/workflows/ios.yml` pretende compilar e empacotar **BBHost sem assinatura**. O protótipo não carrega `Image0` nem executa código guest automaticamente; sua compilação iOS ainda precisa de verificação no runner. Relatórios anteriores de aparelho referem-se às revisões especificadas em `docs/milestones/` e não validam as mudanças atuais.
+
 ## Limitações
 
 AOT aqui significa decodificar um subconjunto fechado de bytes autorais e gerar fonte estática, depois compilá-la para a arquitetura alvo. As fixtures foram escritas manualmente como instruções, não extraídas do executável comercial. Não há descoberta de funções, relocations, jumps ou tradução de binários arbitrários. Não há benchmark de performance nem alegação de jogabilidade.

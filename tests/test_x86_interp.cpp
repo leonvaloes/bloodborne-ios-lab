@@ -1033,116 +1033,181 @@ int main() {
             CHECK(m6.cpu.state.xmm[0][0] == 11 && m6.cpu.state.xmm[0][1] == 22);
             CHECK(m6.cpu.state.ymm_hi[0][0] == 33 && m6.cpu.state.ymm_hi[0][1] == 44);
         }
-        {   // VPCMPGT family (pp=3, op=0x7C..0x7F: Q, W, D, B)
-            // Blocking instruction: c5 f3 7c c9 = vpcmpgtq xmm1, xmm1, xmm1
-            Machine m_blocking{0xC5, 0xF3, 0x7C, 0xC9, 0xC3};
-            m_blocking.cpu.state.xmm[1][0] = 0x123456789ABCDEF0ULL;
-            m_blocking.cpu.state.xmm[1][1] = 0x0FEDCBA987654321ULL;
-            m_blocking.cpu.state.ymm_hi[1][0] = ~0ULL;
-            m_blocking.cpu.state.ymm_hi[1][1] = ~0ULL;
-            CHECK(m_blocking.run().stop == CpuStop::trap);
-            CHECK(m_blocking.cpu.state.xmm[1][0] == 0);
-            CHECK(m_blocking.cpu.state.xmm[1][1] == 0);
-            CHECK(m_blocking.cpu.state.ymm_hi[1][0] == 0 && m_blocking.cpu.state.ymm_hi[1][1] == 0);
-            const std::uint8_t d_blocking[] = {0xC5, 0xF3, 0x7C, 0xC9};
-            CHECK(decode_x86(d_blocking, sizeof(d_blocking)).length == 4);
-            CHECK(decode_x86(d_blocking, sizeof(d_blocking)).supported);
+        {   // AVX move-high/low: aliasing, exact memory width and reserved forms.
+            Machine lh{0xC5, 0xF0, 0x16, 0xC1, 0xC3}; // vmovlhps xmm0, xmm1, xmm1
+            lh.cpu.state.xmm[1][0] = 0x11; lh.cpu.state.xmm[1][1] = 0x22;
+            CHECK(lh.run().stop == CpuStop::trap);
+            CHECK(lh.cpu.state.xmm[0][0] == 0x11 && lh.cpu.state.xmm[0][1] == 0x11);
+            Machine lh_alias{0xC5, 0xF8, 0x16, 0xC0, 0xC3}; // all operands xmm0
+            lh_alias.cpu.state.xmm[0][0] = 0x11; lh_alias.cpu.state.xmm[0][1] = 0x22;
+            CHECK(lh_alias.run().stop == CpuStop::trap);
+            CHECK(lh_alias.cpu.state.xmm[0][0] == 0x11 && lh_alias.cpu.state.xmm[0][1] == 0x11);
+            Machine hl{0xC5, 0xF0, 0x12, 0xC1, 0xC3}; // vmovhlps xmm0, xmm1, xmm1
+            hl.cpu.state.xmm[1][1] = 0x22;
+            CHECK(hl.run().stop == CpuStop::trap);
+            CHECK(hl.cpu.state.xmm[0][0] == 0x22 && hl.cpu.state.xmm[0][1] == 0x22);
+            Machine dup{0xC5, 0xFF, 0x12, 0xC0, 0xC3}; // vmovddup ymm0, ymm0
+            dup.cpu.state.xmm[0][0] = 1; dup.cpu.state.xmm[0][1] = 2;
+            dup.cpu.state.ymm_hi[0][0] = 3; dup.cpu.state.ymm_hi[0][1] = 4;
+            CHECK(dup.run().stop == CpuStop::trap);
+            CHECK(dup.cpu.state.xmm[0][0] == 1 && dup.cpu.state.xmm[0][1] == 1);
+            CHECK(dup.cpu.state.ymm_hi[0][0] == 3 && dup.cpu.state.ymm_hi[0][1] == 3);
+            Machine dup_mem{0xC5, 0xFB, 0x12, 0x03, 0xC3}; // vmovddup xmm0, m64 at page end
+            dup_mem.cpu.state.gpr[3] = DATA + 0xFF8;
+            const std::uint64_t value = 0x1122334455667788ULL;
+            CHECK(dup_mem.mem.store(DATA + 0xFF8, &value, 8) == MemoryError::ok);
+            CHECK(dup_mem.run().stop == CpuStop::trap);
+            CHECK(dup_mem.cpu.state.xmm[0][0] == value && dup_mem.cpu.state.xmm[0][1] == value);
+            Machine low_mem{0xC5, 0xF0, 0x12, 0x03, 0xC3}; // vmovlps xmm0, xmm1, m64
+            low_mem.cpu.state.gpr[3] = DATA + 0xFF8;
+            low_mem.cpu.state.xmm[1][1] = 0x44;
+            CHECK(low_mem.mem.store(DATA + 0xFF8, &value, 8) == MemoryError::ok);
+            CHECK(low_mem.run().stop == CpuStop::trap);
+            CHECK(low_mem.cpu.state.xmm[0][0] == value && low_mem.cpu.state.xmm[0][1] == 0x44);
+            Machine bad{0xC5, 0xF9, 0x12, 0xC1}; // vmovlpd rejects register operand
+            CHECK(bad.run().stop == CpuStop::unsupported_opcode);
+            Machine bad_len{0xC5, 0xFC, 0x16, 0xC1}; // vmovlhps has no 256-bit form
+            CHECK(bad_len.run().stop == CpuStop::unsupported_opcode);
+            Machine bad_vvvv{0xC5, 0xF1, 0x13, 0x03}; // store requires reserved vvvv
+            CHECK(bad_vvvv.run().stop == CpuStop::unsupported_opcode);
+        }
+        {   // Horizontal AVX: source pairs grouped per 128-bit lane.
+            // c5 fb 7c c0 and c5 f3 7c c9 are VHADDPS, not VPCMPGTQ.
+            const std::uint8_t observed[] = {0xC5, 0xFB, 0x7C, 0xC0};
+            CHECK(decode_x86(observed, sizeof(observed)).supported);
+            Machine alias{0xC5, 0xF3, 0x7C, 0xC9, 0xC3};
+            const float a[4] = {1, 2, 10, 20};
+            const float alias_expected[4] = {3, 30, 3, 30};
+            std::memcpy(alias.cpu.state.xmm[1], a, 16);
+            alias.cpu.state.ymm_hi[1][0] = ~0ULL;
+            CHECK(alias.run().stop == CpuStop::trap);
+            CHECK(std::memcmp(alias.cpu.state.xmm[1], alias_expected, 16) == 0);
+            CHECK(alias.cpu.state.ymm_hi[1][0] == 0 && alias.cpu.state.ymm_hi[1][1] == 0);
 
-            // 128-bit VPCMPGTQ (0x7C): signed 64-bit comparison
-            // c5 f3 7c c2 = vpcmpgtq xmm0, xmm1, xmm2
-            Machine m_gtq128{0xC5, 0xF3, 0x7C, 0xC2, 0xC3};
-            m_gtq128.cpu.state.xmm[1][0] = static_cast<std::uint64_t>(100LL);
-            m_gtq128.cpu.state.xmm[1][1] = static_cast<std::uint64_t>(-50LL);
-            m_gtq128.cpu.state.xmm[2][0] = static_cast<std::uint64_t>(50LL);
-            m_gtq128.cpu.state.xmm[2][1] = static_cast<std::uint64_t>(0LL);
-            m_gtq128.cpu.state.ymm_hi[0][0] = ~0ULL;
-            CHECK(m_gtq128.run().stop == CpuStop::trap);
-            CHECK(m_gtq128.cpu.state.xmm[0][0] == ~0ULL); // 100 > 50 -> true
-            CHECK(m_gtq128.cpu.state.xmm[0][1] == 0ULL);  // -50 > 0 -> false
-            CHECK(m_gtq128.cpu.state.ymm_hi[0][0] == 0);
+            // 128-bit PS, destination aliases second source.
+            Machine ps{0xC5, 0xF3, 0x7D, 0xC2, 0xC3};
+            const float src1[4] = {20, 3, 40, 7}, src2[4] = {100, 11, 200, 13};
+            const float horizontal_ps_expected[4] = {17, 33, 89, 187};
+            std::memcpy(ps.cpu.state.xmm[1], src1, 16);
+            std::memcpy(ps.cpu.state.xmm[2], src2, 16);
+            CHECK(ps.run().stop == CpuStop::trap);
+            CHECK(std::memcmp(ps.cpu.state.xmm[0], horizontal_ps_expected, 16) == 0);
 
-            // 256-bit VPCMPGTQ (0x7C, L=1): 4 signed qwords
-            // c5 f7 7c c2 = vpcmpgtq ymm0, ymm1, ymm2
-            Machine m_gtq256{0xC5, 0xF7, 0x7C, 0xC2, 0xC3};
-            m_gtq256.cpu.state.xmm[1][0] = static_cast<std::uint64_t>(10LL);
-            m_gtq256.cpu.state.xmm[1][1] = static_cast<std::uint64_t>(-10LL);
-            m_gtq256.cpu.state.ymm_hi[1][0] = static_cast<std::uint64_t>(0LL);
-            m_gtq256.cpu.state.ymm_hi[1][1] = static_cast<std::uint64_t>(9223372036854775807LL);
-            m_gtq256.cpu.state.xmm[2][0] = static_cast<std::uint64_t>(5LL);
-            m_gtq256.cpu.state.xmm[2][1] = static_cast<std::uint64_t>(-5LL);
-            m_gtq256.cpu.state.ymm_hi[2][0] = static_cast<std::uint64_t>(0LL);
-            m_gtq256.cpu.state.ymm_hi[2][1] = static_cast<std::uint64_t>(-1LL);
-            CHECK(m_gtq256.run().stop == CpuStop::trap);
-            CHECK(m_gtq256.cpu.state.xmm[0][0] == ~0ULL); // 10 > 5 -> true
-            CHECK(m_gtq256.cpu.state.xmm[0][1] == 0ULL);  // -10 > -5 -> false
-            CHECK(m_gtq256.cpu.state.ymm_hi[0][0] == 0ULL); // 0 > 0 -> false
-            CHECK(m_gtq256.cpu.state.ymm_hi[0][1] == ~0ULL); // MAX > -1 -> true
+            // 256-bit PS with memory operand: independently grouped lanes.
+            Machine horizontal_ps_mem{0xC5, 0xF7, 0x7C, 0x03, 0xC3};
+            horizontal_ps_mem.cpu.state.gpr[3] = DATA;
+            const float mem[8] = {100, 1, 200, 2, 300, 3, 400, 4};
+            const float src[8] = {1, 2, 10, 20, 3, 4, 30, 40};
+            const float expected[8] = {3, 30, 101, 202, 7, 70, 303, 404};
+            CHECK(horizontal_ps_mem.mem.store(DATA, mem, sizeof(mem)) == MemoryError::ok);
+            std::memcpy(horizontal_ps_mem.cpu.state.xmm[1], src, 16);
+            std::memcpy(horizontal_ps_mem.cpu.state.ymm_hi[1], src + 4, 16);
+            CHECK(horizontal_ps_mem.run().stop == CpuStop::trap);
+            CHECK(std::memcmp(horizontal_ps_mem.cpu.state.xmm[0], expected, 16) == 0);
+            CHECK(std::memcmp(horizontal_ps_mem.cpu.state.ymm_hi[0], expected + 4, 16) == 0);
 
-            // 128-bit VPCMPGTD (0x7E): signed 32-bit comparison
-            // c5 f3 7e c2 = vpcmpgtd xmm0, xmm1, xmm2
-            Machine m_gtd{0xC5, 0xF3, 0x7E, 0xC2, 0xC3};
-            const std::int32_t d1[4] = {10, -5, 0, 100};
-            const std::int32_t d2[4] = {5, 0, 0, 50};
-            std::memcpy(m_gtd.cpu.state.xmm[1], d1, 16);
-            std::memcpy(m_gtd.cpu.state.xmm[2], d2, 16);
-            CHECK(m_gtd.run().stop == CpuStop::trap);
-            std::uint32_t out_d[4] = {};
-            std::memcpy(out_d, m_gtd.cpu.state.xmm[0], 16);
-            CHECK(out_d[0] == 0xFFFFFFFFU); // 10 > 5
-            CHECK(out_d[1] == 0);           // -5 > 0
-            CHECK(out_d[2] == 0);           // 0 > 0
-            CHECK(out_d[3] == 0xFFFFFFFFU); // 100 > 50
+            // 66 prefix selects PD; 128-bit register and 256-bit memory subtraction.
+            Machine pd{0xC5, 0xF1, 0x7C, 0xC2, 0xC3};
+            const double pd1[2] = {1, 3}, pd2[2] = {10, 20};
+            const double pd_expected[2] = {4, 30};
+            std::memcpy(pd.cpu.state.xmm[1], pd1, 16);
+            std::memcpy(pd.cpu.state.xmm[2], pd2, 16);
+            pd.cpu.state.ymm_hi[0][0] = ~0ULL;
+            CHECK(pd.run().stop == CpuStop::trap);
+            CHECK(std::memcmp(pd.cpu.state.xmm[0], pd_expected, 16) == 0);
+            CHECK(pd.cpu.state.ymm_hi[0][0] == 0 && pd.cpu.state.ymm_hi[0][1] == 0);
+            Machine pd_mem{0xC5, 0xF5, 0x7D, 0x03, 0xC3};
+            pd_mem.cpu.state.gpr[3] = DATA;
+            const double pdsrc[4] = {20, 3, 40, 7};
+            const double pdmem[4] = {100, 11, 200, 13};
+            const double pdout[4] = {17, 89, 33, 187};
+            CHECK(pd_mem.mem.store(DATA, pdmem, sizeof(pdmem)) == MemoryError::ok);
+            std::memcpy(pd_mem.cpu.state.xmm[1], pdsrc, 16);
+            std::memcpy(pd_mem.cpu.state.ymm_hi[1], pdsrc + 2, 16);
+            CHECK(pd_mem.run().stop == CpuStop::trap);
+            CHECK(std::memcmp(pd_mem.cpu.state.xmm[0], pdout, 16) == 0);
+            CHECK(std::memcmp(pd_mem.cpu.state.ymm_hi[0], pdout + 2, 16) == 0);
 
-            // 128-bit VPCMPGTW (0x7D): signed 16-bit comparison
-            // c5 f3 7d c2 = vpcmpgtw xmm0, xmm1, xmm2
-            Machine m_gtw{0xC5, 0xF3, 0x7D, 0xC2, 0xC3};
-            const std::int16_t w1[8] = {1, -1, 300, -300, 0, 5, 10, -10};
-            const std::int16_t w2[8] = {0, 0, 200, -200, 0, 10, 5, -20};
-            std::memcpy(m_gtw.cpu.state.xmm[1], w1, 16);
-            std::memcpy(m_gtw.cpu.state.xmm[2], w2, 16);
-            CHECK(m_gtw.run().stop == CpuStop::trap);
-            std::uint16_t out_w[8] = {};
-            std::memcpy(out_w, m_gtw.cpu.state.xmm[0], 16);
-            CHECK(out_w[0] == 0xFFFFU); // 1 > 0
-            CHECK(out_w[1] == 0);       // -1 > 0
-            CHECK(out_w[2] == 0xFFFFU); // 300 > 200
-            CHECK(out_w[3] == 0);       // -300 > -200
-            CHECK(out_w[4] == 0);       // 0 > 0
-            CHECK(out_w[5] == 0);       // 5 > 10
-            CHECK(out_w[6] == 0xFFFFU); // 10 > 5
-            CHECK(out_w[7] == 0xFFFFU); // -10 > -20
+            // No integer compare or PHADD exists in the 0F 7C..7F map.
+            const std::uint8_t invalid[][4] = {
+                {0xC5, 0xF2, 0x7C, 0xC0}, // F3 7C
+                {0xC5, 0xF3, 0x7F, 0xC0}, // F2 7F is not an integer compare
+                {0xC5, 0xF3, 0x7D, 0xC0}  // valid VHSUBPS, checked below
+            };
+            CHECK(!decode_x86(invalid[0], 4).supported);
+            CHECK(!decode_x86(invalid[1], 4).supported);
+            CHECK(decode_x86(invalid[2], 4).supported);
 
-            // 128-bit VPCMPGTB (0x7F): signed 8-bit comparison
-            // c5 f3 7f c2 = vpcmpgtb xmm0, xmm1, xmm2
-            Machine m_gtb{0xC5, 0xF3, 0x7F, 0xC2, 0xC3};
-            const std::int8_t b1[16] = {127, -128, 0, -1, 50, -50, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-            const std::int8_t b2[16] = {0, 127, 0, -2, 20, -20, 0, 2, 4, 3, 5, 7, 6, 8, 10, 9};
-            std::memcpy(m_gtb.cpu.state.xmm[1], b1, 16);
-            std::memcpy(m_gtb.cpu.state.xmm[2], b2, 16);
-            CHECK(m_gtb.run().stop == CpuStop::trap);
-            std::uint8_t out_b[16] = {};
-            std::memcpy(out_b, m_gtb.cpu.state.xmm[0], 16);
-            CHECK(out_b[0] == 0xFF); // 127 > 0
-            CHECK(out_b[1] == 0);    // -128 > 127
-            CHECK(out_b[2] == 0);    // 0 > 0
-            CHECK(out_b[3] == 0xFF); // -1 > -2
-            CHECK(out_b[4] == 0xFF); // 50 > 20
-            CHECK(out_b[5] == 0);    // -50 > -20
-            CHECK(out_b[6] == 0xFF); // 1 > 0
-            CHECK(out_b[7] == 0);    // 2 > 2
-            CHECK(out_b[8] == 0);    // 3 > 4
-            CHECK(out_b[9] == 0xFF); // 4 > 3
+            // VPSHUFD (0x70): vpshufd xmm0, xmm1, 0x1B (reverse dwords)
+            Machine m_vpshufd{0xC5, 0xF9, 0x70, 0xC1, 0x1B, 0xC3};
+            m_vpshufd.cpu.state.xmm[1][0] = 0x0000000200000001ULL;
+            m_vpshufd.cpu.state.xmm[1][1] = 0x0000000400000003ULL;
+            m_vpshufd.cpu.state.ymm_hi[0][0] = ~0ULL;
+            CHECK(m_vpshufd.run().stop == CpuStop::trap);
+            CHECK(m_vpshufd.cpu.state.xmm[0][0] == 0x0000000300000004ULL);
+            CHECK(m_vpshufd.cpu.state.xmm[0][1] == 0x0000000100000002ULL);
+            CHECK(m_vpshufd.cpu.state.ymm_hi[0][0] == 0ULL);
+            Machine shuf_alias{0xC5, 0xFD, 0x70, 0xC0, 0x1B, 0xC3}; // ymm0 aliases source
+            const std::uint32_t words[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            const std::uint32_t reversed[8] = {4, 3, 2, 1, 8, 7, 6, 5};
+            std::memcpy(shuf_alias.cpu.state.xmm[0], words, 16);
+            std::memcpy(shuf_alias.cpu.state.ymm_hi[0], words + 4, 16);
+            CHECK(shuf_alias.run().stop == CpuStop::trap);
+            CHECK(std::memcmp(shuf_alias.cpu.state.xmm[0], reversed, 16) == 0);
+            CHECK(std::memcmp(shuf_alias.cpu.state.ymm_hi[0], reversed + 4, 16) == 0);
+            Machine shuf_mem{0xC5, 0xF9, 0x70, 0x03, 0x1B, 0xC3}; // reads exactly m128
+            shuf_mem.cpu.state.gpr[3] = DATA + 0xFF0;
+            CHECK(shuf_mem.mem.store(DATA + 0xFF0, words, 16) == MemoryError::ok);
+            CHECK(shuf_mem.run().stop == CpuStop::trap);
+            CHECK(std::memcmp(shuf_mem.cpu.state.xmm[0], reversed, 16) == 0);
+            Machine shuf_reserved{0xC5, 0xF1, 0x70, 0xC0, 0x1B};
+            CHECK(shuf_reserved.run().stop == CpuStop::unsupported_opcode);
 
-            // VPCMPGTQ with memory operand: vpcmpgtq xmm0, xmm1, [rbx]
-            Machine m_gtq_mem{0xC5, 0xF3, 0x7C, 0x03, 0xC3};
-            m_gtq_mem.cpu.state.gpr[3] = DATA;
-            const std::int64_t mem_q[2] = {50, 100};
-            CHECK(m_gtq_mem.mem.store(DATA, mem_q, 16) == MemoryError::ok);
-            m_gtq_mem.cpu.state.xmm[1][0] = static_cast<std::uint64_t>(100LL);
-            m_gtq_mem.cpu.state.xmm[1][1] = static_cast<std::uint64_t>(50LL);
-            CHECK(m_gtq_mem.run().stop == CpuStop::trap);
-            CHECK(m_gtq_mem.cpu.state.xmm[0][0] == ~0ULL); // 100 > 50 -> true
-            CHECK(m_gtq_mem.cpu.state.xmm[0][1] == 0ULL);  // 50 > 100 -> false
+            // VSHUFPS (0xC6, pp=0): exact Bloodborne instruction:
+            // c5 d0 c6 ec f0 = vshufps xmm5, xmm5, xmm4, 0xf0
+            Machine m_vshufps{0xC5, 0xD0, 0xC6, 0xEC, 0xF0, 0xC3};
+            m_vshufps.cpu.state.xmm[5][0] = 0x0000002000000010ULL;
+            m_vshufps.cpu.state.xmm[5][1] = 0x0000004000000030ULL;
+            m_vshufps.cpu.state.xmm[4][0] = 0x0000006000000050ULL;
+            m_vshufps.cpu.state.xmm[4][1] = 0x0000008000000070ULL;
+            m_vshufps.cpu.state.ymm_hi[5][0] = ~0ULL;
+            CHECK(m_vshufps.run().stop == CpuStop::trap);
+            CHECK(m_vshufps.cpu.state.xmm[5][0] == 0x0000001000000010ULL); // dword 0 from src1, dword 0 from src1
+            CHECK(m_vshufps.cpu.state.xmm[5][1] == 0x0000008000000080ULL); // dword 3 from src2, dword 3 from src2
+            CHECK(m_vshufps.cpu.state.ymm_hi[5][0] == 0ULL);
+
+            // VSHUFPD (0xC6, pp=1): vshufpd xmm0, xmm1, xmm2, 0x01
+            Machine m_vshufpd{0xC5, 0xF1, 0xC6, 0xC2, 0x01, 0xC3};
+            m_vshufpd.cpu.state.xmm[1][0] = 100ULL;
+            m_vshufpd.cpu.state.xmm[1][1] = 200ULL;
+            m_vshufpd.cpu.state.xmm[2][0] = 300ULL;
+            m_vshufpd.cpu.state.xmm[2][1] = 400ULL;
+            CHECK(m_vshufpd.run().stop == CpuStop::trap);
+            CHECK(m_vshufpd.cpu.state.xmm[0][0] == 200ULL); // bit 0 = 1 -> xmm1[1]
+            CHECK(m_vshufpd.cpu.state.xmm[0][1] == 300ULL); // bit 1 = 0 -> xmm2[0]
+
+            // 256-bit VSHUFPS: each 128-bit lane selects independently; rm is memory.
+            Machine m_ps256{0xC5, 0xF4, 0xC6, 0x03, 0x4E, 0xC3};
+            m_ps256.cpu.state.gpr[3] = DATA;
+            const std::uint32_t ps_mem[8] = {10, 11, 12, 13, 20, 21, 22, 23};
+            const std::uint32_t ps_src[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            CHECK(m_ps256.mem.store(DATA, ps_mem, sizeof(ps_mem)) == MemoryError::ok);
+            std::memcpy(m_ps256.cpu.state.xmm[1], ps_src, 16);
+            std::memcpy(m_ps256.cpu.state.ymm_hi[1], ps_src + 4, 16);
+            CHECK(m_ps256.run().stop == CpuStop::trap);
+            const std::uint32_t ps_expected[8] = {3, 4, 10, 11, 7, 8, 20, 21};
+            CHECK(std::memcmp(m_ps256.cpu.state.xmm[0], ps_expected, 16) == 0);
+            CHECK(std::memcmp(m_ps256.cpu.state.ymm_hi[0], ps_expected + 4, 16) == 0);
+
+            // 256-bit VSHUFPD: immediate bits 2/3 select the upper lane.
+            Machine m_pd256{0xC5, 0xF5, 0xC6, 0xC2, 0x06, 0xC3};
+            m_pd256.cpu.state.xmm[1][0] = 1; m_pd256.cpu.state.xmm[1][1] = 2;
+            m_pd256.cpu.state.ymm_hi[1][0] = 3; m_pd256.cpu.state.ymm_hi[1][1] = 4;
+            m_pd256.cpu.state.xmm[2][0] = 10; m_pd256.cpu.state.xmm[2][1] = 20;
+            m_pd256.cpu.state.ymm_hi[2][0] = 30; m_pd256.cpu.state.ymm_hi[2][1] = 40;
+            CHECK(m_pd256.run().stop == CpuStop::trap);
+            CHECK(m_pd256.cpu.state.xmm[0][0] == 1 && m_pd256.cpu.state.xmm[0][1] == 20);
+            CHECK(m_pd256.cpu.state.ymm_hi[0][0] == 4 && m_pd256.cpu.state.ymm_hi[0][1] == 30);
         }
         {   // ud2
             Machine m{0x0F, 0x0B};

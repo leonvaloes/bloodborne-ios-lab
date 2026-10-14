@@ -34,14 +34,15 @@ int main(int argc, char** argv) {
     if (args.empty()) {
         for (int i = 0; i < argc; ++i) args.emplace_back(argv[i]);
     }
-    if (args.size()<2) { std::fprintf(stderr,"uso: bb-run-eboot Image0 [max_passos] [--libc] [--hle]\n"); return 2; }
+    if (args.size()<2) { std::fprintf(stderr,"uso: bb-run-eboot Image0 [max_passos] [--libc] [--hle] [--trace-hle]\n"); return 2; }
     try {
         std::uint64_t max_steps=50000000;
-        bool linked=false, hle=false, budget_set=false;
+        bool linked=false, hle=false, trace_hle=false, budget_set=false;
         for (std::size_t a=2;a<args.size();++a) {
             const std::string arg = args[a].string();
             if (arg=="--libc") linked=true;
             else if (arg=="--hle") hle=true;
+            else if (arg=="--trace-hle") trace_hle=true;
             else if (!budget_set && !arg.empty() && arg.find_first_not_of("0123456789")==std::string::npos) {
                 max_steps=std::strtoull(arg.c_str(),nullptr,10);budget_set=true;
             } else throw std::runtime_error("opcao desconhecida: "+arg);
@@ -89,8 +90,16 @@ int main(int argc, char** argv) {
                     break;
                 }
                 std::uint64_t value=0;
-                try { value=runtime.invoke(imp.name,cpu.state); }
-                catch (const std::exception& e) { std::printf("HLE: %s (import: %s)\n",e.what(), imp.name.c_str()); break; }
+                try {
+                    value=runtime.invoke(imp.name,cpu.state);
+                    if (trace_hle) {
+                        std::printf("HLE: %s (%s) -> 0x%llx\n", imp.name.c_str(), runtime.resolve(imp.name).c_str(), (unsigned long long)value);
+                    }
+                }
+                catch (const std::exception& e) {
+                    std::printf("HLE: %s (import: %s - %s)\n", e.what(), imp.name.c_str(), runtime.resolve(imp.name).c_str());
+                    break;
+                }
                 std::uint64_t ret=0;
                 if (memory.load(cpu.state.gpr[4],&ret,8)!=bb::MemoryError::ok) {
                     std::printf("falha ao desempilhar retorno do trap\n");
@@ -113,7 +122,7 @@ int main(int argc, char** argv) {
         }
         bb::Ps4Bootstrap::game_entry(memory,cpu.state,image);
         execute();
-        std::printf("parou: %s\n",result.describe().c_str());
+        std::printf("parou: %s (total_steps=%llu)\n",result.describe().c_str(),static_cast<unsigned long long>(steps));
         std::printf("rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx\n",
                     (unsigned long long)cpu.state.gpr[0], (unsigned long long)cpu.state.gpr[3],
                     (unsigned long long)cpu.state.gpr[1], (unsigned long long)cpu.state.gpr[2]);
