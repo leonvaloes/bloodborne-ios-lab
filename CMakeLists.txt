@@ -106,7 +106,9 @@ set(CORE_SOURCES
     core/miniz_tinfl.c
     core/shader_translator.cpp
     core/metal_pipeline.cpp
-    core/flver_parser.cpp)
+    core/flver_parser.cpp
+    core/gnm_pm4.cpp
+    core/video_out.cpp)
 foreach(name ${ALL_FIXTURES})
     list(APPEND CORE_SOURCES "${generated_dir}/${name}.cpp")
 endforeach()
@@ -137,7 +139,7 @@ else()
     target_link_libraries(bb-run-boot PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe boot_probe audio stability engine shader_translator metal_pipeline flver_parser x86_interp)
+        foreach(name memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe boot_probe audio stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 video_out)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
@@ -152,6 +154,6 @@ else()
             "-DAOT=$<TARGET_FILE:bb-aot>" "-DSMOKE=$<TARGET_FILE:bb-smoke>"
             "-DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/add.hex"
             "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake")
-        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe dcx_probe audio stability engine shader_translator metal_pipeline flver_parser aot_rejection cli_integration PROPERTIES TIMEOUT 60)
+        set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input vfs binder game_asset_probe dcx_probe audio stability engine shader_translator metal_pipeline flver_parser gnm_pm4 video_out aot_rejection cli_integration PROPERTIES TIMEOUT 60)
     endif()
 endif()
