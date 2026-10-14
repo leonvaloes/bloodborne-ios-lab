@@ -403,7 +403,7 @@
     result[@"checked_at"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     _report[@"documents_test"] = result;
     _documentStatus.text = [NSString stringWithFormat:@"Documento teste-bblab.txt: %@ (%@ bytes). %@",
-        result[@"status"], result[@"size_bytes"] ?: @0,
+        result[@"status"], result[@"size_bytes"] ? result[@"size_bytes"] : @0,
         [result[@"valid"] boolValue] ? @"Texto UTF-8 registrado no relatorio." : @"Confira o arquivo em Documentos de BB Lab."];
 }
 
