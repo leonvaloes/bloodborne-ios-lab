@@ -359,18 +359,35 @@ VfsError VirtualFileSystem::read_at(const std::string &virtual_path, std::uint64
     const std::string norm = normalize_path(virtual_path);
     if (contains_traversal(norm)) return VfsError::traversal_detected;
 
-    // This API reads local files only, rather than silently falling back to a
-    // host file beneath an archive mount with the same virtual path.
+    // Archive mounts take precedence over host directories with the same path.
+    // Copy the reader under the lock, then perform potentially slow BDT I/O unlocked.
+    std::shared_ptr<Bhd5Reader> archive;
+    std::size_t mount_length = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto &pair : bhd5_mounts_) {
             const auto &m = pair.first;
-            if (norm == m || norm.rfind(m + "/", 0) == 0) return VfsError::access_denied;
+            if ((norm == m || norm.rfind(m + "/", 0) == 0) && m.size() >= mount_length) {
+                archive = pair.second;
+                mount_length = m.size();
+            }
         }
         for (const auto &pair : bnd4_mounts_) {
             const auto &m = pair.first;
-            if (norm == m || norm.rfind(m + "/", 0) == 0) return VfsError::access_denied;
+            if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                if (m.size() >= mount_length) return VfsError::access_denied;
+            }
         }
+    }
+    if (archive) {
+        if (norm.size() <= mount_length + 1) return VfsError::not_found;
+        const std::string relative = norm.substr(mount_length + 1);
+        if (!archive->has_file(relative)) return VfsError::not_found;
+        if (!bytes_to_read) return VfsError::ok;
+        const BinderError err = archive->stream_file(relative, offset, dest, bytes_to_read, out_bytes_read);
+        if (err == BinderError::ok) return VfsError::ok;
+        if (err == BinderError::file_not_found) return VfsError::not_found;
+        return VfsError::io_error;
     }
 
     std::string host_path;

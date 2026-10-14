@@ -344,6 +344,17 @@ int main() { return run([] {
         CHECK(vfs_data.size() == 200);
         CHECK(vfs_data[0] == 0);
         CHECK(vfs_data[199] == 199);
+        std::uint8_t small[12] = {};
+        std::size_t got = 0;
+        CHECK(vfs.read_at("/dvdroot/map/m10_00_00_00.msb", 30, small, sizeof(small), got) == VfsError::ok);
+        CHECK(got == sizeof(small) && small[0] == 30 && small[11] == 41);
+        CHECK(vfs.read_at("/dvdroot/map/m10_00_00_00.msb", 196, small, sizeof(small), got) == VfsError::ok);
+        CHECK(got == 4 && small[0] == 196 && small[3] == 199);
+        CHECK(vfs.read_at("/dvdroot/map/m10_00_00_00.msb", UINT64_MAX, small, sizeof(small), got) == VfsError::ok);
+        CHECK(got == 0);
+        CHECK(vfs.read_at("/dvdroot/map/m10_00_00_00.msb", 0, nullptr, 1, got) == VfsError::invalid_path);
+        CHECK(vfs.read_at("/dvdroot/unknown.bin", 0, small, sizeof(small), got) == VfsError::not_found);
+        CHECK(vfs.read_at("/dvdroot/../unknown.bin", 0, small, sizeof(small), got) == VfsError::traversal_detected);
 
         // Desmontagem
         CHECK(vfs.unmount("/dvdroot"));
