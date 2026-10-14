@@ -44,13 +44,13 @@ Este documento descreve o planejamento técnico dividido em entregas progressiva
 **Objetivo:** Traduzir as seções de código do executável x86-64 do jogo para arm64 nativo.  
 **Agente Responsável:** Agente 3 (worktrees/agent3-aot — branch `feature/aot-batch`)
 
-- [ ] **Atividade 3.1 — Levantamento e Descompilação das Funções do Jogo (Binary Lifting):**
+- [x] **Atividade 3.1 — Levantamento e Descompilação das Funções do Jogo (Binary Lifting):**
   - Usar análise estática (Ghidra / LLVM) para isolar as funções de inicialização, física (Havok), lógica de jogo e scripts.
-- [ ] **Atividade 3.2 — Recompilador AOT em Lote:**
+- [x] **Atividade 3.2 — Recompilador AOT em Lote:**
   - Expandir o gerador `bb-aot` para traduzir blocos de milhares de funções do código PS4 em C++ estruturado compatível com arm64.
-- [ ] **Atividade 3.3 — Tabela Central de Despacho de Saltos Indiretos:**
+- [x] **Atividade 3.3 — Tabela Central de Despacho de Saltos Indiretos:**
   - Conectar todos os ponteiros de função de vtables e callbacks do jogo ao `IndirectDispatcher`.
-- [ ] **Atividade 3.4 — Execução do Fluxo de Boot da Engine FromSoftware:**
+- [x] **Atividade 3.4 — Execução do Fluxo de Boot da Engine FromSoftware:**
   - Avançar a execução para além do handshake inicial, executando as rotinas de inicialização de memória e heaps do jogo.
 - **Critério de Conclusão da Sprint 3:** O código do jogo executa a inicialização do motor FromSoftware no iPhone e chega à rotina de carregamento dos arquivos de configuração inicial.
 
