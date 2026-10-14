@@ -24,6 +24,7 @@
     UILabel *_subsystemStatus;
     UILabel *_documentStatus;
     UILabel *_assetStatus;
+    UILabel *_dcxStatus;
     MTKView *_metal;
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
@@ -96,6 +97,13 @@
     [assetButton setTitle:@"Verificar param.sfo via VFS" forState:UIControlStateNormal];
     [assetButton addTarget:self action:@selector(checkGameAsset) forControlEvents:UIControlEventTouchUpInside];
 
+    _dcxStatus = [UILabel new];
+    _dcxStatus.numberOfLines = 0;
+    _dcxStatus.text = @"DCX: aguardando arquivo em Documents.";
+    UIButton *dcxButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [dcxButton setTitle:@"Verificar pequeno FLVER.DCX via VFS" forState:UIControlStateNormal];
+    [dcxButton addTarget:self action:@selector(checkDcx) forControlEvents:UIControlEventTouchUpInside];
+
     UIButton *run = [UIButton buttonWithType:UIButtonTypeSystem];
     [run setTitle:@"Executar testes completos (CPU, VFS, Áudio, Entrada)" forState:UIControlStateNormal];
     [run addTarget:self action:@selector(runTests) forControlEvents:UIControlEventTouchUpInside];
@@ -137,7 +145,7 @@
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
         title, scope, _status, run, _metal, _gpuStatus, _subsystemStatus,
-        documentButton, _documentStatus, assetButton, _assetStatus, dpadRow, actionsRow, exportButton]];
+        documentButton, _documentStatus, assetButton, _assetStatus, dcxButton, _dcxStatus, dpadRow, actionsRow, exportButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -449,6 +457,20 @@
         status, probe.size_bytes, probe.valid ? result[@"title_id"] : @"sem metadados"];
 }
 
+- (void)checkDcx {
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    const auto probe = bb::probe_dcx_in_documents(documents.path ? documents.path.UTF8String : "");
+    NSString *status = [NSString stringWithUTF8String:probe.status.c_str()];
+    _report[@"dcx_probe"] = @{@"path": @"/app0/m29_00_00_00_408010.flver.dcx",
+        @"status": status, @"valid": @(probe.valid),
+        @"size_bytes": @(probe.size_bytes), @"decoded_bytes": @(probe.decoded_bytes),
+        @"crc32": @(probe.crc32), @"decoded_crc32": @(probe.decoded_crc32),
+        @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]};
+    _dcxStatus.text = [NSString stringWithFormat:@"DCX via VFS: %@ (%llu -> %llu bytes).",
+        status, probe.size_bytes, probe.decoded_bytes];
+}
+
 - (void)drawInMTKView:(MTKView *)view {
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
     id<CAMetalDrawable> drawable = view.currentDrawable;
@@ -542,6 +564,7 @@
 - (void)exportReport:(UIButton *)sender {
     [self checkDocument];
     [self checkGameAsset];
+    [self checkDcx];
     _report[@"timestamp"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     auto pacing = _pacingTracker.get_stats();
     _report[@"frame_pacing_p50_ms"] = @(pacing.p50_ms);
