@@ -3,13 +3,14 @@ $ErrorActionPreference = 'Stop'
 function Test-AllowedPath([string]$Path) {
     if ($Path -match '(^|/)(game|dumps|secrets|upstream|bloodborne_portPC|local|out|build[^/]*)(/|$)') { return $false }
     if ($Path -in @('.gitignore','.gitattributes','CMakeLists.txt')) { return $true }
-    return $Path -match '\.(cpp|h|mm|md|json|csv|hex|yml|plist|ps1|cmake|txt)$'
+    if ($Path -match '^third_party/[^/]+/LICENSE$') { return $true }
+    return $Path -match '\.(c|cpp|h|mm|md|json|csv|hex|yml|plist|ps1|cmake|txt)$'
 }
 if ($SelfTest) {
-    foreach ($path in @('eboot.bin','game/readme.md','dump.prx','secret.p12','out/boot.hex','build/a.cpp','local/account.json')) {
+    foreach ($path in @('eboot.bin','game/readme.md','dump.prx','secret.p12','out/boot.hex','build/a.cpp','local/account.json','third_party/LibAtrac9/payload.bin','game/core/x.c')) {
         if (Test-AllowedPath $path) { throw "Should reject: $path" }
     }
-    foreach ($path in @('core/alu.h','tests/test_memory.cpp','.github/workflows/host.yml','fixtures/add.hex','docs/PROGRESS.md','CMakeLists.txt')) {
+    foreach ($path in @('core/alu.h','tests/test_memory.cpp','.github/workflows/host.yml','fixtures/add.hex','docs/PROGRESS.md','CMakeLists.txt','core/miniz.c','third_party/LibAtrac9/LICENSE','third_party/LibAtrac9/src/decoder.c')) {
         if (-not (Test-AllowedPath $path)) { throw "Should accept: $path" }
     }
     Write-Output 'Source path policy tests passed.'
