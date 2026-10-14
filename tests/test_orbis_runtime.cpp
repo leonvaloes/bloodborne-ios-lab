@@ -1,4 +1,6 @@
 #include "../core/orbis_runtime.h"
+#include "../core/vfs.h"
+#include <filesystem>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -146,6 +148,12 @@ int main() {
     assert(call("scePadClose", pad_h) == 0);
 
     // 2. libSceSaveData & libSceAudioOut
+    // Set up VFS and initialize SaveDataManager with it before HLE calls
+    VirtualFileSystem vfs;
+    std::string temp_dir = std::filesystem::temp_directory_path().string() + "/save_test_" + std::to_string(getpid());
+    assert(vfs.mount("/save", temp_dir));
+    rt.save_data_manager().initialize(std::filesystem::temp_directory_path().string() + "/save_data_test_" + std::to_string(getpid()), 32 * 1024 * 1024, &vfs);
+
     SceSaveDataInitParams save_params{};
     save_params.max_quota_per_slot = 32768;
     assert(m.store(0x5300, &save_params, sizeof(save_params)) == MemoryError::ok);
@@ -314,6 +322,12 @@ int main() {
         srt.attach_scheduler(sched);
         srt.set_procparam(0xfeedfaceULL);
         assert(srt.procparam() == 0xfeedfaceULL);
+
+        // Initialize VFS and SaveDataManager for save data tests
+        VirtualFileSystem vfs;
+        std::string temp_dir = std::filesystem::temp_directory_path().string() + "/save_test_" + std::to_string(getpid());
+        assert(vfs.mount("/save", temp_dir));
+        srt.save_data_manager().initialize(std::filesystem::temp_directory_path().string() + "/save_data_test_" + std::to_string(getpid()), 32 * 1024 * 1024, &vfs);
 
         constexpr std::uint64_t trap_base = 0x50000;
         constexpr std::uint64_t return_trap = 0x50f00;
