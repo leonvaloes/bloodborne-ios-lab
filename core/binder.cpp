@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <limits>
 
 namespace bb {
 
@@ -515,13 +516,18 @@ BinderError Bhd5Reader::stream_file(std::uint64_t hash, std::uint64_t offset_in_
     std::size_t available = static_cast<std::size_t>(entry->file_size - offset_in_file);
     std::size_t to_read = std::min(bytes_to_read, available);
     if (to_read == 0) return BinderError::ok;
+    if (!dest || entry->file_offset > UINT64_MAX - offset_in_file ||
+        to_read > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
+        return BinderError::out_of_bounds;
 
     std::lock_guard<std::mutex> lock(impl_->bdt_mutex);
-    if (!impl_->bdt_stream.is_open()) {
-        return BinderError::io_error;
-    }
+    if (!impl_->bdt_stream.is_open()) return BinderError::io_error;
 
-    std::uint64_t seek_pos = entry->file_offset + offset_in_file;
+    const std::uint64_t seek_pos = entry->file_offset + offset_in_file;
+    if (seek_pos > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
+        return BinderError::out_of_bounds;
+    // A previous failed read sets failbit; clear it before a new, independent seek.
+    impl_->bdt_stream.clear();
     impl_->bdt_stream.seekg(static_cast<std::streamoff>(seek_pos), std::ios::beg);
     if (!impl_->bdt_stream.good()) {
         return BinderError::io_error;
