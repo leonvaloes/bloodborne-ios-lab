@@ -89,6 +89,37 @@ int main() { return run([] {
     CHECK(hle.invoke(0x2042, mem, p_cond_id, 0, 0) == ORBIS_OK); // signal
     CHECK(hle.invoke(0x2044, mem, p_cond_id, 0, 0) == ORBIS_OK); // destroy
 
+    // Names are bounded, but a short NUL-terminated name at the end of a mapping
+    // must not require the rest of the 31-byte buffer to be mapped.
+    CHECK(mem.map(0x4000, 2, read | write) == MemoryError::ok);
+    const char short_name[2] = {'x', '\0'};
+    CHECK(mem.store(0x4000, short_name, sizeof(short_name)) == MemoryError::ok);
+    CHECK(hle.invoke(0x2010, mem, 0x1020, 0x4000, packed_counts) == ORBIS_OK);
+    CHECK(mem.load(0x1020, &sem_id, sizeof(sem_id)) == MemoryError::ok);
+    CHECK(hle.invoke(0x2015, mem, sem_id, 0, 0) == ORBIS_OK);
+    CHECK(hle.invoke(0x2020, mem, 0x1040, 0x4000, 0) == ORBIS_OK);
+    CHECK(hle.invoke(0x2024, mem, 0x1040, 0, 0) == ORBIS_OK);
+    CHECK(mem.unmap(0x4000) == MemoryError::ok);
+
+    // A name with no terminator in its mapped span is rejected, not read past it.
+    CHECK(mem.map(0x4000, 1, read | write) == MemoryError::ok);
+    const char nonterminated = 'x';
+    CHECK(mem.store(0x4000, &nonterminated, 1) == MemoryError::ok);
+    CHECK(hle.invoke(0x2010, mem, 0x1020, 0x4000, packed_counts) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(hle.invoke(0x2020, mem, 0x1040, 0x4000, 0) == ORBIS_KERNEL_ERROR_EINVAL);
+    CHECK(mem.unmap(0x4000) == MemoryError::ok);
+
+    // Preserve the existing 31-character truncation behavior (no NUL required).
+    GuestMemory name_mem(64);
+    CHECK(name_mem.map(0x4000, 31, read | write) == MemoryError::ok);
+    CHECK(name_mem.map(0x5000, 4, read | write) == MemoryError::ok);
+    char long_name[31];
+    for (char& c : long_name) c = 'x';
+    CHECK(name_mem.store(0x4000, long_name, sizeof(long_name)) == MemoryError::ok);
+    CHECK(hle.invoke(0x2010, name_mem, 0x5000, 0x4000, packed_counts) == ORBIS_OK);
+    CHECK(name_mem.load(0x5000, &sem_id, sizeof(sem_id)) == MemoryError::ok);
+    CHECK(hle.invoke(0x2015, name_mem, sem_id, 0, 0) == ORBIS_OK);
+
     // Synthetic guest pointers: reject invalid/readonly outputs without returning orphan IDs.
     CHECK(hle.invoke(0x2010, mem, 0, 0, packed_counts) == ORBIS_KERNEL_ERROR_EINVAL);
     CHECK(hle.invoke(0x2030, mem, 0, 0, 0) == ORBIS_KERNEL_ERROR_EINVAL);

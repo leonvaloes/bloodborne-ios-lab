@@ -4,8 +4,24 @@
 #include <chrono>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 
 namespace bb {
+namespace {
+
+// Read at most the bytes the HLE name buffer can hold. A short string need not
+// have another 30 readable guest bytes following its terminator.
+bool load_name(GuestMemory& memory, std::uint64_t address, char (&name)[32]) {
+    for (std::size_t i = 0; i < sizeof(name) - 1; ++i) {
+        if (address > std::numeric_limits<std::uint64_t>::max() - i ||
+            memory.load(address + i, &name[i], 1) != MemoryError::ok) return false;
+        if (name[i] == '\0') return true;
+    }
+    name[sizeof(name) - 1] = '\0';
+    return true;
+}
+
+} // namespace
 
 void HleManager::register_handler(std::uint64_t nid, const std::string& name, HleHandler handler) {
     if (!handler) throw std::invalid_argument("Cannot register null HLE handler");
@@ -71,8 +87,7 @@ HleManager HleManager::create_standard() {
         if (memory.store(arg0, &id, sizeof(id)) != MemoryError::ok) return ORBIS_KERNEL_ERROR_EINVAL;
         char name_buf[32] = "sema";
         if (arg1) {
-            if (memory.load(arg1, name_buf, sizeof(name_buf) - 1) != MemoryError::ok) return ORBIS_KERNEL_ERROR_EINVAL;
-            name_buf[sizeof(name_buf) - 1] = '\0';
+            if (!load_name(memory, arg1, name_buf)) return ORBIS_KERNEL_ERROR_EINVAL;
         }
         std::int32_t initial = static_cast<std::int32_t>(arg2 & 0xFFFF);
         std::int32_t maximum = static_cast<std::int32_t>((arg2 >> 16) & 0xFFFF);
@@ -138,8 +153,7 @@ HleManager HleManager::create_standard() {
     manager.register_handler(0x2020, "sceKernelCreateLwMutex", [](GuestMemory& memory, std::uint64_t arg0, std::uint64_t arg1, std::uint64_t arg2) -> std::int64_t {
         char name_buf[32] = "lwmutex";
         if (arg1) {
-            if (memory.load(arg1, name_buf, sizeof(name_buf) - 1) != MemoryError::ok) return ORBIS_KERNEL_ERROR_EINVAL;
-            name_buf[sizeof(name_buf) - 1] = '\0';
+            if (!load_name(memory, arg1, name_buf)) return ORBIS_KERNEL_ERROR_EINVAL;
         }
         return KernelSyncManager::instance().create_lw_mutex(memory, arg0, name_buf, static_cast<std::uint32_t>(arg2), 0);
     });
