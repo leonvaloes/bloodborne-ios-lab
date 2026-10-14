@@ -1,4 +1,4 @@
-﻿#import <UIKit/UIKit.h>
+#import <UIKit/UIKit.h>
 #import <MetalKit/MetalKit.h>
 #import <GameController/GameController.h>
 #import <TargetConditionals.h>
@@ -21,6 +21,7 @@
     UILabel *_status;
     UILabel *_gpuStatus;
     UILabel *_subsystemStatus;
+    UILabel *_documentStatus;
     MTKView *_metal;
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
@@ -78,6 +79,14 @@
     _subsystemStatus.numberOfLines = 0;
     _subsystemStatus.text = @"Subsistemas: VFS e Áudio prontos. Aguardando entrada.";
 
+    _documentStatus = [UILabel new];
+    _documentStatus.numberOfLines = 0;
+    _documentStatus.text = @"Documento: toque em Verificar arquivo para ler teste-bblab.txt.";
+
+    UIButton *documentButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [documentButton setTitle:@"Verificar teste-bblab.txt em Documents" forState:UIControlStateNormal];
+    [documentButton addTarget:self action:@selector(checkDocument) forControlEvents:UIControlEventTouchUpInside];
+
     UIButton *run = [UIButton buttonWithType:UIButtonTypeSystem];
     [run setTitle:@"Executar testes completos (CPU, VFS, Áudio, Entrada)" forState:UIControlStateNormal];
     [run addTarget:self action:@selector(runTests) forControlEvents:UIControlEventTouchUpInside];
@@ -118,7 +127,8 @@
     [_metal.heightAnchor constraintEqualToConstant:220].active = YES;
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        title, scope, _status, run, _metal, _gpuStatus, _subsystemStatus, dpadRow, actionsRow, exportButton]];
+        title, scope, _status, run, _metal, _gpuStatus, _subsystemStatus,
+        documentButton, _documentStatus, dpadRow, actionsRow, exportButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -354,6 +364,49 @@
     }
 }
 
+- (void)checkDocument {
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    NSURL *file = [documents URLByAppendingPathComponent:@"teste-bblab.txt" isDirectory:NO];
+    NSMutableDictionary *result = [@{@"filename": @"teste-bblab.txt",
+        @"status": @"not_found", @"valid": @NO} mutableCopy];
+    NSError *error = nil;
+    NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:file.path error:&error];
+    if (attributes) {
+        unsigned long long length = [attributes fileSize];
+        result[@"size_bytes"] = @(length);
+        if (![[attributes fileType] isEqualToString:NSFileTypeRegular]) {
+            result[@"status"] = @"not_regular_file";
+        } else if (length > 65536) {
+            result[@"status"] = @"too_large";
+        } else {
+            NSData *bytes = [NSData dataWithContentsOfURL:file options:NSDataReadingMappedIfSafe error:&error];
+            if (!bytes) {
+                result[@"status"] = @"read_error";
+            } else {
+                NSString *content = [[NSString alloc] initWithData:bytes encoding:NSUTF8StringEncoding];
+                if (!content) {
+                    result[@"status"] = @"invalid_utf8";
+                } else if (bytes.length == 0) {
+                    result[@"status"] = @"empty";
+                } else {
+                    result[@"status"] = @"ok";
+                    result[@"valid"] = @YES;
+                    result[@"content_utf8"] = content;
+                    result[@"size_bytes"] = @(bytes.length);
+                }
+            }
+        }
+    } else if (error && error.code != NSFileNoSuchFileError) {
+        result[@"status"] = @"read_error";
+    }
+    result[@"checked_at"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
+    _report[@"documents_test"] = result;
+    _documentStatus.text = [NSString stringWithFormat:@"Documento teste-bblab.txt: %@ (%@ bytes). %@",
+        result[@"status"], result[@"size_bytes"] ?: @0,
+        [result[@"valid"] boolValue] ? @"Texto UTF-8 registrado no relatorio." : @"Confira o arquivo em Documentos de BB Lab."];
+}
+
 - (void)drawInMTKView:(MTKView *)view {
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
     id<CAMetalDrawable> drawable = view.currentDrawable;
@@ -445,6 +498,7 @@
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size { (void)view; (void)size; }
 
 - (void)exportReport:(UIButton *)sender {
+    [self checkDocument];
     _report[@"timestamp"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     auto pacing = _pacingTracker.get_stats();
     _report[@"frame_pacing_p50_ms"] = @(pacing.p50_ms);
