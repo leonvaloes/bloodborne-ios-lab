@@ -7,7 +7,10 @@ VideoStatus VideoOut::register_buffer(std::uint32_t index, VideoBuffer b) {
         b.bytes_per_pixel > 16 || b.pitch < b.width || b.width > 16384 || b.height > 16384 ||
         b.pitch > 16384) return VideoStatus::invalid;
     if (occupied_[index]) return VideoStatus::occupied;
-    const auto bytes = std::uint64_t(b.pitch) * b.height * b.bytes_per_pixel;
+    constexpr std::uint64_t max_frame_bytes = 64ull * 1024 * 1024;
+    const auto row_bytes = std::uint64_t(b.pitch) * b.bytes_per_pixel;
+    if (row_bytes > max_frame_bytes / b.height) return VideoStatus::overflow;
+    const auto bytes = row_bytes * b.height;
     if (b.address > UINT64_MAX - bytes) return VideoStatus::overflow;
     // Verifica começo e fim; buffers não contíguos falham ao tentar acessá-los mais tarde.
     std::uint8_t sample;

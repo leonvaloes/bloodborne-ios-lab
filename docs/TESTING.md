@@ -23,7 +23,15 @@
 
 ## Consolidação local em 14/10/2026
 
-No checkout de trabalho desta data, `tools/test-windows.ps1 -Configuration Release` compilou e executou **50/50 testes CTest**; o smoke host registrou 118 verificações, nenhuma falha e `game_execution=false`. Os novos testes `host_bridge` cobrem principalmente estados sem inicialização; `video_out_manager` usa pixels autorais para verificar leitura completa, limites de tamanho e ausência de frames fabricados. Os testes AVX adicionais são sintéticos. Estes resultados são **Windows host**, não build iOS desta revisão, instalação no iPhone, apresentação Metal de pixels do guest nem execução do motor no dispositivo.
+No checkout de trabalho desta data, `tools/test-windows.ps1 -Configuration Release` e `-Configuration Debug` compilaram e executaram **50/50 testes CTest** com 100% de sucesso; o smoke host registrou 118 verificações, nenhuma falha e `game_execution=false`.
+As correções recentes consolidadas abrangem:
+- **`x86_interp`**: instruções `BT`, `BTS`, `BTR` e `BTC` com operando em memória (0x0F A3/AB/B3/BB) com cálculo de deslocamento de bits com sinal e modificação segura de bytes; correção de `LEA` sem aplicar bases de segmento FS/GS; decodificação de `66 68` (PUSH imm16) empilhando 2 bytes; shifts com count zero sem escrita de memória.
+- **`OrbisRuntime` & stdio HLE**: tabela de descritores opacos de arquivos com handles isolados e fechamento no destrutor; funções stdio (`fopen`, `fclose`, `fread`, `fwrite`, `fseek`, `ftell`, `fgets`, `fgetc`, `fputc`, `fputs`, `remove`, `rename`, `mkdir`, `rmdir`) operando estritamente via buffers intermediários com verificação de limites em `GuestMemory` e bloqueio de path traversal (`..`); conformidade ABI SysV FP lendo registradores XMM incondicionalmente mesmo para escalares zero (+0.0/-0.0).
+- **`libSceVideoOut` HLE**: implementação dos handlers `sceVideoOutOpen`, `sceVideoOutClose`, `sceVideoOutSetFlipRate`, `sceVideoOutAddFlipEvent`, `sceVideoOutSetBufferAttribute`, `sceVideoOutRegisterBuffers`, `sceVideoOutSubmitFlip` e `sceVideoOutGetFlipStatus`, interligados com `VideoOutManager` e `GameBootCoordinator`.
+- **`GuestScheduler`**: alinhamento estrito de stack SysV na entrada da thread (`rsp % 16 == 8`), expiração e remoção confiável de waiters de mutex expirados/cancelados da fila de sincronização.
+- **`VideoOut` & `VideoOutManager`**: teto rígido de 64 MiB por buffer de vídeo registrado, prevenção de overflow em pitch * height e validação integral com `GuestMemory`.
+
+Estes resultados são **Windows host**, não build iOS desta revisão, instalação no iPhone, apresentação Metal de pixels do guest nem execução do motor no dispositivo.
 
 O alvo iOS `BBHost` em `host/ios/` continua independente do protótipo diagnóstico `bb-ios-lab` em `ios/`. O workflow `.github/workflows/ios.yml` pretende compilar e empacotar **BBHost sem assinatura**. O protótipo não carrega `Image0` nem executa código guest automaticamente; sua compilação iOS ainda precisa de verificação no runner. Relatórios anteriores de aparelho referem-se às revisões especificadas em `docs/milestones/` e não validam as mudanças atuais.
 

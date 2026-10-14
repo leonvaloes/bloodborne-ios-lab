@@ -22,7 +22,8 @@ public:
     explicit GuestScheduler(GuestMemory& memory, std::uint64_t quantum = 256);
     void add_trap_range(std::uint64_t base, std::uint64_t size);
     void set_trap(Trap trap) { trap_ = std::move(trap); }
-    // Caller maps disjoint stacks and places a return trap at [stack_top-8].
+    // Caller maps disjoint stacks; create() places the return trap at the
+    // SysV entry rsp (rsp % 16 == 8), with [rsp, rsp+8) inside the stack.
     Id create(std::uint64_t entry, std::uint64_t stack_bottom, std::uint64_t stack_top,
               std::uint64_t return_trap, std::uint64_t argument = 0);
     std::int32_t start(Id id);

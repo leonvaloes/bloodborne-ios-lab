@@ -10,6 +10,8 @@
 #include <limits>
 #include <stdexcept>
 #include <vector>
+#include <filesystem>
+#include <system_error>
 #if defined(_WIN32)
 #include <io.h>
 #include <fcntl.h>
@@ -150,6 +152,12 @@ OrbisRuntime::OrbisRuntime(GuestMemory& memory)
         "pthread_mutex_getprioceiling", "pthread_mutex_setprioceiling",
     };
     for (const char* s : symbols) names_.emplace(orbis_nid(s), s);
+}
+OrbisRuntime::~OrbisRuntime() {
+    for (auto& pair : open_files_) {
+        if (pair.second) std::fclose(pair.second);
+    }
+    open_files_.clear();
 }
 std::string OrbisRuntime::resolve(const std::string& import) const {
     const auto key=import.substr(0,import.find('#'));
@@ -759,15 +767,10 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         }
         return s;
     };
-    auto get_double = [&](unsigned xmm_idx, unsigned gpr_idx) -> double {
-        if (c.xmm[xmm_idx][0] != 0) {
-            double val = 0;
-            std::memcpy(&val, &c.xmm[xmm_idx][0], sizeof(val));
-            return val;
-        }
+    // Pela ABI SysV, argumentos escalares FP vêm dos XMM, inclusive quando seus bits são zero.
+    auto get_double = [&](unsigned xmm_idx) -> double {
         double val = 0;
-        std::uint64_t gpr_val = a(gpr_idx);
-        std::memcpy(&val, &gpr_val, sizeof(val));
+        std::memcpy(&val, &c.xmm[xmm_idx][0], sizeof(val));
         return val;
     };
     auto put_double = [&](double val) -> std::uint64_t {
@@ -776,17 +779,11 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         c.xmm[0][0] = bits;
         return bits;
     };
-    auto get_float = [&](unsigned xmm_idx, unsigned gpr_idx) -> float {
-        if ((c.xmm[xmm_idx][0] & 0xFFFFFFFFULL) != 0) {
-            std::uint32_t val = static_cast<std::uint32_t>(c.xmm[xmm_idx][0]);
-            float f = 0;
-            std::memcpy(&f, &val, sizeof(f));
-            return f;
-        }
-        std::uint32_t val = static_cast<std::uint32_t>(a(gpr_idx));
-        float f = 0;
-        std::memcpy(&f, &val, sizeof(f));
-        return f;
+    auto get_float = [&](unsigned xmm_idx) -> float {
+        std::uint32_t bits = static_cast<std::uint32_t>(c.xmm[xmm_idx][0]);
+        float val = 0;
+        std::memcpy(&val, &bits, sizeof(val));
+        return val;
     };
     auto put_float = [&](float val) -> std::uint64_t {
         std::uint32_t bits = 0;
@@ -1004,34 +1001,106 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n == "sceAudioOutInit") return 0;
 
-    // Math libc functions
-    if (n == "sin") return put_double(std::sin(get_double(0, 0)));
-    if (n == "cos") return put_double(std::cos(get_double(0, 0)));
-    if (n == "tan") return put_double(std::tan(get_double(0, 0)));
-    if (n == "atan2") return put_double(std::atan2(get_double(0, 0), get_double(1, 1)));
-    if (n == "pow") return put_double(std::pow(get_double(0, 0), get_double(1, 1)));
-    if (n == "exp") return put_double(std::exp(get_double(0, 0)));
-    if (n == "log") return put_double(std::log(get_double(0, 0)));
-    if (n == "sqrt") return put_double(std::sqrt(get_double(0, 0)));
-    if (n == "floor") return put_double(std::floor(get_double(0, 0)));
-    if (n == "ceil") return put_double(std::ceil(get_double(0, 0)));
-    if (n == "fmod") return put_double(std::fmod(get_double(0, 0), get_double(1, 1)));
-    if (n == "round") return put_double(std::round(get_double(0, 0)));
-    if (n == "fabs") return put_double(std::fabs(get_double(0, 0)));
+    // libSceVideoOut HLE
+    if (n == "sceVideoOutOpen") {
+        return next_handle_++;
+    }
+    if (n == "sceVideoOutClose") {
+        return 0;
+    }
+    if (n == "sceVideoOutSetFlipRate") {
+        return 0;
+    }
+    if (n == "sceVideoOutAddFlipEvent") {
+        return 0;
+    }
+    if (n == "sceVideoOutSetBufferAttribute") {
+        std::uint64_t attr_addr = a(0);
+        if (attr_addr) {
+            std::uint32_t fields[6] = {
+                static_cast<std::uint32_t>(a(1)), // pixelFormat
+                static_cast<std::uint32_t>(a(2)), // tilingMode
+                static_cast<std::uint32_t>(a(3)), // aspectRatio
+                static_cast<std::uint32_t>(a(4)), // width
+                static_cast<std::uint32_t>(a(5)), // height
+                static_cast<std::uint32_t>(a(6))  // pitchInPixel
+            };
+            mem_.store(attr_addr, fields, sizeof(fields));
+        }
+        return 0;
+    }
+    if (n == "sceVideoOutRegisterBuffers") {
+        int start_idx = static_cast<int>(a(1));
+        std::uint64_t addrs_ptr = a(2);
+        int buf_count = static_cast<int>(a(3));
+        std::uint64_t attr_ptr = a(4);
 
-    if (n == "sinf") return put_float(std::sin(get_float(0, 0)));
-    if (n == "cosf") return put_float(std::cos(get_float(0, 0)));
-    if (n == "tanf") return put_float(std::tan(get_float(0, 0)));
-    if (n == "atan2f") return put_float(std::atan2(get_float(0, 0), get_float(1, 1)));
-    if (n == "powf") return put_float(std::pow(get_float(0, 0), get_float(1, 1)));
-    if (n == "expf") return put_float(std::exp(get_float(0, 0)));
-    if (n == "logf") return put_float(std::log(get_float(0, 0)));
-    if (n == "sqrtf") return put_float(std::sqrt(get_float(0, 0)));
-    if (n == "floorf") return put_float(std::floor(get_float(0, 0)));
-    if (n == "ceilf") return put_float(std::ceil(get_float(0, 0)));
-    if (n == "fmodf") return put_float(std::fmod(get_float(0, 0), get_float(1, 1)));
-    if (n == "roundf") return put_float(std::round(get_float(0, 0)));
-    if (n == "fabsf") return put_float(std::fabs(get_float(0, 0)));
+        if (video_out_ && addrs_ptr && buf_count > 0 && buf_count <= 16 && attr_ptr) {
+            std::uint32_t attr_fields[6] = {};
+            if (mem_.load(attr_ptr, attr_fields, sizeof(attr_fields)) == MemoryError::ok) {
+                std::uint32_t width = attr_fields[3];
+                std::uint32_t height = attr_fields[4];
+                std::uint32_t pitch = attr_fields[5];
+                if (!pitch) pitch = width;
+                std::uint32_t bpp = 4;
+
+                for (int i = 0; i < buf_count; ++i) {
+                    std::uint64_t buf_addr = 0;
+                    if (mem_.load(addrs_ptr + i * 8, &buf_addr, 8) == MemoryError::ok) {
+                        VideoBuffer vb{buf_addr, width, height, pitch, bpp};
+                        video_out_->register_buffer(static_cast<std::uint32_t>(start_idx + i), vb);
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    if (n == "sceVideoOutSubmitFlip") {
+        int buf_idx = static_cast<int>(a(1));
+        std::uint64_t flip_arg = a(3);
+        if (video_out_) {
+            auto status = video_out_->submit_flip(static_cast<std::uint32_t>(buf_idx), flip_arg);
+            return status == VideoStatus::ok ? 0 : static_cast<std::uint64_t>(-1);
+        }
+        return 0;
+    }
+    if (n == "sceVideoOutGetFlipStatus") {
+        std::uint64_t status_ptr = a(1);
+        if (status_ptr && video_out_) {
+            std::uint64_t count = video_out_->last_flip().sequence;
+            mem_.store(status_ptr, &count, 8);
+        }
+        return 0;
+    }
+
+    // Math libc functions
+    if (n == "sin") return put_double(std::sin(get_double(0)));
+    if (n == "cos") return put_double(std::cos(get_double(0)));
+    if (n == "tan") return put_double(std::tan(get_double(0)));
+    if (n == "atan2") return put_double(std::atan2(get_double(0), get_double(1)));
+    if (n == "pow") return put_double(std::pow(get_double(0), get_double(1)));
+    if (n == "exp") return put_double(std::exp(get_double(0)));
+    if (n == "log") return put_double(std::log(get_double(0)));
+    if (n == "sqrt") return put_double(std::sqrt(get_double(0)));
+    if (n == "floor") return put_double(std::floor(get_double(0)));
+    if (n == "ceil") return put_double(std::ceil(get_double(0)));
+    if (n == "fmod") return put_double(std::fmod(get_double(0), get_double(1)));
+    if (n == "round") return put_double(std::round(get_double(0)));
+    if (n == "fabs") return put_double(std::fabs(get_double(0)));
+
+    if (n == "sinf") return put_float(std::sin(get_float(0)));
+    if (n == "cosf") return put_float(std::cos(get_float(0)));
+    if (n == "tanf") return put_float(std::tan(get_float(0)));
+    if (n == "atan2f") return put_float(std::atan2(get_float(0), get_float(1)));
+    if (n == "powf") return put_float(std::pow(get_float(0), get_float(1)));
+    if (n == "expf") return put_float(std::exp(get_float(0)));
+    if (n == "logf") return put_float(std::log(get_float(0)));
+    if (n == "sqrtf") return put_float(std::sqrt(get_float(0)));
+    if (n == "floorf") return put_float(std::floor(get_float(0)));
+    if (n == "ceilf") return put_float(std::ceil(get_float(0)));
+    if (n == "fmodf") return put_float(std::fmod(get_float(0), get_float(1)));
+    if (n == "roundf") return put_float(std::round(get_float(0)));
+    if (n == "fabsf") return put_float(std::fabs(get_float(0)));
 
     // Conversions and Sorting
     if (n == "strtol" || n == "strtoll") {
@@ -1923,65 +1992,95 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return (quot << 32) | (rem & 0xFFFFFFFF);
     }
 
-    // stdio: FILE* stubs (simplified - use host FILE* mapping)
+    // stdio: FILE* implementation with opaque handles and memory-safe transfers
+    auto get_file = [&](std::uint64_t handle) -> FILE* {
+        auto it = open_files_.find(handle);
+        return it != open_files_.end() ? it->second : nullptr;
+    };
     if (n=="fopen") {
         std::string path = read_guest_string(a(0));
         std::string mode = read_guest_string(a(1));
+        if (path.empty() || mode.empty() || path.find("..") != std::string::npos) return 0;
         FILE* fp = std::fopen(path.c_str(), mode.c_str());
-        return reinterpret_cast<std::uint64_t>(fp);
+        if (!fp) return 0;
+        std::uint64_t handle = next_handle_++;
+        open_files_[handle] = fp;
+        return handle;
     }
     if (n=="fclose") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
-        return std::fclose(fp);
+        auto it = open_files_.find(a(0));
+        if (it == open_files_.end()) return static_cast<std::uint64_t>(-1);
+        int res = std::fclose(it->second);
+        open_files_.erase(it);
+        return static_cast<std::uint64_t>(res);
     }
     if (n=="fread") {
-        void* ptr = reinterpret_cast<void*>(a(0));
+        std::uint64_t dst = a(0);
         std::size_t size = static_cast<std::size_t>(a(1));
         std::size_t nmemb = static_cast<std::size_t>(a(2));
-        FILE* fp = reinterpret_cast<FILE*>(a(3));
-        return std::fread(ptr, size, nmemb, fp);
+        FILE* fp = get_file(a(3));
+        if (!fp || !dst || !size || !nmemb) return 0;
+        constexpr std::size_t max_transfer = 64ull * 1024 * 1024;
+        if (nmemb > max_transfer / size) return 0;
+        std::size_t total = size * nmemb;
+        std::vector<std::uint8_t> tmp(total);
+        std::size_t read_bytes = std::fread(tmp.data(), 1, total, fp);
+        if (read_bytes > 0) {
+            if (mem_.store(dst, tmp.data(), read_bytes) != MemoryError::ok) return 0;
+        }
+        return read_bytes / size;
     }
     if (n=="fwrite") {
-        const void* ptr = reinterpret_cast<const void*>(a(0));
+        std::uint64_t src = a(0);
         std::size_t size = static_cast<std::size_t>(a(1));
         std::size_t nmemb = static_cast<std::size_t>(a(2));
-        FILE* fp = reinterpret_cast<FILE*>(a(3));
-        return std::fwrite(ptr, size, nmemb, fp);
+        FILE* fp = get_file(a(3));
+        if (!fp || !src || !size || !nmemb) return 0;
+        constexpr std::size_t max_transfer = 64ull * 1024 * 1024;
+        if (nmemb > max_transfer / size) return 0;
+        std::size_t total = size * nmemb;
+        std::vector<std::uint8_t> tmp(total);
+        if (mem_.load(src, tmp.data(), total) != MemoryError::ok) return 0;
+        std::size_t written_bytes = std::fwrite(tmp.data(), 1, total, fp);
+        return written_bytes / size;
     }
     if (n=="fseek") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        FILE* fp = get_file(a(0));
+        if (!fp) return static_cast<std::uint64_t>(-1);
         long offset = static_cast<long>(a(1));
         int whence = static_cast<int>(a(2));
         return std::fseek(fp, offset, whence);
     }
     if (n=="ftell") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        FILE* fp = get_file(a(0));
+        if (!fp) return static_cast<std::uint64_t>(-1);
         return static_cast<std::uint64_t>(std::ftell(fp));
     }
     if (n=="rewind") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
-        std::rewind(fp);
+        FILE* fp = get_file(a(0));
+        if (fp) std::rewind(fp);
         return 0;
     }
     if (n=="fflush") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
-        return std::fflush(fp);
+        FILE* fp = get_file(a(0));
+        return fp ? std::fflush(fp) : 0;
     }
     if (n=="feof") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
-        return std::feof(fp);
+        FILE* fp = get_file(a(0));
+        return fp ? std::feof(fp) : 1;
     }
     if (n=="ferror") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
-        return std::ferror(fp);
+        FILE* fp = get_file(a(0));
+        return fp ? std::ferror(fp) : 1;
     }
     if (n=="clearerr") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
-        std::clearerr(fp);
+        FILE* fp = get_file(a(0));
+        if (fp) std::clearerr(fp);
         return 0;
     }
     if (n=="fprintf" || n=="vfprintf") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        FILE* fp = get_file(a(0));
+        if (!fp) return 0;
         std::string fmt = read_guest_string(a(1));
         // Simplified: just print the format string without args
         if (fmt.find('%') != std::string::npos) return 0;
@@ -2012,26 +2111,31 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return std::getchar();
     }
     if (n=="fgetc") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
-        return std::fgetc(fp);
+        FILE* fp = get_file(a(0));
+        return fp ? std::fgetc(fp) : EOF;
     }
     if (n=="fgets") {
-        char* buf = reinterpret_cast<char*>(a(0));
+        std::uint64_t dst = a(0);
         int size = static_cast<int>(a(1));
-        FILE* fp = reinterpret_cast<FILE*>(a(2));
-        if (!buf || size <= 0) return 0;
-        char* res = std::fgets(buf, size, fp);
-        return res ? a(0) : 0;
+        FILE* fp = get_file(a(2));
+        if (!dst || size <= 1 || !fp) return 0;
+        if (size > 65536) size = 65536;
+        std::vector<char> tmp(size);
+        char* res = std::fgets(tmp.data(), size, fp);
+        if (!res) return 0;
+        std::size_t len = std::strlen(res) + 1;
+        if (mem_.store(dst, res, len) != MemoryError::ok) return 0;
+        return dst;
     }
     if (n=="fputc") {
         int c = static_cast<int>(a(0));
-        FILE* fp = reinterpret_cast<FILE*>(a(1));
-        return std::fputc(c, fp);
+        FILE* fp = get_file(a(1));
+        return fp ? std::fputc(c, fp) : EOF;
     }
     if (n=="fputs") {
         std::string s = read_guest_string(a(0));
-        FILE* fp = reinterpret_cast<FILE*>(a(1));
-        return std::fputs(s.c_str(), fp);
+        FILE* fp = get_file(a(1));
+        return fp ? std::fputs(s.c_str(), fp) : EOF;
     }
 
     // pthreads stubs
@@ -2241,31 +2345,45 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n=="remove") {
         std::string path = read_guest_string(a(0));
-        return std::remove(path.c_str());
+        if (path.empty() || path.find("..") != std::string::npos) return static_cast<std::uint64_t>(-1);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return ec ? static_cast<std::uint64_t>(-1) : 0;
     }
     if (n=="rename") {
         std::string oldpath = read_guest_string(a(0));
         std::string newpath = read_guest_string(a(1));
-        return std::rename(oldpath.c_str(), newpath.c_str());
+        if (oldpath.empty() || newpath.empty() || oldpath.find("..") != std::string::npos || newpath.find("..") != std::string::npos)
+            return static_cast<std::uint64_t>(-1);
+        std::error_code ec;
+        std::filesystem::rename(oldpath, newpath, ec);
+        return ec ? static_cast<std::uint64_t>(-1) : 0;
     }
     if (n=="mkdir") {
         std::string path = read_guest_string(a(0));
-        // mode is a(1) - ignored on Windows
-        return std::system(("mkdir \"" + path + "\"").c_str());
+        if (path.empty() || path.find("..") != std::string::npos) return static_cast<std::uint64_t>(-1);
+        std::error_code ec;
+        std::filesystem::create_directories(path, ec);
+        return ec ? static_cast<std::uint64_t>(-1) : 0;
     }
     if (n=="rmdir") {
         std::string path = read_guest_string(a(0));
-        return std::system(("rmdir \"" + path + "\"").c_str());
+        if (path.empty() || path.find("..") != std::string::npos) return static_cast<std::uint64_t>(-1);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return ec ? static_cast<std::uint64_t>(-1) : 0;
     }
     if (n=="fgetpos") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        FILE* fp = get_file(a(0));
+        if (!fp) return static_cast<std::uint64_t>(-1);
         std::fpos_t pos;
         int res = std::fgetpos(fp, &pos);
         if (res == 0 && a(1)) put<std::uint64_t>(mem_, a(1), static_cast<std::uint64_t>(pos));
         return res;
     }
     if (n=="fsetpos") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
+        FILE* fp = get_file(a(0));
+        if (!fp) return static_cast<std::uint64_t>(-1);
         std::fpos_t pos = static_cast<std::fpos_t>(a(1));
         return std::fsetpos(fp, &pos);
     }
@@ -2276,9 +2394,15 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     if (n=="freopen") {
         std::string path = read_guest_string(a(0));
         std::string mode = read_guest_string(a(1));
-        FILE* fp = reinterpret_cast<FILE*>(a(2));
-        FILE* res = std::freopen(path.c_str(), mode.c_str(), fp);
-        return reinterpret_cast<std::uint64_t>(res);
+        auto it = open_files_.find(a(2));
+        if (it == open_files_.end() || path.empty() || path.find("..") != std::string::npos) return 0;
+        FILE* res = std::freopen(path.c_str(), mode.c_str(), it->second);
+        if (!res) {
+            open_files_.erase(it);
+            return 0;
+        }
+        it->second = res;
+        return a(2);
     }
     if (n=="frexp" || n=="frexpf") {
         // Stub: return 0.5, exponent in a(1)
@@ -2524,8 +2648,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         // Already handled above
     }
     if (n=="fileno") {
-        FILE* fp = reinterpret_cast<FILE*>(a(0));
-        return _fileno(fp);
+        FILE* fp = get_file(a(0));
+        return fp ? static_cast<std::uint64_t>(_fileno(fp)) : static_cast<std::uint64_t>(-1);
     }
     if (n=="isatty") {
         // Stub
@@ -2573,7 +2697,10 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n=="unlink") {
         std::string path = read_guest_string(a(0));
-        return std::remove(path.c_str());
+        if (path.empty() || path.find("..") != std::string::npos) return static_cast<std::uint64_t>(-1);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return ec ? static_cast<std::uint64_t>(-1) : 0;
     }
     // POSIX I/O functions (libc low-level)
     if (n=="_write" || n=="write") {

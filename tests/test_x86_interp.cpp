@@ -68,6 +68,82 @@ int main() {
             CHECK(m.run().stop == CpuStop::trap);
             CHECK(m.cpu.state.gpr[0] == CODE + 7 + 0x10);
         }
+        {   // LEA calcula offset efetivo, sem somar bases FS/GS; flags intactas.
+            for (const std::uint8_t prefix : {0x64, 0x65}) {
+                Machine m{prefix, 0x48, 0x8D, 0x47, 0x10, 0xC3};
+                m.cpu.state.gpr[7] = DATA;
+                m.cpu.state.fs_base = 0x10000;
+                m.cpu.state.gs_base = 0x20000;
+                m.cpu.state.rflags = 2 | FLAG_CF | FLAG_ZF;
+                CHECK(m.run().stop == CpuStop::trap);
+                CHECK(m.cpu.state.gpr[0] == DATA + 0x10);
+                CHECK(m.cpu.state.rflags == (2 | FLAG_CF | FLAG_ZF));
+            }
+        }
+        {   // LEA RIP-relative com GS também ignora a base do segmento.
+            Machine m{0x65, 0x48, 0x8D, 0x05, 0x10, 0, 0, 0, 0xC3};
+            m.cpu.state.gs_base = DATA;
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.gpr[0] == CODE + 8 + 0x10);
+        }
+        {   // PUSH imm16: dois bytes na pilha, imediato de dois bytes e RIP correto.
+            Machine m{0x66, 0x68, 0x34, 0xF2, 0xF9};
+            const std::uint64_t old_sp = m.cpu.state.gpr[4];
+            m.cpu.state.rflags = 2 | FLAG_ZF;
+            const std::uint8_t bytes[] = {0x66, 0x68, 0x34, 0xF2};
+            const auto d = decode_x86(bytes, sizeof(bytes));
+            CHECK(d.supported && d.length == 4);
+            CHECK(m.run(1).stop == CpuStop::step_limit);
+            CHECK(m.cpu.state.rip == CODE + 4);
+            CHECK(m.cpu.state.gpr[4] == old_sp - 2);
+            std::uint16_t value = 0;
+            CHECK(m.mem.load(old_sp - 2, &value, 2) == MemoryError::ok);
+            CHECK(value == 0xF234);
+            CHECK(m.cpu.state.rflags == (2 | FLAG_ZF));
+            CHECK(m.run(1).stop == CpuStop::step_limit);
+            CHECK((m.cpu.state.rflags & FLAG_CF) != 0);
+        }
+        {   // Shift com count mascarado para zero lê memória, mas não escreve em página readonly.
+            for (const std::uint8_t count : {0, 32}) {
+                Machine m{0xC1, 0x27, count, 0xC3}; // shl dword ptr [rdi], imm8
+                m.cpu.state.gpr[7] = DATA;
+                m.cpu.state.rflags = 2 | FLAG_CF | FLAG_OF | FLAG_ZF;
+                const std::uint32_t value = 0x80000001;
+                CHECK(m.mem.store(DATA, &value, 4) == MemoryError::ok);
+                CHECK(m.mem.protect(DATA, Permission::read) == MemoryError::ok);
+                CHECK(m.run().stop == CpuStop::trap);
+                std::uint32_t result = 0;
+                CHECK(m.mem.load(DATA, &result, 4) == MemoryError::ok);
+                CHECK(result == value);
+                CHECK(m.cpu.state.rflags == (2 | FLAG_CF | FLAG_OF | FLAG_ZF));
+            }
+            Machine m{0xD3, 0x27, 0xC3}; // shl dword ptr [rdi], cl
+            m.cpu.state.gpr[7] = DATA;
+            m.cpu.state.gpr[1] = 32;
+            m.cpu.state.rflags = 2 | FLAG_CF;
+            const std::uint32_t value = 0x11;
+            CHECK(m.mem.store(DATA, &value, 4) == MemoryError::ok);
+            CHECK(m.mem.protect(DATA, Permission::read) == MemoryError::ok);
+            CHECK(m.run().stop == CpuStop::trap);
+            CHECK(m.cpu.state.rflags == (2 | FLAG_CF));
+        }
+        {   // Mesmo com count zero, operandos de memória inválidos ainda causam fault de leitura.
+            Machine m{0xC1, 0x27, 0};
+            m.cpu.state.gpr[7] = 0x99999;
+            const auto r = m.run();
+            CHECK(r.stop == CpuStop::memory_fault && r.fault_address == 0x99999);
+            CHECK(r.rip == CODE);
+        }
+        {   // Count efetivo não zero escreve: página readonly causa fault; CF da operação normal.
+            Machine m{0xD1, 0x27}; // shl dword ptr [rdi], 1
+            m.cpu.state.gpr[7] = DATA;
+            const std::uint32_t value = 0x80000001;
+            CHECK(m.mem.store(DATA, &value, 4) == MemoryError::ok);
+            CHECK(m.mem.protect(DATA, Permission::read) == MemoryError::ok);
+            const auto r = m.run();
+            CHECK(r.stop == CpuStop::memory_fault && r.fault_address == DATA);
+            CHECK((m.cpu.state.rflags & FLAG_CF) != 0);
+        }
         {   // memory fault reports the address and the faulting rip
             Machine m{0x8B, 0x01};
             m.cpu.state.gpr[1] = 0x99999;
@@ -1208,6 +1284,70 @@ int main() {
             CHECK(m_pd256.run().stop == CpuStop::trap);
             CHECK(m_pd256.cpu.state.xmm[0][0] == 1 && m_pd256.cpu.state.xmm[0][1] == 20);
             CHECK(m_pd256.cpu.state.ymm_hi[0][0] == 4 && m_pd256.cpu.state.ymm_hi[0][1] == 30);
+        }
+        {   // BT / BTS / BTR / BTC with memory operand (0x0F A3, AB, B3, BB)
+            // bt [rbx], rcx (64-bit with bit offset crossing qwords)
+            Machine m_bt{0x48, 0x0F, 0xA3, 0x0B, 0xC3}; // bt [rbx], rcx; ret
+            m_bt.cpu.state.gpr[3] = DATA + 16;
+            const std::uint64_t words[4] = {0x1ULL, 0x2ULL, 0x4ULL, 0x8ULL};
+            CHECK(m_bt.mem.store(DATA, words, sizeof(words)) == MemoryError::ok);
+
+            // rcx = 65 -> tests bit 1 of qword at [rbx+8] (DATA+24 -> words[3] = 0x8 = bit 3 -> 0)
+            m_bt.cpu.state.gpr[1] = 65;
+            CHECK(m_bt.run().stop == CpuStop::trap);
+            CHECK((m_bt.cpu.state.rflags & FLAG_CF) == 0);
+
+            // rcx = 67 -> tests bit 3 of qword at [rbx+8] (words[3] bit 3 == 1)
+            Machine m_bt2{0x48, 0x0F, 0xA3, 0x0B, 0xC3};
+            CHECK(m_bt2.mem.store(DATA, words, sizeof(words)) == MemoryError::ok);
+            m_bt2.cpu.state.gpr[3] = DATA + 16;
+            m_bt2.cpu.state.gpr[1] = 67;
+            CHECK(m_bt2.run().stop == CpuStop::trap);
+            CHECK((m_bt2.cpu.state.rflags & FLAG_CF) != 0);
+
+            // negative offset: rcx = -63 -> tests bit 1 of [rbx - 8] (DATA+8 -> words[1] = 2 = bit 1)
+            Machine m_bt_neg{0x48, 0x0F, 0xA3, 0x0B, 0xC3};
+            CHECK(m_bt_neg.mem.store(DATA, words, sizeof(words)) == MemoryError::ok);
+            m_bt_neg.cpu.state.gpr[3] = DATA + 16;
+            m_bt_neg.cpu.state.gpr[1] = static_cast<std::uint64_t>(-63LL); // bit 1 of [DATA+8] -> 1
+            CHECK(m_bt_neg.run().stop == CpuStop::trap);
+            CHECK((m_bt_neg.cpu.state.rflags & FLAG_CF) != 0);
+
+            // bts [rbx], rcx: sets bit
+            Machine m_bts{0x48, 0x0F, 0xAB, 0x0B, 0xC3};
+            m_bts.cpu.state.gpr[3] = DATA;
+            m_bts.cpu.state.gpr[1] = 10; // bit 2 of byte 1
+            std::uint8_t zero_byte = 0;
+            CHECK(m_bts.mem.store(DATA + 1, &zero_byte, 1) == MemoryError::ok);
+            CHECK(m_bts.run().stop == CpuStop::trap);
+            CHECK((m_bts.cpu.state.rflags & FLAG_CF) == 0);
+            std::uint8_t modified_byte = 0;
+            CHECK(m_bts.mem.load(DATA + 1, &modified_byte, 1) == MemoryError::ok);
+            CHECK(modified_byte == (1u << 2));
+
+            // btr [rbx], rcx: clears bit
+            Machine m_btr{0x48, 0x0F, 0xB3, 0x0B, 0xC3};
+            m_btr.cpu.state.gpr[3] = DATA;
+            m_btr.cpu.state.gpr[1] = 10;
+            std::uint8_t bit_set = (1u << 2);
+            CHECK(m_btr.mem.store(DATA + 1, &bit_set, 1) == MemoryError::ok);
+            CHECK(m_btr.run().stop == CpuStop::trap);
+            CHECK((m_btr.cpu.state.rflags & FLAG_CF) != 0);
+            CHECK(m_btr.mem.load(DATA + 1, &modified_byte, 1) == MemoryError::ok);
+            CHECK(modified_byte == 0);
+
+            // btc [rbx], rcx: complements bit
+            Machine m_btc{0x48, 0x0F, 0xBB, 0x0B, 0xC3};
+            m_btc.cpu.state.gpr[3] = DATA;
+            m_btc.cpu.state.gpr[1] = 10;
+            CHECK(m_btc.run().stop == CpuStop::trap);
+            CHECK((m_btc.cpu.state.rflags & FLAG_CF) == 0);
+            CHECK(m_btc.mem.load(DATA + 1, &modified_byte, 1) == MemoryError::ok);
+            CHECK(modified_byte == (1u << 2));
+
+            const std::uint8_t d_bt_mem[] = {0x48, 0x0F, 0xA3, 0x0B};
+            CHECK(decode_x86(d_bt_mem, sizeof(d_bt_mem)).length == 4);
+            CHECK(decode_x86(d_bt_mem, sizeof(d_bt_mem)).supported);
         }
         {   // ud2
             Machine m{0x0F, 0x0B};

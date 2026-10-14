@@ -323,6 +323,9 @@ bool GameBootCoordinator::phase4_initialize_runtime(const BootConfig& config) {
 
     runtime_ = std::make_unique<OrbisRuntime>(*guest_memory_);
     runtime_->set_procparam(image_.procparam);
+    if (video_out_) {
+        runtime_->attach_video_out(video_out_);
+    }
 
     // Inicializa os módulos carregados na ordem topológica de dependência
     for (std::size_t i = 0; i < image_.modules.size(); ++i) {

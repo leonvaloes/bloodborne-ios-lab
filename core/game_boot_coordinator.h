@@ -150,6 +150,11 @@ public:
 
     AudioOutManager& audio_out();
 
+    void attach_video_out(VideoOutManager* video_out) {
+        video_out_ = video_out;
+        if (runtime_) runtime_->attach_video_out(video_out_);
+    }
+
     GuestMemory* guest_memory();
     const GuestMemory* guest_memory() const;
 
@@ -179,6 +184,7 @@ private:
     Ps4Image image_;
     std::unique_ptr<X86Interpreter> cpu_;
     std::unique_ptr<OrbisRuntime> runtime_;
+    VideoOutManager* video_out_{nullptr};
     std::uint64_t tcb_address_{0};
 
     std::uint64_t total_steps_{0};

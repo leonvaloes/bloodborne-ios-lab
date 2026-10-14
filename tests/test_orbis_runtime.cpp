@@ -194,7 +194,7 @@ int main() {
     assert(call("atexit",0)==0x80020016);
     assert(call("atexit",0x1234)==0);
     bool failed=false;
-    try { call("sceVideoOutOpen"); } catch(const std::runtime_error& e) {
+    try { call("unknown_dummy_symbol"); } catch(const std::runtime_error& e) {
         failed=std::string(e.what()).find("import não implementado")!=std::string::npos;
     }
     assert(failed);
@@ -240,8 +240,13 @@ int main() {
     // Set up VFS and initialize SaveDataManager with it before HLE calls
     VirtualFileSystem vfs;
     std::string temp_dir = std::filesystem::temp_directory_path().string() + "/save_test_" + std::to_string(getpid());
+    std::string save_base_dir = std::filesystem::temp_directory_path().string() + "/save_data_test_" + std::to_string(getpid());
+    std::error_code ec_clean;
+    std::filesystem::remove_all(temp_dir, ec_clean);
+    std::filesystem::remove_all(save_base_dir, ec_clean);
+
     assert(vfs.mount("/save", temp_dir));
-    rt.save_data_manager().initialize(std::filesystem::temp_directory_path().string() + "/save_data_test_" + std::to_string(getpid()), 32 * 1024 * 1024, &vfs);
+    rt.save_data_manager().initialize(save_base_dir, 32 * 1024 * 1024, &vfs);
 
     SceSaveDataInitParams save_params{};
     save_params.max_quota_per_slot = 32768;
@@ -265,6 +270,8 @@ int main() {
     assert(std::string(sres.point.data).find("/savedata") != std::string::npos);
     assert(m.store(0x5600, &sres.point, sizeof(sres.point)) == MemoryError::ok);
     assert(call("sceSaveDataUmount", 0x5600, 1) == 0);
+    std::filesystem::remove_all(temp_dir, ec_clean);
+    std::filesystem::remove_all(save_base_dir, ec_clean);
 
     auto audio_h = call("sceAudioOutOpen", uid, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 512, 48000, SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
     assert(static_cast<std::int32_t>(audio_h) > 0);
@@ -323,6 +330,48 @@ int main() {
     assert(std::abs(call_math_f("cosf", 0.0f) - 1.0f) < 1e-5f);
     assert(std::abs(call_math_f("sqrtf", 25.0f) - 5.0f) < 1e-5f);
     assert(std::abs(call_math_f("fabsf", -99.5f) - 99.5f) < 1e-5f);
+
+    // SysV: GPRs não são fallback para parâmetros FP, nem quando XMM contém +0 ou -0.
+    auto double_bits = [](double value) {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    };
+    auto float_bits = [](float value) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    };
+    auto check_double_abi = [&](const char* name, double x, double expected) {
+        cpu.state = {};
+        cpu.state.xmm[0][0] = double_bits(x);
+        cpu.state.gpr[7] = double_bits(1.0); // RDI conflitante com XMM0
+        rt.invoke(name, cpu.state);
+        assert(cpu.state.xmm[0][0] == double_bits(expected));
+    };
+    auto check_float_abi = [&](const char* name, float x, float expected) {
+        cpu.state = {};
+        cpu.state.xmm[0][0] = 0xDEADBEEF00000000ULL | float_bits(x);
+        cpu.state.gpr[7] = float_bits(1.0f); // RDI conflitante com XMM0
+        rt.invoke(name, cpu.state);
+        assert(static_cast<std::uint32_t>(cpu.state.xmm[0][0]) == float_bits(expected));
+    };
+    for (double zero_arg : {0.0, -0.0}) {
+        check_double_abi("cos", zero_arg, 1.0);
+        check_double_abi("exp", zero_arg, 1.0);
+        check_double_abi("sqrt", zero_arg, zero_arg); // preserva sinal de -0
+    }
+    for (float zero_arg : {0.0f, -0.0f}) {
+        check_float_abi("cosf", zero_arg, 1.0f);
+        check_float_abi("sqrtf", zero_arg, zero_arg);
+    }
+    // XMM1 também é independente de RSI em funções binárias.
+    cpu.state = {};
+    cpu.state.xmm[0][0] = double_bits(2.0);
+    cpu.state.xmm[1][0] = double_bits(0.0);
+    cpu.state.gpr[6] = double_bits(3.0);
+    rt.invoke("pow", cpu.state);
+    assert(cpu.state.xmm[0][0] == double_bits(1.0));
 
     // 4. Conversões & Ordenação (strtol, strtoul, strtod, strtof, qsort, bsearch)
     assert(m.store(0x5a00, " -98765xyz", 11) == MemoryError::ok);
@@ -396,6 +445,87 @@ int main() {
 
     // 6. _sceKernelRtldSetApplicationHeapAPI
     assert(call("_sceKernelRtldSetApplicationHeapAPI", 0x9000) == 0);
+
+    // 7. libSceVideoOut HLE
+    {
+        struct TestVideoSink : public VideoOutSink {
+            void on_flip(const FlipEvent&) override {}
+        } test_sink;
+        VideoOutManager vom(16);
+        vom.attach_guest_memory(&m, &test_sink);
+        rt.attach_video_out(&vom);
+
+        auto vh = call("sceVideoOutOpen", 0, 0, 0, 0);
+        assert(vh > 0);
+        assert(call("sceVideoOutSetFlipRate", vh, 60) == 0);
+        assert(call("sceVideoOutAddFlipEvent", 0, vh, 0) == 0);
+
+        constexpr std::uint64_t attr_addr = 0x6000;
+        assert(call("sceVideoOutSetBufferAttribute", attr_addr, 0, 0, 0, 2, 2, 2) == 0);
+        std::uint32_t read_attr[6] = {};
+        assert(m.load(attr_addr, read_attr, sizeof(read_attr)) == MemoryError::ok);
+        assert(read_attr[3] == 2 && read_attr[4] == 2 && read_attr[5] == 2);
+
+        constexpr std::uint64_t addrs_ptr = 0x6100;
+        constexpr std::uint64_t buf0_addr = 0x7000;
+        assert(m.store(addrs_ptr, &buf0_addr, 8) == MemoryError::ok);
+        assert(call("sceVideoOutRegisterBuffers", vh, 0, addrs_ptr, 1, attr_addr) == 0);
+
+        assert(call("sceVideoOutSubmitFlip", vh, 0, 0, 42) == 0);
+        assert(vom.has_new_frame());
+        assert(vom.flip_count() == 1);
+
+        constexpr std::uint64_t status_addr = 0x6200;
+        assert(call("sceVideoOutGetFlipStatus", vh, status_addr) == 0);
+        std::uint64_t flip_seq = 0;
+        assert(m.load(status_addr, &flip_seq, 8) == MemoryError::ok && flip_seq == 1);
+
+        assert(call("sceVideoOutClose", vh) == 0);
+    }
+
+    // 8. stdio HLE memory safety
+    {
+        std::string tmp_file = (std::filesystem::temp_directory_path() / ("hle_stdio_test_" + std::to_string(getpid()) + ".tmp")).string();
+        assert(m.store(0x6300, tmp_file.c_str(), tmp_file.size() + 1) == MemoryError::ok);
+        assert(m.store(0x6400, "wb+", 4) == MemoryError::ok);
+
+        auto fh = call("fopen", 0x6300, 0x6400);
+        assert(fh > 0);
+
+        // Escape path traversal must be rejected
+        assert(m.store(0x6350, "../escape.txt", 14) == MemoryError::ok);
+        assert(call("fopen", 0x6350, 0x6400) == 0);
+
+        // Safe fwrite via guest memory
+        assert(m.store(0x6500, "Hello Orbis Stdio!\n", 20) == MemoryError::ok);
+        assert(call("fwrite", 0x6500, 1, 20, fh) == 20);
+
+        // fseek & ftell
+        assert(call("fseek", fh, 0, 0) == 0);
+        assert(call("ftell", fh) == 0);
+
+        // Safe fread via guest memory
+        assert(call("fread", 0x6600, 1, 5, fh) == 5);
+        char read_buf[16] = {};
+        assert(m.load(0x6600, read_buf, 5) == MemoryError::ok);
+        assert(std::string(read_buf, 5) == "Hello");
+
+        // Safe fgets via guest memory
+        assert(call("fseek", fh, 0, 0) == 0);
+        assert(call("fgets", 0x6700, 32, fh) == 0x6700);
+        char line_buf[32] = {};
+        assert(m.load(0x6700, line_buf, sizeof(line_buf)) == MemoryError::ok);
+        assert(std::string(line_buf) == "Hello Orbis Stdio!\n");
+
+        assert(call("fclose", fh) == 0);
+
+        // Operation on closed handle returns error safely without crashing
+        assert(call("fread", 0x6600, 1, 4, fh) == 0);
+        assert(call("fclose", fh) == static_cast<std::uint64_t>(-1));
+
+        std::error_code rm_ec;
+        std::filesystem::remove(tmp_file, rm_ec);
+    }
 
     // =========================================================================
     // Testes de máquina guest com GuestScheduler e adaptador scheduler-traps

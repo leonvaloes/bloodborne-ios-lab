@@ -909,13 +909,35 @@ void Exec::two_byte(int opsz) {
     }
     case 0xA3: case 0xAB: case 0xB3: case 0xBB: {
         const Rm rm = decode_rm(rg, 0);
-        if (!rm.reg) throw Unsupported{};
-        const unsigned bit = static_cast<unsigned>(rd_reg(rg, opsz)) & (opsz * 8 - 1);
-        const std::uint64_t v = rd_reg(rm.r, opsz);
-        set_flag(FLAG_CF, ((v >> bit) & 1) != 0);
-        if (op2 == 0xAB) wr_reg(rm.r, opsz, v | (1ULL << bit));
-        else if (op2 == 0xB3) wr_reg(rm.r, opsz, v & ~(1ULL << bit));
-        else if (op2 == 0xBB) wr_reg(rm.r, opsz, v ^ (1ULL << bit));
+        if (rm.reg) {
+            const unsigned bit = static_cast<unsigned>(rd_reg(rg, opsz)) & (opsz * 8 - 1);
+            const std::uint64_t v = rd_reg(rm.r, opsz);
+            set_flag(FLAG_CF, ((v >> bit) & 1) != 0);
+            if (op2 == 0xAB) wr_reg(rm.r, opsz, v | (1ULL << bit));
+            else if (op2 == 0xB3) wr_reg(rm.r, opsz, v & ~(1ULL << bit));
+            else if (op2 == 0xBB) wr_reg(rm.r, opsz, v ^ (1ULL << bit));
+        } else {
+            std::int64_t bit_offset = 0;
+            if (opsz == 2) bit_offset = static_cast<std::int16_t>(rd_reg(rg, 2));
+            else if (opsz == 4) bit_offset = static_cast<std::int32_t>(rd_reg(rg, 4));
+            else bit_offset = static_cast<std::int64_t>(rd_reg(rg, 8));
+
+            const std::uint64_t target_addr = rm.addr + static_cast<std::uint64_t>(bit_offset >> 3);
+            const unsigned bit = static_cast<unsigned>(bit_offset & 7);
+            std::uint8_t byte_val = 0;
+            if (m.load(target_addr, &byte_val, 1) != MemoryError::ok) throw Fault{target_addr};
+            set_flag(FLAG_CF, ((byte_val >> bit) & 1) != 0);
+            if (op2 == 0xAB) {
+                byte_val |= static_cast<std::uint8_t>(1u << bit);
+                if (m.store(target_addr, &byte_val, 1) != MemoryError::ok) throw Fault{target_addr};
+            } else if (op2 == 0xB3) {
+                byte_val &= static_cast<std::uint8_t>(~(1u << bit));
+                if (m.store(target_addr, &byte_val, 1) != MemoryError::ok) throw Fault{target_addr};
+            } else if (op2 == 0xBB) {
+                byte_val ^= static_cast<std::uint8_t>(1u << bit);
+                if (m.store(target_addr, &byte_val, 1) != MemoryError::ok) throw Fault{target_addr};
+            }
+        }
         return;
     }
     case 0xBC: case 0xBD: case 0xB8: {
@@ -1394,7 +1416,13 @@ void Exec::step() {
         if (rw) wr_reg(rg, 8, static_cast<std::uint64_t>(sext(v, 4))); else wr_reg(rg, opsz, v);
         break;
     }
-    case 0x68: push(static_cast<std::uint64_t>(sext(u32(), 4))); break;
+    case 0x68:
+        if (p66) {
+            const std::uint16_t v = u16();
+            wr_mem(s.gpr[4] - 2, 2, v);
+            s.gpr[4] -= 2;
+        } else push(static_cast<std::uint64_t>(sext(u32(), 4)));
+        break;
     case 0x6A: push(static_cast<std::uint64_t>(sext(u8(), 1))); break;
     case 0x69: case 0x6B: {
         const int ib = (op == 0x6B) ? 1 : (opsz == 2 ? 2 : 4);
@@ -1455,10 +1483,10 @@ void Exec::step() {
         break;
     }
     case 0x8D: {
-        const bool saved_fs = fs;
-        fs = false;
+        const bool saved_fs = fs, saved_gs = gs;
+        fs = gs = false;
         const Rm rm = decode_rm(rg, 0);
-        fs = saved_fs;
+        fs = saved_fs; gs = saved_gs;
         if (rm.reg) throw UdEx{};
         wr_reg(rg, opsz, rm.addr);
         break;
@@ -1513,7 +1541,9 @@ void Exec::step() {
         const int ib = (op == 0xC0 || op == 0xC1) ? 1 : 0;
         const Rm rm = decode_rm(rg, ib);
         unsigned count = (op <= 0xC1) ? u8() : (op <= 0xD1 ? 1 : static_cast<unsigned>(s.gpr[1] & 0xFF));
-        wr_rm(rm, sz, shift(rg & 7, rd_rm(rm, sz), count, sz));
+        const std::uint64_t value = rd_rm(rm, sz);
+        if ((count & (sz == 8 ? 0x3F : 0x1F)) != 0)
+            wr_rm(rm, sz, shift(rg & 7, value, count, sz));
         break;
     }
     case 0xC2: { const std::uint16_t extra = u16(); s.rip = pop(); s.gpr[4] += extra; return; }
@@ -1695,7 +1725,8 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
             (op >= 0xF6 && op <= 0xF7) || (op >= 0xFE);
         if (op >= 0xB0 && op <= 0xBF) imm = op < 0xB8 ? 1 : w ? 8 : opsz16 ? 2 : 4;
         if (op < 0x40 && (op & 7) >= 4 && (op & 7) <= 5) imm = (op & 7) == 4 ? 1 : opsz16 ? 2 : 4;
-        if (op == 0x68 || op == 0xE8 || op == 0xE9 || op == 0xA9) imm = 4;
+        if (op == 0x68 || op == 0xA9) imm = opsz16 ? 2 : 4;
+        if (op == 0xE8 || op == 0xE9) imm = 4;
         if (op == 0x6A || op == 0xEB || op == 0xA8 || op == 0xCD || op == 0xC0 || op == 0xC1 || op == 0x6B || op == 0x80 || op == 0x83 || op == 0xC6) imm = 1;
         if (op == 0x69 || op == 0x81 || op == 0xC7) imm = opsz16 ? 2 : 4;
         if (op == 0xC2 || op == 0xC8) imm = 2 + (op == 0xC8);

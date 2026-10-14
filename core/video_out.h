@@ -66,9 +66,10 @@ struct HostFrameBuffer {
 // Modo sintético registra metadados, mas nunca produz pixels nem frame válido.
 class VideoOutManager {
 public:
-    explicit VideoOutManager(std::uint32_t max_buffers = 16) : max_buffers_(max_buffers) {
-        internal_buffers_.resize(max_buffers);
-        internal_occupied_.resize(max_buffers, false);
+    explicit VideoOutManager(std::uint32_t max_buffers = 16)
+        : max_buffers_(std::min<std::uint32_t>(max_buffers, 16)) {
+        internal_buffers_.resize(max_buffers_);
+        internal_occupied_.resize(max_buffers_, false);
     }
     ~VideoOutManager() = default;
 
@@ -124,8 +125,7 @@ public:
         if (video_out_) {
             auto status = video_out_->submit_flip(index, argument);
             if (status == VideoStatus::ok) {
-                // Atualiza estado interno para has_new_frame() funcionar
-                internal_last_flip_ = {index, argument, video_out_->last_flip().sequence};
+                internal_last_flip_ = video_out_->last_flip();
                 internal_has_new_frame_ = true;
             }
             return status;

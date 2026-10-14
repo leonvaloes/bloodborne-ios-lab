@@ -15,8 +15,8 @@ const GuestScheduler::Thread* GuestScheduler::find(Id id) const { auto it=thread
 GuestScheduler::Id GuestScheduler::create(std::uint64_t entry, std::uint64_t bottom, std::uint64_t top, std::uint64_t ret, std::uint64_t arg) {
     if (!entry || !ret || bottom>=top || top-bottom<16 || top<8 || next_==0) return 0;
     for (const auto& kv:threads_) if (bottom<kv.second.stack_top && kv.second.stack_bottom<top) return 0;
-    const auto rsp=(top-8)&~std::uint64_t(15); // SysV entry: rsp % 16 == 8
-    const auto slot=rsp-8;
+    // The return address occupies [rsp, rsp+8); at SysV function entry rsp % 16 == 8.
+    const auto slot=((top-16)&~std::uint64_t(15))+8;
     if (slot<bottom || mem_.store(slot,&ret,8)!=MemoryError::ok) return 0;
     const Id id=next_++;
     auto& t=threads_[id]; t.cpu.rip=entry; t.cpu.gpr[4]=slot; t.cpu.gpr[7]=arg;
@@ -62,6 +62,10 @@ std::int32_t GuestScheduler::join(Id caller, Id target, std::uint64_t* out, std:
 std::int32_t GuestScheduler::cancel(Id id) {
     auto* t=find(id); if (!t || t->state!=State::waiting) return ORBIS_KERNEL_ERROR_EINVAL;
     if (t->wait==Wait::cond || t->wait==Wait::reacquire) { reacquire(id,t->mutex,ORBIS_KERNEL_ERROR_ECANCELED); return ORBIS_OK; }
+    if (t->wait==Wait::mutex) {
+        auto& w = mutexes_.at(t->object).waiters;
+        w.erase(std::remove(w.begin(), w.end(), id), w.end());
+    }
     if (t->wait==Wait::sema) {
         auto it = semas_.find(t->object);
         if (it != semas_.end()) {
@@ -77,6 +81,11 @@ void GuestScheduler::advance(std::uint64_t us) {
         auto& t=kv.second;
         if (t.state!=State::waiting || !t.timed || now_<t.deadline) continue;
         if (t.wait==Wait::cond || t.wait==Wait::reacquire) reacquire(kv.first,t.mutex,ORBIS_KERNEL_ERROR_ETIMEDOUT);
+        else if (t.wait==Wait::mutex) {
+            auto& w = mutexes_.at(t.object).waiters;
+            w.erase(std::remove(w.begin(), w.end(), kv.first), w.end());
+            ready(kv.first, ORBIS_KERNEL_ERROR_ETIMEDOUT);
+        }
         else if (t.wait==Wait::sema) {
             auto it = semas_.find(t.object);
             if (it != semas_.end()) {
@@ -325,7 +334,23 @@ GuestScheduler::Result GuestScheduler::run(std::uint64_t max_steps) {
     struct RunGuard { bool& flag; ~RunGuard() { flag=false; } } guard{running_};
     running_=true;
     Result out{Stop::budget,0,0,{}};
-    while (out.steps<max_steps && !ready_.empty()) {
+    while (out.steps<max_steps) {
+        if (ready_.empty()) {
+            // Virtual time normally advances with retired instructions. When every
+            // runnable thread sleeps, jump to the next finite wait deadline.
+            std::uint64_t deadline=UINT64_MAX;
+            bool timed=false;
+            for (const auto& kv:threads_) {
+                const auto& t=kv.second;
+                if (t.state==State::waiting && t.timed) {
+                    timed=true;
+                    deadline=std::min(deadline,t.deadline);
+                }
+            }
+            if (!timed) break;
+            advance(deadline-now_);
+            continue;
+        }
         Id id=ready_.front(); ready_.pop_front(); auto& t=threads_.at(id);
         if (t.state!=State::ready) continue;
         if (t.on_resume) {

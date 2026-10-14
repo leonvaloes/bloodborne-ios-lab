@@ -16,6 +16,7 @@ int main() { return run([] {
     CHECK(video.register_buffer(16, {0x1000, 2, 2, 2, 4}) == bb::VideoStatus::invalid);
     CHECK(video.register_buffer(0, {0x1000, 3, 2, 2, 4}) == bb::VideoStatus::invalid);
     CHECK(video.register_buffer(0, {UINT64_MAX - 3, 2, 2, 2, 4}) == bb::VideoStatus::overflow);
+    CHECK(video.register_buffer(0, {0x1000, 4097, 4096, 4097, 4}) == bb::VideoStatus::overflow);
     CHECK(video.register_buffer(0, {0x8000, 2, 2, 2, 4}) == bb::VideoStatus::unmapped);
     CHECK(video.register_buffer(0, {0x1000, 2, 2, 2, 4}) == bb::VideoStatus::ok);
     CHECK(video.register_buffer(0, {0x1000, 2, 2, 2, 4}) == bb::VideoStatus::occupied);

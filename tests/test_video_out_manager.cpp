@@ -16,6 +16,8 @@ int main() { return run([] {
     CHECK(memory.map(0x1000, 4096, bb::read | bb::write) == bb::MemoryError::ok);
     Sink sink;
     bb::VideoOutManager manager;
+    bb::VideoOutManager capped(17);
+    CHECK(capped.register_buffer(16, {0x1000, 2, 2, 2, 4}) == bb::VideoStatus::invalid);
     bb::HostFrameBuffer frame;
     const bb::VideoBuffer buffer{0x1000, 2, 2, 2, 4};
     CHECK(manager.register_buffer(0, buffer) == bb::VideoStatus::ok);

@@ -58,12 +58,17 @@ bool HostBridge::init(const HostBridgeConfig& config) {
     boot_config.require_essential_assets = config_.require_essential_assets;
     boot_config.enable_hle = config_.enable_hle;
 
+    boot_coordinator_.attach_video_out(&video_out_);
+
     if (!boot_coordinator_.initialize(boot_config)) {
         // Preserva o diagnóstico de falha; reset() limpa recursos parciais mesmo sem initialized_.
         return false;
     }
 
     video_out_.attach_guest_memory(boot_coordinator_.guest_memory(), &video_sink_);
+    if (boot_coordinator_.runtime()) {
+        boot_coordinator_.runtime()->attach_video_out(&video_out_);
+    }
     touch_controls_.bind_input_manager(&input_);
     pad_hle_.set_default_input(&input_);
 

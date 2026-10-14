@@ -6,6 +6,8 @@
 #include "user_service.h"
 #include "save_data.h"
 #include "audio_out.h"
+#include "video_out.h"
+#include <cstdio>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -33,9 +35,13 @@ public:
     };
 
     explicit OrbisRuntime(GuestMemory& memory);
+    ~OrbisRuntime();
     // Explicit opt-in; blocking guest services must be dispatched by a scheduler-aware
     // trap driver, not through invoke() on the host thread.
     void attach_scheduler(GuestScheduler& scheduler) { scheduler_ = &scheduler; }
+    void attach_video_out(VideoOutManager* video_out) { video_out_ = video_out; }
+    VideoOutManager* video_out() { return video_out_; }
+    const VideoOutManager* video_out() const { return video_out_; }
     void set_procparam(std::uint64_t address) { procparam_ = address; }
     std::uint64_t procparam() const { return procparam_; }
     std::string resolve(const std::string& import) const;
@@ -90,6 +96,8 @@ private:
     PadHleManager pad_mgr_;
     SaveDataManager save_mgr_;
     AudioOutManager audio_mgr_;
+    VideoOutManager* video_out_ = nullptr;
+    std::unordered_map<std::uint64_t, FILE*> open_files_;
     struct PendingCallback { std::uint64_t key = 0, return_address = 0, return_trap = 0; };
     std::unordered_map<GuestScheduler::Id, PendingCallback> callbacks_;
     std::unordered_map<std::uint64_t, GuestScheduler::Id> guest_mutexes_, guest_conds_, guest_events_, guest_semas_;
