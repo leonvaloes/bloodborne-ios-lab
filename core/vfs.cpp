@@ -13,11 +13,19 @@ namespace bb {
 
 VirtualFileSystem::VirtualFileSystem() = default;
 
-bool VirtualFileSystem::mount_bhd5(const std::string &mount_point, std::shared_ptr<Bhd5Reader> reader) {
+bool VirtualFileSystem::mount_bhd5(const std::string &mount_point, std::shared_ptr<Bhd5Reader> reader, int priority) {
     if (mount_point.empty() || !reader) return false;
     std::string norm_mount = normalize_path(mount_point);
     std::lock_guard<std::mutex> lock(mutex_);
-    bhd5_mounts_[norm_mount] = std::move(reader);
+    for (auto it = bhd5_mounts_.begin(); it != bhd5_mounts_.end(); ++it) {
+        if (it->mount_point == norm_mount && it->reader == reader) {
+            bhd5_mounts_.erase(it);
+            break;
+        }
+    }
+    auto pos = std::upper_bound(bhd5_mounts_.begin(), bhd5_mounts_.end(), priority,
+        [](int prio, const Bhd5Mount &m) { return prio > m.priority; });
+    bhd5_mounts_.insert(pos, Bhd5Mount{norm_mount, std::move(reader), priority});
     return true;
 }
 
@@ -101,7 +109,12 @@ bool VirtualFileSystem::unmount(const std::string &mount_point) {
     std::string norm_mount = normalize_path(mount_point);
     std::lock_guard<std::mutex> lock(mutex_);
     bool erased = mounts_.erase(norm_mount) > 0;
-    erased = (bhd5_mounts_.erase(norm_mount) > 0) || erased;
+    auto it = std::remove_if(bhd5_mounts_.begin(), bhd5_mounts_.end(),
+        [&](const Bhd5Mount &m) { return m.mount_point == norm_mount; });
+    if (it != bhd5_mounts_.end()) {
+        bhd5_mounts_.erase(it, bhd5_mounts_.end());
+        erased = true;
+    }
     erased = (bnd4_mounts_.erase(norm_mount) > 0) || erased;
     return erased;
 }
@@ -109,9 +122,11 @@ bool VirtualFileSystem::unmount(const std::string &mount_point) {
 bool VirtualFileSystem::is_mounted(const std::string &mount_point) const {
     std::string norm_mount = normalize_path(mount_point);
     std::lock_guard<std::mutex> lock(mutex_);
-    return mounts_.find(norm_mount) != mounts_.end() ||
-           bhd5_mounts_.find(norm_mount) != bhd5_mounts_.end() ||
-           bnd4_mounts_.find(norm_mount) != bnd4_mounts_.end();
+    if (mounts_.find(norm_mount) != mounts_.end()) return true;
+    for (const auto &m : bhd5_mounts_) {
+        if (m.mount_point == norm_mount) return true;
+    }
+    return bnd4_mounts_.find(norm_mount) != bnd4_mounts_.end();
 }
 
 VfsError VirtualFileSystem::resolve(const std::string &virtual_path, std::string &out_host_path, bool &out_readonly) const {
@@ -212,12 +227,12 @@ bool VirtualFileSystem::exists(const std::string &virtual_path) const {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto &pair : bhd5_mounts_) {
-            const std::string &m = pair.first;
-            if (norm == m || norm.rfind(m + "/", 0) == 0) {
-                std::string rel = norm.substr(m.size());
+        for (const auto &m : bhd5_mounts_) {
+            const std::string &mp = m.mount_point;
+            if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
+                std::string rel = norm.substr(mp.size());
                 if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
-                if (pair.second && pair.second->has_file(rel)) return true;
+                if (m.reader && m.reader->has_file(rel)) return true;
             }
         }
         for (const auto &pair : bnd4_mounts_) {
@@ -243,13 +258,13 @@ VfsError VirtualFileSystem::stat(const std::string &virtual_path, VfsStat &out_s
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto &pair : bhd5_mounts_) {
-            const std::string &m = pair.first;
-            if (norm == m || norm.rfind(m + "/", 0) == 0) {
-                std::string rel = norm.substr(m.size());
+        for (const auto &m : bhd5_mounts_) {
+            const std::string &mp = m.mount_point;
+            if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
+                std::string rel = norm.substr(mp.size());
                 if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
-                if (pair.second) {
-                    const auto *entry = pair.second->get_entry(rel);
+                if (m.reader) {
+                    const auto *entry = m.reader->get_entry(rel);
                     if (entry) {
                         out_stat.size = entry->file_size;
                         out_stat.is_directory = false;
@@ -305,13 +320,13 @@ VfsError VirtualFileSystem::read_file(const std::string &virtual_path, std::vect
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto &pair : bhd5_mounts_) {
-            const std::string &m = pair.first;
-            if (norm == m || norm.rfind(m + "/", 0) == 0) {
-                std::string rel = norm.substr(m.size());
+        for (const auto &m : bhd5_mounts_) {
+            const std::string &mp = m.mount_point;
+            if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
+                std::string rel = norm.substr(mp.size());
                 if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
-                if (pair.second && pair.second->has_file(rel)) {
-                    BinderError b_err = pair.second->read_file(rel, out_data);
+                if (m.reader && m.reader->has_file(rel)) {
+                    BinderError b_err = m.reader->read_file(rel, out_data);
                     if (b_err == BinderError::ok) return VfsError::ok;
                     return VfsError::io_error;
                 }
@@ -362,32 +377,41 @@ VfsError VirtualFileSystem::read_at(const std::string &virtual_path, std::uint64
     // Archive mounts take precedence over host directories with the same path.
     // Copy the reader under the lock, then perform potentially slow BDT I/O unlocked.
     std::shared_ptr<Bhd5Reader> archive;
-    std::size_t mount_length = 0;
+    std::string archive_rel;
+    bool matched_bhd_mount = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto &pair : bhd5_mounts_) {
-            const auto &m = pair.first;
-            if ((norm == m || norm.rfind(m + "/", 0) == 0) && m.size() >= mount_length) {
-                archive = pair.second;
-                mount_length = m.size();
+        for (const auto &m : bhd5_mounts_) {
+            const std::string &mp = m.mount_point;
+            if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
+                matched_bhd_mount = true;
+                std::string rel = norm.substr(mp.size());
+                if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+                if (m.reader && m.reader->has_file(rel)) {
+                    archive = m.reader;
+                    archive_rel = rel;
+                    break;
+                }
             }
         }
-        for (const auto &pair : bnd4_mounts_) {
-            const auto &m = pair.first;
-            if (norm == m || norm.rfind(m + "/", 0) == 0) {
-                if (m.size() >= mount_length) return VfsError::access_denied;
+        if (!archive && !matched_bhd_mount) {
+            for (const auto &pair : bnd4_mounts_) {
+                const auto &m = pair.first;
+                if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                    return VfsError::access_denied;
+                }
             }
         }
     }
     if (archive) {
-        if (norm.size() <= mount_length + 1) return VfsError::not_found;
-        const std::string relative = norm.substr(mount_length + 1);
-        if (!archive->has_file(relative)) return VfsError::not_found;
         if (!bytes_to_read) return VfsError::ok;
-        const BinderError err = archive->stream_file(relative, offset, dest, bytes_to_read, out_bytes_read);
+        const BinderError err = archive->stream_file(archive_rel, offset, dest, bytes_to_read, out_bytes_read);
         if (err == BinderError::ok) return VfsError::ok;
         if (err == BinderError::file_not_found) return VfsError::not_found;
         return VfsError::io_error;
+    }
+    if (matched_bhd_mount) {
+        return VfsError::not_found;
     }
 
     std::string host_path;

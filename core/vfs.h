@@ -40,7 +40,7 @@ public:
     bool is_mounted(const std::string &mount_point) const;
 
     // Montagem direta de pacotes FromSoftware BHD5/BDT e BND4 no VFS
-    bool mount_bhd5(const std::string &mount_point, std::shared_ptr<Bhd5Reader> reader);
+    bool mount_bhd5(const std::string &mount_point, std::shared_ptr<Bhd5Reader> reader, int priority = 0);
     bool mount_bnd4(const std::string &mount_point, std::shared_ptr<Bnd4Reader> reader);
 
     // Normaliza e resolve um caminho virtual para caminho f?sico host
@@ -69,9 +69,15 @@ private:
         bool read_only{true};
     };
 
+    struct Bhd5Mount {
+        std::string mount_point;
+        std::shared_ptr<Bhd5Reader> reader;
+        int priority{0};
+    };
+
     mutable std::mutex mutex_;
     std::unordered_map<std::string, MountPoint> mounts_;
-    std::unordered_map<std::string, std::shared_ptr<Bhd5Reader>> bhd5_mounts_;
+    std::vector<Bhd5Mount> bhd5_mounts_;
     std::unordered_map<std::string, std::shared_ptr<Bnd4Reader>> bnd4_mounts_;
 };
 
