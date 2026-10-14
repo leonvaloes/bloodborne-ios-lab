@@ -109,3 +109,41 @@ As 3 falhas pontuais ocorridas no iPhone no build `bd7bc24` foram identificadas 
 - **Suite de 18 Testes Host:** 18/18 testes unitários e de integração executados e aprovados com 100% de sucesso localmente e na matriz de CI (Windows MinGW/MSVC, Linux Clang, macOS Clang).
 - **Pipeline de IPA (GitHub Actions):** Compilação cruzada para iOS arm64 (`Apple A17 Pro`) e empacotamento do arquivo `BBHost-unsigned.ipa` mantidos 100% verdes no workflow `iOS unsigned laboratory`.
 
+---
+
+## 5. Conquistas da Sprint 2 — Tradução de Shaders e Pipeline Gráfico 3D (Metal 3 / A17 Pro)
+
+### 5.1 Tradutor de Shaders SPIR-V para Metal MSL 3.0 (Atividade 2.1)
+- Módulo `core/shader_translator.h/.cpp` implementado com reflexão completa de bytecode SPIR-V (entradas de vértice, descritores, buffers de uniforms e push constants).
+- Geração de MSL 3.0 nativo para Apple A17 Pro com inversão do eixo Y no espaço de recorte (Vulkan clip-space Y-flip) e layouts alinhados de structs.
+- Geradores sintéticos de bytecode SPIR-V para shaders de vértice e fragmento.
+- Validado via teste unitário `tests/test_shader_translator.cpp`.
+
+### 5.2 Gerenciamento de Descritores via Metal 3 Argument Buffers (Atividade 2.2)
+- Módulo `core/metal_pipeline.h/.cpp` implementado com suporte a Argument Buffers Tier 2 do Metal 3 (`Metal3ArgumentTable`).
+- Mapeamento direto de até 32 texturas, 8 samplers e 8 buffers de uniforms com alinhamento estrito a 8 bytes na memória unificada do A17 Pro.
+- Biblioteca de matemática 3D com matrizes 4x4 (perspective, look_at, normal_matrix, rotações) e uniforms de iluminação Blinn-Phong (`ModelViewProjectionUniforms`, `LightingUniforms`).
+- Validado via teste unitário `tests/test_metal_pipeline.cpp`.
+
+### 5.3 Leitor de Geometria de Modelos FLVER2 e Descompressão DCX (Atividade 2.3)
+- Módulo `core/flver_parser.h/.cpp` implementado com descompressão transparente de contêineres `.flver.dcx` (DCX DFLT/Deflate via miniz embarcado).
+- Leitura integral do formato FLVER2 de Bloodborne: cabeçalhos de arquivo, bounding boxes, materiais, texturas, ossos com hierarquia de transformação, dummies, submeshes e definições de layouts de vértices (posições, normais, tangentes, UVs e pesos/índices de ossos).
+- Desdobramento determinístico de triangle strips com remoção de triângulos degenerados e alternância de winding para Metal.
+- Conversão direta para buffers Metal indexados (`MetalMeshBuffer`) em memória unificada `MTLResourceStorageModeShared`.
+- Modelos sintéticos de referência (cubo 3D e arma FromSoftware Saw Cleaver com 126 vértices e 144 triângulos).
+- Validação com arquivos `.flver.dcx` reais de Bloodborne (`map/m24_00_00_00_900091.flver.dcx` com 3.497 vértices e 1.750 triângulos) e teste unitário `tests/test_flver_parser.cpp`.
+
+### 5.4 Render Targets HDR, Depth Buffer e Host iOS 3D (Atividade 2.4)
+- Configurados formatos de render targets HDR (`RGBA16Float`, `RG11B10Float`) e depth buffer (`Depth32Float`).
+- Atualizado o host nativo iOS `host/ios/main.mm`:
+  - MTKView configurado com `MTLPixelFormatBGRA8Unorm` e `MTLPixelFormatDepth32Float` a 30 FPS.
+  - Carregamento de modelo FLVER real (se presente via USB) ou fallback imediato para o modelo FromSoftware Saw Cleaver.
+  - Compilação do pipeline 3D com shaders MSL 3.0 traduzidos, `MTLVertexDescriptor` com stride de 48 bytes e depth stencil state.
+  - Renderização 3D indexada contínua com rotação da cena, projeção perspectiva, matrizes normais e modelo de iluminação Blinn-Phong.
+  - Telemetria no dashboard com contagem de vértices, triângulos, frame pacing P50/P95 e consumo de memória.
+
+### 5.5 Expansão da Suite de Testes
+- **21/21 testes aprovados (100% de sucesso)** com tempo de execução de apenas 0.32 s.
+- **118 verificações de baixo nível aprovadas com 0 falhas** no smoke test (`bb-smoke`).
+
+

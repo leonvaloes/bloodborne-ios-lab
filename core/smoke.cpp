@@ -12,6 +12,9 @@
 #include "audio.h"
 #include "stability.h"
 #include "engine_loop.h"
+#include "shader_translator.h"
+#include "metal_pipeline.h"
+#include "flver_parser.h"
 #include <limits>
 #include <cmath>
 #include <cstring>
@@ -274,6 +277,32 @@ SmokeReport smoke() {
     engine.shutdown();
     check(!engine.is_initialized());
     std::filesystem::remove_all(sbox, sec);
+
+    // Sprint 2: SPIR-V Shader Translation & Metal 3 Pipeline (4 checks)
+    auto vert_spv = ShaderTranslator::build_basic_vertex_spirv();
+    std::string spv_err;
+    check(ShaderTranslator::validate_spirv_header(vert_spv.data(), vert_spv.size(), spv_err));
+    auto vert_msl = ShaderTranslator::translate_spirv_to_msl(vert_spv);
+    check(vert_msl.success && !vert_msl.msl_source.empty());
+
+    auto frag_spv = ShaderTranslator::build_basic_fragment_spirv();
+    auto frag_msl = ShaderTranslator::translate_spirv_to_msl(frag_spv);
+    check(frag_msl.success && frag_msl.msl_source.find("fragment_main") != std::string::npos);
+
+    Metal3ArgumentTable arg_table{};
+    arg_table.bind_texture(0, 0x10008000ULL);
+    arg_table.bind_buffer(0, 0x20008000ULL);
+    check(arg_table.validate());
+
+    // Sprint 2: FLVER 3D Geometry Parser & Metal Unified Buffers (4 checks)
+    auto cube_data = FlverParser::create_synthetic_flver_cube();
+    check(FlverParser::is_flver_data(cube_data.data(), cube_data.size()));
+    FlverModel flver_model{};
+    std::string flver_err;
+    check(FlverParser::parse(cube_data.data(), cube_data.size(), flver_model, flver_err));
+    check(flver_model.total_vertex_count() == 8 && flver_model.total_triangle_count() == 12);
+    auto metal_mesh = FlverParser::convert_to_metal_buffers(flver_model);
+    check(metal_mesh.vertex_count == 8 && metal_mesh.index_count == 36 && metal_mesh.bounding_sphere[3] > 0.5f);
 
     // Cleanup
     check(memory.unmap(0x500000) == MemoryError::ok);

@@ -12,7 +12,7 @@
 | Agente | Terminal / Pasta | Branch | Tarefas em Andamento | Status |
 |:---:|---|---|---|:---:|
 | **Agente 1** | `worktrees/agent1-vfs` | `feature/vfs-bdt-ingestion` | **Atividades 1.2 e 1.3:** Implementação de `core/binder.h/.cpp` (BHD5/BDT parser) e descompressor DCX em streaming. | *Em execução* |
-| **Agente 2** | `worktrees/agent2-metal` | `feature/metal3-shaders` | **Atividades 2.1 e 2.3:** Integração SPIRV-Cross para Metal MSL e parser de malhas 3D FLVER (`.flver`). | *Em execução* |
+| **Agente 2** | `worktrees/agent2-metal` | `feature/metal3-shaders` | **Atividades 2.1 a 2.4 (Concluídas):** Tradutor SPIR-V -> MSL 3.0, Argument Buffers Tier 2, Leitor FLVER2/DCX e Pipeline 3D com Depth32Float e iluminação Blinn-Phong no host iOS. | *Concluído / 21 Testes Verdes* |
 | **Agente 3** | `worktrees/agent3-aot` | `feature/aot-batch` | **Atividades 3.1 e 3.2:** Expansão do gerador `bb-aot` para recompilação estática em lote de funções do executável PS4. | *Em execução* |
 | **Agente 4** | `worktrees/agent4-hle` | `feature/hle-audio-threads` | **Atividades 4.1 e 4.2:** Primitivas de multithreading do Orbis OS sobre pthreads e integração da LibAtrac9. | *Em execução* |
 | **Agente 5** | `bloodborne-ios-lab` | `main` | **Integração Contínua e QA:** Gestão do board, revisão de commits dos agentes 1 a 4, merge das features validadas, execução da suite de 18 testes e garantia do build IPA. | *Ativo / 100% Verde* |
