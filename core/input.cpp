@@ -61,6 +61,11 @@ void InputManager::set_deadzone(float deadzone) {
     deadzone_ = std::clamp(deadzone, 0.0f, 0.9f);
 }
 
+void InputManager::set_pad_state(const PadData &state) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    state_ = state;
+}
+
 float InputManager::apply_deadzone(float val, float threshold) {
     const float abs_val = std::abs(val);
     if (abs_val <= threshold) return 0.0f;

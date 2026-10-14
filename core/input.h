@@ -50,6 +50,7 @@ public:
     void set_triggers(float l2, float r2);
     void set_connected(bool connected);
     void set_deadzone(float deadzone);
+    void set_pad_state(const PadData &state);
 
     PadData poll() const;
     void reset();
