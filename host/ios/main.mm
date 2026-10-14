@@ -256,16 +256,47 @@
     bb::FlverModel model;
     std::string parseErr;
     bool loadedFromDisk = false;
-
-    NSArray *docDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    if (docDirs.count > 0) {
-        NSString *flverPath = [docDirs.firstObject stringByAppendingPathComponent:@"dvdroot_ps4/map/m24_00_00_00/m24_00_00_00_900091.flver.dcx"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:flverPath]) {
-            loadedFromDisk = bb::FlverParser::parse_file([flverPath UTF8String], model, parseErr);
+    NSString *modelSource = @"synthetic_saw_cleaver";
+    _report[@"small_flver_render_status"] = @"not_found";
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    if (documents) {
+        const auto probe = bb::probe_dcx_in_documents(documents.path.UTF8String);
+        _report[@"small_flver_render_status"] = [NSString stringWithUTF8String:probe.status.c_str()];
+        if (probe.valid) {
+            NSString *path = [documents.path stringByAppendingPathComponent:@"m29_00_00_00_408010.flver.dcx"];
+            if (probe.geometry_status == "ok" &&
+                bb::FlverParser::parse_file(path.UTF8String, model, parseErr)) {
+                const auto candidate = bb::FlverParser::convert_to_metal_buffers(model);
+                bool indicesValid = candidate.vertex_count == probe.vertex_count &&
+                    candidate.index_count == probe.triangle_count * 3 &&
+                    candidate.vertex_count > 0 && candidate.index_count > 0;
+                for (uint32_t index : candidate.index_data) {
+                    if (index >= candidate.vertex_count) { indicesValid = false; break; }
+                }
+                if (indicesValid) {
+                    loadedFromDisk = true;
+                    modelSource = @"documents_small_flver_dcx";
+                    _report[@"small_flver_render_status"] = @"mesh_ready";
+                } else {
+                    _report[@"small_flver_render_status"] = @"invalid_mesh";
+                }
+            } else {
+                _report[@"small_flver_render_status"] = @"parse_failed";
+            }
         }
     }
 
+    if (!loadedFromDisk && documents) {
+        NSString *mapPath = [documents.path stringByAppendingPathComponent:@"dvdroot_ps4/map/m24_00_00_00/m24_00_00_00_900091.flver.dcx"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:mapPath] &&
+            bb::FlverParser::parse_file(mapPath.UTF8String, model, parseErr)) {
+            loadedFromDisk = true;
+            modelSource = @"documents_map_flver_dcx";
+        }
+    }
     if (!loadedFromDisk) {
+        model = bb::FlverModel{};
         auto cleaverBytes = bb::FlverParser::create_synthetic_flver_saw_cleaver();
         bb::FlverParser::parse(cleaverBytes.data(), cleaverBytes.size(), model, parseErr);
     }
@@ -337,7 +368,8 @@
     _report[@"metal_flver_triangles"] = @(_modelTriangleCount);
     _report[@"metal_depth_buffer"] = @"Depth32Float";
     _report[@"metal_shader_msl_version"] = @"3.0";
-    _report[@"model_rendered"] = loadedFromDisk ? @"Bloodborne Map FLVER" : @"Saw Cleaver (FromSoftware FLVER)";
+    _report[@"model_source"] = modelSource;
+    _report[@"model_rendered"] = loadedFromDisk ? @"Documents FLVER (laboratory)" : @"Saw Cleaver (synthetic FLVER)";
 
     // Registra suporte a controles externos Apple GameController
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onControllerConnected:)

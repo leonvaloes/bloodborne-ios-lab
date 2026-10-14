@@ -58,5 +58,7 @@ int main() { return run([] {
         report = bb::probe_dcx_in_documents(dir.string());
         CHECK(report.status == "ok" && report.valid);
         CHECK(report.size_bytes == real_bytes.size());
+        CHECK(report.geometry_status == "ok");
+        CHECK(report.vertex_count == 23 && report.triangle_count == 22);
     }
 }); }
