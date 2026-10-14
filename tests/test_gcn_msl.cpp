@@ -14,8 +14,8 @@ struct Registers {
 static Registers eval_cpu(const ProgramIR& ir, Registers r) {
     uint32_t scc = 0;
     (void)scc;
-    for (const auto& b : ir.blocks) {
-        for (const auto& n : b.nodes) {
+    for (const auto& blk : ir.blocks) {
+        for (const auto& n : blk.nodes) {
             if (n.operation == Operation::End) break;
             auto get_val = [&](const Value& val) -> uint32_t {
                 if (val.operand.kind == OperandKind::Scalar) return r.s[val.operand.value];
