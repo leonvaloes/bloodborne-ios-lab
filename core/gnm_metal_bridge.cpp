@@ -8,6 +8,12 @@
 
 namespace bb {
 
+static inline float uint_as_float(std::uint32_t val) {
+    float f;
+    std::memcpy(&f, &val, sizeof(float));
+    return f;
+}
+
 // =============================================================================
 // BridgeError -> string
 // =============================================================================
@@ -375,10 +381,16 @@ bool GnmMetalBridge::bind_buffer_table(ShaderStage stage, std::uint32_t base_slo
     if (!bindings) return false;
 
     for (std::uint32_t i = 0; i < count; ++i) {
-        BufferDescriptor desc;
-        if (memory_.load(table_addr + i * 16, &desc, sizeof(desc)) != MemoryError::ok) {
+        std::array<std::uint32_t, 4> raw_desc;
+        if (memory_.load(table_addr + i * 16, raw_desc.data(), 16) != MemoryError::ok) {
             return false;
         }
+        BufferDescriptor desc;
+        desc.raw = raw_desc;
+        desc.base_address = (static_cast<std::uint64_t>(raw_desc[1] & 0xFFFF) << 32) | raw_desc[0];
+        desc.stride = (raw_desc[1] >> 16) & 0x3FFF;
+        desc.num_records = raw_desc[2];
+        desc.format = raw_desc[3];
         if (!desc.is_valid()) continue;
         if (!bindings->bind_buffer(base_slot + i, desc)) return false;
     }
@@ -396,10 +408,20 @@ bool GnmMetalBridge::bind_texture_table(ShaderStage stage, std::uint32_t base_sl
     if (!bindings) return false;
 
     for (std::uint32_t i = 0; i < count; ++i) {
-        TextureDescriptor desc;
-        if (memory_.load(table_addr + i * 32, &desc, sizeof(desc)) != MemoryError::ok) {
+        std::array<std::uint32_t, 8> raw_desc;
+        if (memory_.load(table_addr + i * 32, raw_desc.data(), 32) != MemoryError::ok) {
             return false;
         }
+        TextureDescriptor desc;
+        desc.raw = raw_desc;
+        desc.base_address = (static_cast<std::uint64_t>(raw_desc[1] & 0xFF) << 40) | (static_cast<std::uint64_t>(raw_desc[0]) << 8);
+        desc.format = (raw_desc[1] >> 20) & 0x3F;
+        desc.width = (raw_desc[2] & 0x3FFF) + 1;
+        desc.height = ((raw_desc[2] >> 14) & 0x3FFF) + 1;
+        desc.pitch = raw_desc[3] & 0x3FFF;
+        desc.depth = (raw_desc[3] >> 14) & 0x3FFF;
+        desc.num_mips = (raw_desc[4] & 0xF) + 1;
+        desc.tile_mode = (raw_desc[4] >> 4) & 0x1F;
         if (!desc.is_valid()) continue;
         if (!bindings->bind_texture(base_slot + i, desc)) return false;
     }
@@ -417,10 +439,21 @@ bool GnmMetalBridge::bind_sampler_table(ShaderStage stage, std::uint32_t base_sl
     if (!bindings) return false;
 
     for (std::uint32_t i = 0; i < count; ++i) {
-        SamplerDescriptor desc;
-        if (memory_.load(table_addr + i * 16, &desc, sizeof(desc)) != MemoryError::ok) {
+        std::array<std::uint32_t, 4> raw_desc;
+        if (memory_.load(table_addr + i * 16, raw_desc.data(), 16) != MemoryError::ok) {
             return false;
         }
+        SamplerDescriptor desc;
+        desc.raw = raw_desc;
+        desc.clamp_x = raw_desc[0] & 0xF;
+        desc.clamp_y = (raw_desc[0] >> 4) & 0xF;
+        desc.clamp_z = (raw_desc[0] >> 8) & 0xF;
+        desc.min_filter = (raw_desc[0] >> 12) & 0xF;
+        desc.mag_filter = (raw_desc[0] >> 16) & 0xF;
+        desc.mip_filter = (raw_desc[0] >> 20) & 0xF;
+        desc.min_lod = uint_as_float(raw_desc[1]);
+        desc.max_lod = uint_as_float(raw_desc[2]);
+        desc.lod_bias = uint_as_float(raw_desc[3]);
         if (!bindings->bind_sampler(base_slot + i, desc)) return false;
     }
     return true;
