@@ -8,6 +8,7 @@
 namespace bb {
 enum class MemoryError { ok, invalid, overlap, budget, unmapped, denied, allocation };
 enum Permission : unsigned { read = 1, write = 2 };
+
 // Logical guest memory only: never maps executable pages or casts guest
 // addresses to host pointers. A transfer must fit a single region.
 class GuestMemory {
@@ -19,6 +20,13 @@ public:
     MemoryError load(std::uint64_t address, void* destination, std::size_t size) const;
     MemoryError store(std::uint64_t address, const void* source, std::size_t size);
     std::size_t used() const;
+
+    // F5: Atomic memory operations (equivalent to x86 LOCK prefix)
+    MemoryError atomic_fetch_add_u64(std::uint64_t address, std::uint64_t delta, std::uint64_t& old_val);
+    MemoryError atomic_fetch_add_u32(std::uint64_t address, std::uint32_t delta, std::uint32_t& old_val);
+    MemoryError atomic_compare_exchange_u64(std::uint64_t address, std::uint64_t& expected, std::uint64_t desired, bool& success);
+    MemoryError atomic_compare_exchange_u32(std::uint64_t address, std::uint32_t& expected, std::uint32_t desired, bool& success);
+
 private:
     struct Region { std::vector<std::uint8_t> bytes; unsigned permissions; };
     using Regions = std::map<std::uint64_t, Region>;

@@ -1,7 +1,12 @@
 #include "smoke.h"
 #include "fixtures.h"
 #include "guest_memory.h"
+#include "simd.h"
+#include "dispatcher.h"
+#include "hle.h"
+#include "manifest.h"
 #include <limits>
+#include <cmath>
 
 namespace bb {
 SmokeReport smoke() {
@@ -79,8 +84,8 @@ SmokeReport smoke() {
     check((fixture_abi_align16(0x123, 0).value & 0xF) == 0);
     check(fixture_abi_callee_saved(0x10, 0x20).value == 0x130);
 
-    // Guest memory checks (8 checks)
-    GuestMemory memory(64);
+    // Guest memory baseline checks (8 checks)
+    GuestMemory memory(1024);
     check(memory.map(0x400000, 64, read | write) == MemoryError::ok);
     const auto expected = fixture_add64(0xBB00, 0x15).value;
     check(memory.store(0x400038, &expected, sizeof expected) == MemoryError::ok);
@@ -90,7 +95,53 @@ SmokeReport smoke() {
     check(memory.store(0x400039, &expected, sizeof expected) == MemoryError::unmapped);
     check(memory.protect(0x400000, read) == MemoryError::ok);
     check(memory.store(0x400000, &expected, sizeof expected) == MemoryError::denied);
-    check(memory.unmap(0x400000) == MemoryError::ok && memory.used() == 0);
+    check(memory.unmap(0x400000) == MemoryError::ok);
+
+    // F4: SIMD Vector 128-bit checks (7 checks)
+    Vec128 v1{{{1.0f, 2.0f, 3.0f, 4.0f}}}, v2{{{5.0f, 6.0f, 7.0f, 8.0f}}};
+    check(vec_add_f32(v1, v2).f32[0] == 6.0f);
+    check(vec_mul_f32(v1, v2).f32[3] == 32.0f);
+    check(vec_dot_f32(v1, v2) == 70.0f);
+    check(vec_xor(v1, v1).u64[0] == 0 && vec_xor(v1, v1).u64[1] == 0);
+    check(!vec_has_nan(v1));
+    Vec128 vnan{{{NAN, 0.0f, 0.0f, 0.0f}}};
+    check(vec_has_nan(vnan));
+    Vec128 vinf{{{INFINITY, 0.0f, 0.0f, 0.0f}}};
+    check(vec_has_inf(vinf));
+
+    // F5: Atomics on Guest Memory (5 checks)
+    check(memory.map(0x500000, 64, read | write) == MemoryError::ok);
+    std::uint64_t old_v = 0;
+    check(memory.atomic_fetch_add_u64(0x500000, 42, old_v) == MemoryError::ok && old_v == 0);
+    check(memory.atomic_fetch_add_u64(0x500000, 10, old_v) == MemoryError::ok && old_v == 42);
+    std::uint64_t cas_expected = 52, cas_desired = 100;
+    bool cas_success = false;
+    check(memory.atomic_compare_exchange_u64(0x500000, cas_expected, cas_desired, cas_success) == MemoryError::ok && cas_success);
+    check(memory.atomic_compare_exchange_u64(0x500000, cas_expected, 200, cas_success) == MemoryError::ok && !cas_success && cas_expected == 100);
+
+    // F6: Indirect Dispatcher & HLE imports (7 checks)
+    IndirectDispatcher dispatcher;
+    dispatcher.register_target(0x401000, fixture_add64);
+    dispatcher.register_target(0x402000, fixture_sub64);
+    check(dispatcher.has_target(0x401000));
+    check(dispatcher.dispatch(0x401000, 100, 50).value == 150);
+    check(dispatcher.dispatch(0x402000, 100, 50).value == 50);
+    check(!dispatcher.has_target(0x999999));
+
+    auto hle = HleManager::create_standard();
+    check(hle.invoke(0x2002, memory, 0, 0, 0) == 0); // sceKernelGetCurrentCpu
+    check(hle.invoke(0x2003, memory, 0x600000, 64, 0x500008) == 0); // sceKernelAllocateDirectMemory
+    check(hle.invoke(0x2001, memory, 0x600000, 0, 0) == 0); // sceKernelGettimeofday
+
+    // Translation Manifest validation (2 checks)
+    TranslationManifest manifest{1, "x86_64", "arm64-apple-ios", "52d3441",
+        {{"0x1000", 64, "bb_entry", true, "verified"}}};
+    check(manifest.validate());
+    check(manifest.to_json().find("bb_entry") != std::string::npos);
+
+    // Cleanup
+    check(memory.unmap(0x500000) == MemoryError::ok);
+    check(memory.unmap(0x600000) == MemoryError::ok && memory.used() == 0);
 
     return report;
 }
