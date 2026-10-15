@@ -283,7 +283,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         _screenPipeline = [device newRenderPipelineStateWithDescriptor:screenDesc error:&screenError];
     }
     if (!_screenPipeline) {
-        _report[@"guest_presentation_error"] = screenError.localizedDescription ?: @"Pipeline de vídeo indisponível";
+        _report[@"guest_presentation_error"] = screenError ? screenError.localizedDescription : @"Pipeline de vídeo indisponível";
     }
     MTLSamplerDescriptor *screenSamplerDesc = [MTLSamplerDescriptor new];
     screenSamplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
@@ -1105,7 +1105,6 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         if (_videoOutManager.read_current_frame_pixels(guestFrame) && guestFrame.valid &&
             guestFrame.bytes_per_pixel == 4 && guestFrame.width > 0 && guestFrame.height > 0 &&
             guestFrame.pitch >= guestFrame.width &&
-            guestFrame.pitch <= SIZE_MAX / 4 &&
             guestFrame.pixel_data.size() >= static_cast<size_t>(guestFrame.pitch) * 4 * guestFrame.height) {
             _report[@"guest_frame_flipped"] = @YES;
             _report[@"guest_frame_seq"] = @(guestFrame.flip_sequence);
