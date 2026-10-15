@@ -42,6 +42,7 @@ struct CpuState {
     std::uint64_t ymm_hi[16][2] = {};
     std::uint64_t fs_base = 0;
     std::uint64_t gs_base = 0;
+    std::uint32_t mxcsr = 0x1F80;
 };
 
 struct CpuRunResult {
@@ -60,6 +61,8 @@ class X86Interpreter {
 public:
     explicit X86Interpreter(GuestMemory& memory) : mem_(memory) {}
     CpuState state;
+    std::uint64_t tsc() const { return tsc_; }
+    void set_tsc(std::uint64_t t) { tsc_ = t; }
 
     // rip values in [base, base + size) stop execution with CpuStop::trap before fetching.
     void add_trap_range(std::uint64_t base, std::uint64_t size);
@@ -72,6 +75,23 @@ private:
     void step(CpuRunResult& out);
     GuestMemory& mem_;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> traps_;
+    std::uint64_t tsc_ = 0;
+public:
+    struct TraceItem { std::uint64_t rip, rbp, rsp; };
+private:
+    TraceItem recent_traces_[1024] = {};
+    std::size_t recent_rips_count_ = 0;
+public:
+    std::vector<TraceItem> recent_traces() const {
+        std::vector<TraceItem> res;
+        std::size_t count = recent_rips_count_ < 1024 ? recent_rips_count_ : 1024;
+        res.reserve(count);
+        std::size_t start = recent_rips_count_ < 1024 ? 0 : (recent_rips_count_ % 1024);
+        for (std::size_t i = 0; i < count; ++i) {
+            res.push_back(recent_traces_[(start + i) % 1024]);
+        }
+        return res;
+    }
 };
 
 } // namespace bb

@@ -1,5 +1,7 @@
 #include "orbis_runtime.h"
 #include "kernel_threads.h"
+#include "dialog_hle.h"
+#include "gnm_context.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -24,10 +26,20 @@
 
 namespace bb {
 namespace {
-constexpr std::uint64_t page = 16384, pool = 5056ULL << 20, logical_limit = 3ULL << 30;
+constexpr std::uint64_t page = 16384, pool = 5056ULL << 20, logical_limit = 6ULL << 30;
 constexpr std::uint64_t invalid = 0x80020016, no_memory = 0x8002000c, no_space = 0x80020023;
 std::uint64_t align(std::uint64_t value, std::uint64_t unit) { return (value + unit - 1) & ~(unit - 1); }
 bool valid_alignment(std::uint64_t a) { return a >= page && a <= pool && !(a & (a - 1)); }
+
+FILE* portable_fopen(const std::string& path, const char* mode) {
+#if defined(_WIN32)
+    std::filesystem::path p = std::filesystem::u8path(path);
+    std::wstring wmode(mode, mode + std::strlen(mode));
+    return _wfopen(p.c_str(), wmode.c_str());
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
 // SHA-1 de FIPS 180-4, somente 8 bytes do resultado são usados pelo NID.
 std::array<std::uint8_t, 20> sha1(const std::string& text) {
     std::vector<std::uint8_t> data(text.begin(), text.end());
@@ -92,7 +104,7 @@ std::string orbis_nid(const std::string& symbol) {
     return result;
 }
 OrbisRuntime::OrbisRuntime(GuestMemory& memory)
-    : mem_(memory), user_mgr_(), pad_mgr_(nullptr, &user_mgr_) {
+    : mem_(memory), user_mgr_(), pad_mgr_(nullptr, &user_mgr_), gnm_context_(std::make_unique<GnmContext>(memory)) {
     static const char* const symbols[] = {
 #include "orbis_import_names.h"
         "scePthreadMutexattrInit", "scePthreadMutexattrSettype", "scePthreadMutexattrDestroy",
@@ -152,8 +164,15 @@ OrbisRuntime::OrbisRuntime(GuestMemory& memory)
         "pthread_mutex_getprioceiling", "pthread_mutex_setprioceiling",
     };
     for (const char* s : symbols) names_.emplace(orbis_nid(s), s);
+    names_.emplace("H2e8t5ScQGc", "__cxa_finalize");
+    names_.emplace("5bBacGLyLOs", "gmtime_s");
+    names_.emplace("ioKMruft1ek", "sceDiscMapUnknownIoKM");
 }
 OrbisRuntime::~OrbisRuntime() {
+    for (auto& pair : kernel_files_) {
+        if (pair.second.fp) std::fclose(pair.second.fp);
+    }
+    kernel_files_.clear();
     for (auto& pair : open_files_) {
         if (pair.second) std::fclose(pair.second);
     }
@@ -186,6 +205,108 @@ std::uint64_t OrbisRuntime::invoke(const std::string& import, CpuState& cpu) {
         throw std::runtime_error("guest scheduler trap adapter unavailable for " + name);
     return handle(name,cpu);
 }
+std::uint64_t OrbisRuntime::get_errno_addr(GuestScheduler::Id tid) {
+    if (!errno_page_) {
+        errno_page_ = next_virtual_;
+        next_virtual_ += 0x10000;
+        auto err = mem_.map(errno_page_, 0x10000, read | write);
+        if (err != MemoryError::ok) {
+            std::printf("[HLE] failed to map errno page at 0x%llx\n", (unsigned long long)errno_page_);
+        }
+        mappings_[errno_page_] = 0x10000;
+    }
+    const std::uint64_t offset = (static_cast<std::uint64_t>(tid) % 1024) * 64;
+    return errno_page_ + offset;
+}
+OrbisRuntime::PthreadAttrDefaults* OrbisRuntime::find_attr(std::uint64_t slot_addr) {
+    if (!slot_addr) return nullptr;
+    auto it = attr_defaults_.find(slot_addr);
+    if (it != attr_defaults_.end()) return &it->second;
+    std::uint64_t h = 0;
+    if (mem_.load(slot_addr, &h, 8) == MemoryError::ok && h != 0) {
+        it = attr_defaults_.find(h);
+        if (it != attr_defaults_.end()) return &it->second;
+    }
+    return &attr_defaults_[slot_addr];
+}
+
+#pragma pack(push, 1)
+struct SceKernelStat {
+    std::uint32_t st_dev;
+    std::uint32_t st_ino;
+    std::uint16_t st_mode;
+    std::uint16_t st_nlink;
+    std::uint32_t st_uid;
+    std::uint32_t st_gid;
+    std::uint32_t st_rdev;
+    std::int64_t  st_atime_sec;
+    std::int64_t  st_atime_nsec;
+    std::int64_t  st_mtime_sec;
+    std::int64_t  st_mtime_nsec;
+    std::int64_t  st_ctime_sec;
+    std::int64_t  st_ctime_nsec;
+    std::int64_t  st_size;
+    std::int64_t  st_blocks;
+    std::uint32_t st_blksize;
+    std::uint32_t st_flags;
+    std::uint32_t st_gen;
+    std::int32_t  st_lspare;
+    std::int64_t  st_birthtime_sec;
+    std::int64_t  st_birthtime_nsec;
+};
+#pragma pack(pop)
+static_assert(sizeof(SceKernelStat) == 120, "SceKernelStat size must be 120 bytes");
+
+std::string OrbisRuntime::resolve_guest_path(const std::string& guest_path) const {
+    if (guest_path.empty()) return "";
+    std::string norm = guest_path;
+    for (char& c : norm) {
+        if (c == '\\') c = '/';
+    }
+    std::string rel;
+    if (norm.rfind("/app0/", 0) == 0) {
+        rel = norm.substr(6);
+    } else if (norm.rfind("app0:/", 0) == 0) {
+        rel = norm.substr(7);
+    } else if (norm.rfind("app0:", 0) == 0) {
+        rel = norm.substr(5);
+    } else if (norm == "/app0" || norm == "app0") {
+        rel = "";
+    } else if (norm.rfind("/app0", 0) == 0) {
+        rel = norm.substr(5);
+    } else if (norm.rfind("/temp/", 0) == 0 || norm.rfind("/tmp/", 0) == 0) {
+        auto tmp_base = std::filesystem::temp_directory_path() / "antigravity";
+        std::error_code ec;
+        std::filesystem::create_directories(tmp_base, ec);
+        std::string sub = (norm.rfind("/temp/", 0) == 0) ? norm.substr(6) : norm.substr(5);
+        return (tmp_base / sub).lexically_normal().string();
+    } else if (norm.rfind("/savedata/", 0) == 0 || norm.rfind("savedata:/", 0) == 0) {
+        auto save_base = app0_dir_.empty() ? (std::filesystem::current_path() / "savedata")
+                                           : (app0_dir_.parent_path() / "savedata");
+        std::error_code ec;
+        std::filesystem::create_directories(save_base, ec);
+        std::string sub = (norm.rfind("/savedata/", 0) == 0) ? norm.substr(10) : norm.substr(11);
+        return (save_base / sub).lexically_normal().string();
+    } else if (norm[0] == '/') {
+        rel = norm.substr(1);
+    } else {
+        rel = norm;
+    }
+
+    if (!app0_dir_.empty()) {
+        auto cand = (app0_dir_ / rel).lexically_normal();
+        std::error_code ec;
+        if (std::filesystem::exists(cand, ec)) {
+            return cand.string();
+        }
+        if (std::filesystem::exists(rel, ec)) {
+            return std::filesystem::path(rel).lexically_normal().string();
+        }
+        return cand.string();
+    }
+    return rel;
+}
+
 OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& import, CpuState& cpu,
                                                            GuestScheduler::Id tid, std::uint64_t return_trap) {
     if (!scheduler_) {
@@ -206,23 +327,95 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         return s;
     };
 
-    if (n == "scePthreadCreate") {
-        if (!a(0) || !a(2) || !return_trap || thread_stack_next_ > UINT64_MAX - 0x10000) return result(invalid);
+    if (n == "scePthreadCreate" || n == "pthread_create" || n == "pthread_create_name_np") {
+        std::size_t thread_stack_size = (mem_.budget() > (16ULL << 20)) ? (2 * 1024 * 1024) : 0x10000;
+        if (a(1)) {
+            auto* at = find_attr(a(1));
+            if (at && at->stack_size >= 0x10000 && at->stack_size <= (mem_.budget() / 2)) {
+                thread_stack_size = static_cast<std::size_t>(at->stack_size);
+            }
+        }
+        if (!a(0) || !a(2) || !return_trap || thread_stack_next_ > UINT64_MAX - thread_stack_size) {
+            std::printf("[PTHREAD] invalid args in scePthreadCreate: a0=0x%llx a2=0x%llx ret_trap=0x%llx\n",
+                        (unsigned long long)a(0), (unsigned long long)a(2), (unsigned long long)return_trap);
+            return result(invalid);
+        }
         const auto bottom = thread_stack_next_;
-        if (mem_.map(bottom, 0x10000, read | write) != MemoryError::ok) return result(no_memory);
-        auto id = scheduler_->create(a(2), bottom, bottom + 0x10000, return_trap, a(3));
-        if (!id) { mem_.unmap(bottom); return result(invalid); }
-        if (mem_.store(a(0), &id, sizeof(id)) != MemoryError::ok) { mem_.unmap(bottom); return result(invalid); }
-        thread_stack_next_ += 0x10000;
-        return result(static_cast<std::uint32_t>(scheduler_->start(id)));
+        auto err1 = mem_.map(bottom, thread_stack_size, read | write);
+        if (err1 != MemoryError::ok) {
+            std::printf("[PTHREAD] mem_.map stack bottom=0x%llx sz=0x%zx failed: err=%d\n",
+                        (unsigned long long)bottom, thread_stack_size, (int)err1);
+            return result(no_memory);
+        }
+
+        std::uint64_t main_tls_size = tls_template_.memsz ? (tls_template_.memsz + 15) & ~15ULL : 0x1000;
+        if (main_tls_size < 0x1000) main_tls_size = 0x1000;
+        const std::uint64_t thread_tls_region = 0x10000; // 64 KB for TLS + TCB
+        std::uint64_t thread_tls_base = next_virtual_;
+        next_virtual_ += thread_tls_region;
+        auto err2 = mem_.map(thread_tls_base, thread_tls_region, read | write);
+        if (err2 != MemoryError::ok) {
+            std::printf("[PTHREAD] mem_.map tls base=0x%llx failed: err=%d\n", (unsigned long long)thread_tls_base, (int)err2);
+            mem_.unmap(bottom);
+            return result(no_memory);
+        }
+        mappings_[thread_tls_base] = thread_tls_region;
+
+        std::uint64_t thread_tcb = thread_tls_base + main_tls_size;
+        if (tls_template_.filesz && tls_template_.address) {
+            std::vector<std::uint8_t> tls_data(static_cast<std::size_t>(tls_template_.filesz));
+            mem_.load(tls_template_.address, tls_data.data(), tls_data.size());
+            mem_.store(thread_tls_base, tls_data.data(), tls_data.size());
+        }
+        put<std::uint64_t>(mem_, thread_tcb, thread_tcb);
+        std::uint64_t thread_dtv = thread_tcb + 64;
+        put<std::uint64_t>(mem_, thread_tcb + 8, thread_dtv);
+        put<std::uint64_t>(mem_, thread_tcb + 16, thread_tcb + 256);
+        put<std::uint64_t>(mem_, thread_dtv, 1);
+        put<std::uint64_t>(mem_, thread_dtv + 8, thread_tls_base);
+
+        auto id = scheduler_->create(a(2), bottom, bottom + thread_stack_size, return_trap, a(3), thread_tcb);
+        if (!id) {
+            std::printf("[PTHREAD] scheduler_->create failed\n");
+            mem_.unmap(bottom);
+            return result(invalid);
+        }
+        std::uint64_t thread_handle = id;
+        if (mem_.store(a(0), &thread_handle, sizeof(thread_handle)) != MemoryError::ok) {
+            mem_.unmap(bottom);
+            return result(invalid);
+        }
+        thread_stack_next_ += thread_stack_size;
+        auto thread_name = (n == "pthread_create") ? "pthread" : (a(4) ? read_guest_string(a(4)) : std::string("unnamed"));
+        auto start_res = scheduler_->start(id);
+        std::printf("[HLE] Created guest thread %u: '%s' entry=0x%llx arg=0x%llx stack=[0x%llx..0x%llx] start_res=0x%x\n",
+                    id, thread_name.c_str(), (unsigned long long)a(2), (unsigned long long)a(3),
+                    (unsigned long long)bottom, (unsigned long long)(bottom + thread_stack_size), start_res);
+        return result(static_cast<std::uint32_t>(start_res));
     }
 
-    if (n == "scePthreadExit") {
+    if (n == "scePthreadSelf" || n == "pthread_self") {
+        return result(tid);
+    }
+
+    if (n == "scePthreadEqual" || n == "pthread_equal") {
+        return result(a(0) == a(1) ? 1 : 0);
+    }
+
+    if (n == "scePthreadYield" || n == "pthread_yield" || n == "sched_yield") {
+        return result(0);
+    }
+
+    if (n == "scePthreadSetName" || n == "scePthreadRename" || n == "pthread_setname_np") {
+        return result(0);
+    }
+
+    if (n == "scePthreadExit" || n == "pthread_exit") {
         scheduler_->exit(tid, a(0));
         return {InvocationResult::Action::exited, 0, 0, 0};
     }
 
-    if (n == "scePthreadJoin") {
+    if (n == "scePthreadJoin" || n == "pthread_join") {
         if (a(1)) {
             std::uint64_t probe = 0;
             if (mem_.load(a(1), &probe, 8) != MemoryError::ok || mem_.store(a(1), &probe, 8) != MemoryError::ok)
@@ -364,7 +557,11 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         n == "scePthreadCondBroadcast" || n == "pthread_cond_broadcast") {
         if (!a(0)) return result(invalid);
         auto handle = get<std::uint64_t>(mem_, a(0));
-        if (!guest_conds_.count(handle)) return result(invalid);
+        if (!guest_conds_.count(handle)) {
+            handle = next_handle_++;
+            guest_conds_[handle] = scheduler_->cond_create();
+            put(mem_, a(0), handle);
+        }
         bool broadcast = (n.find("Broadcast") != std::string::npos || n == "pthread_cond_broadcast");
         return result(static_cast<std::uint32_t>(scheduler_->cond_signal(guest_conds_.at(handle), broadcast)));
     }
@@ -374,7 +571,16 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         if (!a(0) || !a(1)) return result(invalid);
         auto ch = get<std::uint64_t>(mem_, a(0));
         auto mh = get<std::uint64_t>(mem_, a(1));
-        if (!guest_conds_.count(ch) || !guest_mutexes_.count(mh)) return result(invalid);
+        if (!guest_conds_.count(ch)) {
+            ch = next_handle_++;
+            guest_conds_[ch] = scheduler_->cond_create();
+            put(mem_, a(0), ch);
+        }
+        if (!guest_mutexes_.count(mh)) {
+            mh = next_handle_++;
+            guest_mutexes_[mh] = scheduler_->mutex_create(false);
+            put(mem_, a(1), mh);
+        }
         std::uint64_t timeout = 0;
         if (n.find("Timedwait") != std::string::npos || n == "pthread_cond_timedwait") {
             if (!a(2)) return result(invalid);
@@ -402,6 +608,9 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
             }
         }
         auto status = scheduler_->cond_wait(tid, guest_conds_.at(ch), guest_mutexes_.at(mh), timeout);
+        std::printf("[HLE TID %u] scePthreadCondWait cond=0x%llx mutex=0x%llx status=0x%x (state=%d)\n",
+                    tid, (unsigned long long)a(0), (unsigned long long)a(1), (unsigned int)status,
+                    (int)scheduler_->state(tid));
         if (status) return result(static_cast<std::uint32_t>(status));
         if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
             std::uint64_t ret = 0;
@@ -420,36 +629,40 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
     if (n == "sceKernelCreateEventFlag") {
         bool is_sdk = is_likely_string_ptr(mem_, a(0)) || a(0) == 0;
         if (is_sdk) {
-            const auto handle = next_handle_++;
+            const auto handle = static_cast<std::uint32_t>(next_handle_++);
             guest_events_[handle] = scheduler_->event_create(a(2));
             return result(handle);
         } else {
             if (!a(0) || a(2) > 3) return result(invalid);
-            const auto handle = next_handle_++;
+            const auto handle = static_cast<std::uint32_t>(next_handle_++);
             guest_events_[handle] = scheduler_->event_create(a(3));
-            put<std::uint32_t>(mem_, a(0), static_cast<std::uint32_t>(handle));
+            put<std::uint64_t>(mem_, a(0), static_cast<std::uint64_t>(handle));
             return result(0);
         }
     }
 
     if (n == "sceKernelDeleteEventFlag") {
-        if (!guest_events_.erase(a(0))) return result(invalid);
+        auto handle = static_cast<std::uint32_t>(a(0));
+        if (!guest_events_.erase(handle)) return result(0x80020003); // ESRCH
         return result(0);
     }
 
     if (n == "sceKernelSetEventFlag") {
-        if (!guest_events_.count(a(0))) return result(invalid);
-        return result(static_cast<std::uint32_t>(scheduler_->event_set(guest_events_.at(a(0)), a(1))));
+        auto handle = static_cast<std::uint32_t>(a(0));
+        if (!guest_events_.count(handle)) return result(0x80020003); // ESRCH
+        return result(static_cast<std::uint32_t>(scheduler_->event_set(guest_events_.at(handle), a(1))));
     }
 
     if (n == "sceKernelClearEventFlag") {
-        if (!guest_events_.count(a(0))) return result(invalid);
-        return result(static_cast<std::uint32_t>(scheduler_->event_clear(guest_events_.at(a(0)), a(1))));
+        auto handle = static_cast<std::uint32_t>(a(0));
+        if (!guest_events_.count(handle)) return result(0x80020003); // ESRCH
+        return result(static_cast<std::uint32_t>(scheduler_->event_clear(guest_events_.at(handle), a(1))));
     }
 
     if (n == "sceKernelWaitEventFlag" || n == "sceKernelPollEventFlag") {
-        if (!guest_events_.count(a(0))) return result(invalid);
-        const auto eid = guest_events_.at(a(0));
+        auto handle = static_cast<std::uint32_t>(a(0));
+        if (!guest_events_.count(handle)) return result(0x80020003); // ESRCH
+        const auto eid = guest_events_.at(handle);
         const auto mask = a(1), mode = a(2);
         if (!mask || (mode & ~0x33)) return result(invalid);
         const bool poll = (n == "sceKernelPollEventFlag");
@@ -554,41 +767,43 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
 
     // Kernel Semaphores
     if (n == "sceKernelCreateSema") {
-        bool is_sdk = is_likely_string_ptr(mem_, a(0)) || a(0) == 0;
         std::string sema_name = "sema";
         std::uint32_t attr = 0;
         std::int32_t init_val = 0, max_val = 1;
         std::uint64_t out_id_addr = 0;
+        bool is_sdk = false;
 
-        if (is_sdk) {
+        if (a(4) > 0) {
+            // Standard Orbis API: sceKernelCreateSema(out_id, name, attr, init, max, opt)
+            out_id_addr = a(0);
+            if (!out_id_addr) return result(invalid);
+            if (a(1)) sema_name = read_guest_string(a(1), 32);
+            attr = static_cast<std::uint32_t>(a(2));
+            init_val = static_cast<std::int32_t>(a(3));
+            max_val = static_cast<std::int32_t>(a(4));
+            is_sdk = false;
+        } else if ((a(2) >> 16) > 0) {
+            // Packed legacy test format: a(0)=out, a(1)=name, a(2)=max<<16|init
+            out_id_addr = a(0);
+            if (!out_id_addr) return result(invalid);
+            if (a(1)) sema_name = read_guest_string(a(1), 32);
+            init_val = static_cast<std::int32_t>(a(2) & 0xFFFF);
+            max_val = static_cast<std::int32_t>((a(2) >> 16) & 0xFFFF);
+            is_sdk = false;
+        } else {
+            // Unit test SDK format: a(0)=name, a(1)=attr, a(2)=init, a(3)=max -> returns handle
             if (a(0)) sema_name = read_guest_string(a(0), 32);
             attr = static_cast<std::uint32_t>(a(1));
             init_val = static_cast<std::int32_t>(a(2));
             max_val = static_cast<std::int32_t>(a(3));
-        } else {
-            out_id_addr = a(0);
-            if (!out_id_addr) return result(invalid);
-            if (a(1)) sema_name = read_guest_string(a(1), 32);
-            if (a(3) != 0 && (a(3) >> 16) != 0) {
-                init_val = static_cast<std::int32_t>(a(3) & 0xFFFF);
-                max_val = static_cast<std::int32_t>((a(3) >> 16) & 0xFFFF);
-            } else if (a(2) != 0 && (a(2) >> 16) != 0) {
-                init_val = static_cast<std::int32_t>(a(2) & 0xFFFF);
-                max_val = static_cast<std::int32_t>((a(2) >> 16) & 0xFFFF);
-            } else if (a(3) != 0) {
-                init_val = static_cast<std::int32_t>(a(2));
-                max_val = static_cast<std::int32_t>(a(3));
-            } else {
-                init_val = static_cast<std::int32_t>(a(2));
-                max_val = std::max<std::int32_t>(1, init_val);
-            }
+            is_sdk = true;
         }
         if (max_val <= 0) max_val = std::max<std::int32_t>(1, init_val);
         if (init_val < 0 || max_val <= 0 || init_val > max_val) return result(invalid);
 
         auto sid = scheduler_->sema_create(init_val, max_val);
         if (!sid) return result(no_memory);
-        auto handle = next_handle_++;
+        auto handle = static_cast<std::uint32_t>(next_handle_++);
         guest_semas_[handle] = sid;
 
         SemaRecord rec;
@@ -596,20 +811,31 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         rec.attr = attr;
         rec.init_count = init_val;
         rec.max_count = max_val;
-        sema_records_[static_cast<std::uint32_t>(handle)] = rec;
+        sema_records_[handle] = rec;
+
+        std::printf("[SEMA] sceKernelCreateSema name='%s' init=%d max=%d is_sdk=%d -> handle=0x%x sid=%u out_addr=0x%llx\n",
+                    sema_name.c_str(), init_val, max_val, is_sdk ? 1 : 0, handle, sid, (unsigned long long)out_id_addr);
 
         if (is_sdk) {
             return result(handle);
         } else {
-            put<std::uint32_t>(mem_, out_id_addr, static_cast<std::uint32_t>(handle));
+            put<std::uint64_t>(mem_, out_id_addr, static_cast<std::uint64_t>(handle));
             return result(0);
         }
     }
 
     if (n == "sceKernelWaitSema") {
-        if (!a(0)) return result(invalid);
-        auto it = guest_semas_.find(a(0));
-        if (it == guest_semas_.end()) return result(invalid);
+        auto sid_handle = static_cast<std::uint32_t>(a(0));
+        if (!sid_handle) {
+            std::printf("[SEMA] sceKernelWaitSema called with a(0)=0 (TID %u)\n", tid);
+            return result(invalid);
+        }
+        auto it = guest_semas_.find(sid_handle);
+        if (it == guest_semas_.end()) {
+            std::printf("[SEMA] sceKernelWaitSema handle 0x%x NOT FOUND in guest_semas_ (TID %u)\n",
+                        sid_handle, tid);
+            return result(0x80020003); // ESRCH
+        }
         std::int32_t need = a(1) ? static_cast<std::int32_t>(a(1)) : 1;
         std::uint64_t timeout = 0;
         if (a(2)) {
@@ -617,7 +843,11 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
             if (mem_.load(a(2), &to32, 4) == MemoryError::ok) timeout = to32;
         }
         auto status = scheduler_->sema_wait(tid, it->second, need, timeout);
-        if (status) return result(static_cast<std::uint32_t>(status));
+        if (status) {
+            std::printf("[SEMA] sema_wait failed with status=0x%x (handle=0x%x sid=%u need=%d tid=%u)\n",
+                        status, sid_handle, it->second, need, tid);
+            return result(static_cast<std::uint32_t>(status));
+        }
         if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
             std::uint64_t ret = 0;
             if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
@@ -633,28 +863,31 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
     }
 
     if (n == "sceKernelPollSema") {
-        if (!a(0)) return result(invalid);
-        auto it = guest_semas_.find(a(0));
-        if (it == guest_semas_.end()) return result(invalid);
+        auto sid_handle = static_cast<std::uint32_t>(a(0));
+        if (!sid_handle) return result(invalid);
+        auto it = guest_semas_.find(sid_handle);
+        if (it == guest_semas_.end()) return result(0x80020003); // ESRCH
         std::int32_t need = a(1) ? static_cast<std::int32_t>(a(1)) : 1;
         return result(static_cast<std::uint32_t>(scheduler_->sema_poll(it->second, need)));
     }
 
     if (n == "sceKernelSignalSema") {
-        if (!a(0)) return result(invalid);
-        auto it = guest_semas_.find(a(0));
-        if (it == guest_semas_.end()) return result(invalid);
+        auto sid_handle = static_cast<std::uint32_t>(a(0));
+        if (!sid_handle) return result(invalid);
+        auto it = guest_semas_.find(sid_handle);
+        if (it == guest_semas_.end()) return result(0x80020003); // ESRCH
         std::int32_t count = a(1) ? static_cast<std::int32_t>(a(1)) : 1;
         return result(static_cast<std::uint32_t>(scheduler_->sema_signal(it->second, count)));
     }
 
     if (n == "sceKernelDeleteSema") {
-        if (!a(0)) return result(invalid);
-        auto it = guest_semas_.find(a(0));
-        if (it == guest_semas_.end()) return result(invalid);
+        auto sid_handle = static_cast<std::uint32_t>(a(0));
+        if (!sid_handle) return result(invalid);
+        auto it = guest_semas_.find(sid_handle);
+        if (it == guest_semas_.end()) return result(0x80020003); // ESRCH
         scheduler_->sema_delete(it->second);
         guest_semas_.erase(it);
-        sema_records_.erase(static_cast<std::uint32_t>(a(0)));
+        sema_records_.erase(sid_handle);
         return result(0);
     }
 
@@ -663,7 +896,7 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         auto sid_handle = static_cast<std::uint32_t>(a(0));
         auto it_rec = sema_records_.find(sid_handle);
         if (it_rec == sema_records_.end()) return result(0x80020003); // ESRCH
-        auto it_guest = guest_semas_.find(a(0));
+        auto it_guest = guest_semas_.find(sid_handle);
         std::int32_t cur_cnt = it_rec->second.init_count;
         std::uint32_t num_waiters = 0;
         if (it_guest != guest_semas_.end()) {
@@ -737,6 +970,10 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         return result(0);
     }
 
+    if (n == "__error") {
+        return result(get_errno_addr(tid));
+    }
+
     return result(handle(n, cpu));
 }
 OrbisRuntime::InvocationResult OrbisRuntime::complete_callback(CpuState& cpu, GuestScheduler::Id tid) {
@@ -755,6 +992,7 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     auto a=[&](unsigned i){return arg(c,i);};
     if (n=="_init_env" || n=="_sceKernelRtldSetApplicationHeapAPI") return 0;
     if (n=="sceKernelGetProcParam") return procparam_;
+    if (n=="__error") return get_errno_addr(1);
     // Debug: print unhandled imports
     // std::printf("HLE handle: %s\n", n.c_str());
 
@@ -831,6 +1069,15 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n == "sceUserServiceTerminate") {
         return static_cast<std::uint32_t>(user_mgr_.sceUserServiceTerminate());
+    }
+    if (n == "sceUserServiceGetEvent") {
+        auto out = a(0);
+        if (!out) return 0x80960005; // USER_INVALID_ARGUMENT
+        if (!user_login_event_pending_) return 0x80960007; // USER_NO_EVENT
+        user_login_event_pending_ = false;
+        std::int32_t event[2] = {0, 1}; // LOGIN, USER_ID = 1
+        mem_.store(out, event, sizeof(event));
+        return 0;
     }
 
     // libSceSaveData HLE
@@ -1001,6 +1248,21 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n == "sceAudioOutInit") return 0;
 
+    // libSceAvPlayer HLE (stubs para transição direta aos menus)
+    if (n == "sceAvPlayerInit") return next_handle_++;
+    if (n == "sceAvPlayerClose" || n == "sceAvPlayerPostInit" ||
+        n == "sceAvPlayerAddSource" || n == "sceAvPlayerSetLooping" ||
+        n == "sceAvPlayerStart" || n == "sceAvPlayerStop" ||
+        n == "sceAvPlayerPause" || n == "sceAvPlayerResume" ||
+        n == "sceAvPlayerEnableStream") {
+        return 0;
+    }
+    if (n == "sceAvPlayerIsActive" || n == "sceAvPlayerGetVideoDataEx" ||
+        n == "sceAvPlayerGetAudioData" || n == "sceAvPlayerCurrentTime" ||
+        n == "sceAvPlayerStreamCount" || n == "sceAvPlayerGetStreamInfo") {
+        return 0;
+    }
+
     // libSceVideoOut HLE
     if (n == "sceVideoOutOpen") {
         return next_handle_++;
@@ -1012,6 +1274,13 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
     if (n == "sceVideoOutAddFlipEvent") {
+        auto eq_id = static_cast<std::uint32_t>(a(0));
+        auto udata = a(2);
+        auto it = equeues_.find(eq_id);
+        if (it != equeues_.end()) {
+            it->second.has_flip_event = true;
+            it->second.flip_udata = udata;
+        }
         return 0;
     }
     if (n == "sceVideoOutSetBufferAttribute") {
@@ -1058,6 +1327,12 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     if (n == "sceVideoOutSubmitFlip") {
         int buf_idx = static_cast<int>(a(1));
         std::uint64_t flip_arg = a(3);
+        for (auto& pair : equeues_) {
+            if (pair.second.has_flip_event) {
+                EqueueEvent ev{0x6, -13, 0, 0, 1, pair.second.flip_udata};
+                pair.second.pending_events.push_back(ev);
+            }
+        }
         if (video_out_) {
             auto status = video_out_->submit_flip(static_cast<std::uint32_t>(buf_idx), flip_arg);
             return status == VideoStatus::ok ? 0 : static_cast<std::uint64_t>(-1);
@@ -1070,6 +1345,159 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             std::uint64_t count = video_out_->last_flip().sequence;
             mem_.store(status_ptr, &count, 8);
         }
+        return 0;
+    }
+
+    // Kernel Event Queue (Equeue) HLE
+    if (n == "sceKernelCreateEqueue") {
+        auto out_eq = a(0);
+        auto name_ptr = a(1);
+        std::string name = name_ptr ? read_guest_string(name_ptr) : "equeue";
+        auto id = static_cast<std::uint32_t>(next_equeue_id_++);
+        equeues_[id] = EqueueRecord{name, {}, 0, false};
+        if (out_eq) put<std::uint64_t>(mem_, out_eq, id);
+        return 0;
+    }
+    if (n == "sceKernelDeleteEqueue") {
+        auto id = static_cast<std::uint32_t>(a(0));
+        equeues_.erase(id);
+        return 0;
+    }
+    if (n == "sceKernelWaitEqueue") {
+        auto id = static_cast<std::uint32_t>(a(0));
+        auto ev_ptr = a(1);
+        auto num = static_cast<int>(a(2));
+        auto out_ptr = a(3);
+
+        auto it = equeues_.find(id);
+        if (it == equeues_.end()) {
+            if (out_ptr) put<std::int32_t>(mem_, out_ptr, 0);
+            return 0;
+        }
+
+        if (num > 0 && ev_ptr) {
+            if (!it->second.pending_events.empty()) {
+                auto ev = it->second.pending_events.front();
+                it->second.pending_events.erase(it->second.pending_events.begin());
+                mem_.store(ev_ptr, &ev, sizeof(EqueueEvent));
+                if (out_ptr) put<std::int32_t>(mem_, out_ptr, 1);
+                return 0;
+            }
+            if (it->second.has_flip_event) {
+                EqueueEvent ev{0x6, -13, 0, 0, 1, it->second.flip_udata};
+                mem_.store(ev_ptr, &ev, sizeof(EqueueEvent));
+                if (out_ptr) put<std::int32_t>(mem_, out_ptr, 1);
+                return 0;
+            }
+        }
+
+        if (out_ptr) put<std::int32_t>(mem_, out_ptr, 0);
+        return 0;
+    }
+
+    // libSceGnmDriver HLE
+    if (n == "sceGnmGetTheTessellationFactorRingBufferBaseAddress") {
+        if (!tessellation_ring_addr_) {
+            const std::size_t size = 0x800000; // 8 MB
+            tessellation_ring_addr_ = next_virtual_;
+            next_virtual_ += size;
+            mem_.map(tessellation_ring_addr_, size, bb::Permission::read | bb::Permission::write);
+            mappings_[tessellation_ring_addr_] = size;
+        }
+        return tessellation_ring_addr_;
+    }
+    if (n == "sceGnmDrawInitDefaultHardwareState200" || n == "sceGnmDispatchInitDefaultHardwareState") {
+        auto cmdbuf = a(0);
+        auto size = a(1);
+        if (cmdbuf && size >= 0x100) {
+            std::vector<std::uint32_t> nops(0x100, 0xffff0000);
+            nops[0] = 0xc0001000 | (0x100 - 2); // Type 3 PM4 NOP
+            mem_.store(cmdbuf, nops.data(), 0x100 * sizeof(std::uint32_t));
+        }
+        return 0x100;
+    }
+    if (n == "sceGnmAreSubmitsAllowed") {
+        return 1;
+    }
+    if (n == "sceGnmMapComputeQueue" || n == "sceGnmMapComputeQueueWithPriority") {
+        auto read_ptr = a(4);
+        if (read_ptr) {
+            put<std::uint32_t>(mem_, read_ptr, 0);
+        }
+        return 1;
+    }
+    if (n == "sceGnmUnmapComputeQueue" || n == "sceGnmDingDong" || n == "sceGnmFlushGarlic") {
+        return 0;
+    }
+    if (n == "sceGnmLogicalCuIndexToPhysicalCuIndex" || n == "sceGnmLogicalCuMaskToPhysicalCuMask") {
+        return a(1) != 0 ? a(1) : a(0);
+    }
+    if (n == "sceGnmInsertWaitFlipDone") {
+        auto cmdbuf = a(0);
+        auto size = a(1);
+        if (cmdbuf && size >= 7) {
+            std::vector<std::uint32_t> nops(7, 0xffff0000);
+            mem_.store(cmdbuf, nops.data(), 7 * sizeof(std::uint32_t));
+        }
+        return 0;
+    }
+    if (n == "sceGnmInsertSetMarker" || n == "sceGnmInsertSetColorMarker" ||
+        n == "sceGnmInsertPushMarker" || n == "sceGnmInsertPushColorMarker" ||
+        n == "sceGnmInsertPopMarker") {
+        return 0;
+    }
+    if (n == "sceGnmSetPsShader" || n == "sceGnmUpdatePsShader" ||
+        n == "sceGnmSetVsShader" || n == "sceGnmUpdateVsShader" ||
+        n == "sceGnmSetEsShader" || n == "sceGnmSetHsShader" ||
+        n == "sceGnmUpdateHsShader" || n == "sceGnmSetLsShader" ||
+        n == "sceGnmSetCsShader" || n == "sceGnmSetGsShader" ||
+        n == "sceGnmUpdateGsShader") {
+        return 0;
+    }
+    if (n == "sceGnmSubmitCommandBuffers" || n == "sceGnmSubmitAndFlipCommandBuffers") {
+        uint32_t count = static_cast<uint32_t>(a(0));
+        uint64_t dcb_addrs_ptr = a(1);
+        uint64_t dcb_sizes_ptr = a(2);
+        if (gnm_context_ && dcb_addrs_ptr && dcb_sizes_ptr && count > 0 && count < 64) {
+            for (uint32_t i = 0; i < count; ++i) {
+                uint64_t dcb_addr = 0;
+                uint32_t dcb_size = 0;
+                if (mem_.load(dcb_addrs_ptr + i * 8, &dcb_addr, 8) == MemoryError::ok &&
+                    mem_.load(dcb_sizes_ptr + i * 4, &dcb_size, 4) == MemoryError::ok) {
+                    if (dcb_addr != 0 && dcb_size >= 4) {
+                        gnm_context_->submit(dcb_addr, dcb_size / 4);
+                    }
+                }
+            }
+        }
+        if (n == "sceGnmSubmitAndFlipCommandBuffers") {
+            auto h = static_cast<std::uint32_t>(a(5));
+            auto buf_idx = static_cast<std::uint32_t>(a(6));
+            auto flip_arg = a(8);
+            if (video_out_) {
+                if (buf_idx < 16) {
+                    video_out_->submit_flip(buf_idx, flip_arg);
+                } else if (h < 16) {
+                    video_out_->submit_flip(h, a(7));
+                }
+            }
+            for (auto& pair : equeues_) {
+                if (pair.second.has_flip_event) {
+                    EqueueEvent ev{0x6, -13, 0, 0, 1, pair.second.flip_udata};
+                    pair.second.pending_events.push_back(ev);
+                }
+            }
+        }
+        return 0;
+    }
+    if (n == "sceGnmValidateCommandBuffers" || n == "sceGnmAddEqEvent" ||
+        n == "sceGnmDeleteEqEvent" || n == "sceGnmGetEqEventType" ||
+        n == "sceGnmGetEqTimeStamp" || n == "sceGnmDebugHardwareStatus" ||
+        n == "sceGnmSubmitDone" || n == "sceGnmRequestFlipAndSubmitDone" ||
+        n == "sceGnmSetupMipStatsReport" || n == "sceGnmRequestMipStatsReportAndReset" ||
+        n == "sceGnmDisableMipStatsReport" || n == "sceGnmSetGsRingSizes" ||
+        n == "sceGnmDriverTriggerCapture" || n == "sceGnmDriverCaptureInProgress" ||
+        n == "sceGnmIsUserPaEnabled") {
         return 0;
     }
 
@@ -1381,7 +1809,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (at>high || size>high-at) return no_space;
         put(mem_,a(5),at); physical_[at]=size; physical_used_+=size; return 0;
     }
-    if (n=="sceKernelMapDirectMemory" || n=="sceKernelMmap") {
+    if (n=="sceKernelMapDirectMemory" || n=="sceKernelMmap" ||
+        n=="sceKernelMapFlexibleMemory" || n=="sceKernelMapNamedFlexibleMemory") {
         const bool direct=n=="sceKernelMapDirectMemory";
         const auto size=a(1), prot=a(2), flags=a(3), phys=direct?a(4):0;
         const auto alignment=direct && a(5) ? a(5) : page;
@@ -1400,10 +1829,127 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         mappings_[at]=size; if (direct) direct_mappings_[at]=phys;
         next_virtual_=std::max(next_virtual_,at+size); return 0;
     }
-    if (n=="sceKernelMunmap") {
+    if (n=="sceKernelMunmap" || n=="munmap" || n=="sceKernelReleaseFlexibleMemory") {
         auto it=mappings_.find(a(0));
         if (it==mappings_.end() || a(1)!=it->second) return invalid;
         mem_.unmap(it->first); direct_mappings_.erase(it->first); mappings_.erase(it); return 0;
+    }
+    if (n=="sceKernelReserveVirtualRange") {
+        auto inout = a(0);
+        auto size = a(1);
+        auto flags = a(2);
+        auto alignment = a(3) ? a(3) : page;
+        if (!inout || !size || size%page || !valid_alignment(alignment)) return invalid;
+        auto at = get<std::uint64_t>(mem_, inout);
+        if (!(flags & 0x10) || !at) {
+            at = align(next_virtual_, alignment);
+        }
+        if (mem_.map(at, static_cast<std::size_t>(size), read|write) != MemoryError::ok) return no_memory;
+        put(mem_, inout, at);
+        mappings_[at] = size;
+        next_virtual_ = std::max(next_virtual_, at + size);
+        return 0;
+    }
+    if (n=="sceKernelMprotect") return 0;
+    if (n=="sceKernelQueryMemoryProtection") {
+        auto addr = a(0);
+        auto out_start = a(1);
+        auto out_end = a(2);
+        auto out_prot = a(3);
+        std::uint64_t base = 0;
+        std::size_t size = 0;
+        unsigned perm = bb::Permission::read | bb::Permission::write;
+        if (!mem_.query_region(addr, base, size, perm)) {
+            if (addr < 0x1000) return 0x8002000e; // EFAULT
+            base = addr & ~0x3fffULL;
+            size = 0x4000;
+            perm = bb::Permission::read | bb::Permission::write;
+        }
+        if (out_start) put<std::uint64_t>(mem_, out_start, base);
+        if (out_end) put<std::uint64_t>(mem_, out_end, base + size);
+        if (out_prot) {
+            std::uint32_t p = 0;
+            if (perm & bb::Permission::read) p |= 0x11;  // CPU_READ | GPU_READ
+            if (perm & bb::Permission::write) p |= 0x22; // CPU_WRITE | GPU_WRITE
+            put<std::uint32_t>(mem_, out_prot, p);
+        }
+        return 0;
+    }
+    if (n=="sceKernelVirtualQuery") {
+        auto addr = a(0);
+        auto info = a(2);
+        auto info_size = a(3);
+        if (!info || info_size < 32) return invalid;
+        std::uint64_t base = 0;
+        std::size_t size = 0;
+        unsigned perm = bb::Permission::read | bb::Permission::write;
+        if (!mem_.query_region(addr, base, size, perm)) {
+            if (addr < 0x1000) return 0x8002000e;
+            base = addr & ~0x3fffULL;
+            size = 0x4000;
+            perm = bb::Permission::read | bb::Permission::write;
+        }
+        put<std::uint64_t>(mem_, info, base);
+        put<std::uint64_t>(mem_, info + 8, base + size);
+        put<std::uint64_t>(mem_, info + 16, 0); // offset
+        std::uint32_t p = 0;
+        if (perm & bb::Permission::read) p |= 0x11;
+        if (perm & bb::Permission::write) p |= 0x22;
+        put<std::int32_t>(mem_, info + 24, p);
+        put<std::int32_t>(mem_, info + 28, 0); // memory_type
+        if (info_size >= 72) {
+            put<std::uint8_t>(mem_, info + 32, 0x13); // is_flexible | is_direct | is_committed
+            std::vector<std::uint8_t> zeros(32, 0);
+            mem_.store(info + 33, zeros.data(), 32);
+        }
+        return 0;
+    }
+    if (n=="sceKernelGetDirectMemoryType") {
+        auto out_type = a(1);
+        if (out_type) put<std::int32_t>(mem_, out_type, 0); // main memory type
+        return 0;
+    }
+    if (n=="sceKernelBatchMap" || n=="sceKernelBatchMap2") {
+        auto entries_addr = a(0);
+        auto count = static_cast<int>(a(1));
+        auto processed_addr = a(2);
+        auto flags = (n=="sceKernelBatchMap2") ? a(3) : 0x10;
+        int done = 0;
+        for (; done < count; ++done) {
+            auto entry_ptr = entries_addr + static_cast<std::uint64_t>(done) * 32;
+            std::uint64_t start_addr = 0, offset = 0, length = 0;
+            std::int8_t prot = 0, type = 0;
+            std::int16_t reserved = 0;
+            std::int32_t operation = 0;
+            mem_.load(entry_ptr, &start_addr, 8);
+            mem_.load(entry_ptr + 8, &offset, 8);
+            mem_.load(entry_ptr + 16, &length, 8);
+            mem_.load(entry_ptr + 24, &prot, 1);
+            mem_.load(entry_ptr + 25, &type, 1);
+            mem_.load(entry_ptr + 26, &reserved, 2);
+            mem_.load(entry_ptr + 28, &operation, 4);
+
+            if (operation == 0 || operation == 3) { // map direct ou flexible
+                if (!start_addr || !length || length % page) break;
+                if (!(flags & 0x10) || !start_addr) {
+                    start_addr = align(next_virtual_, page);
+                }
+                if (mem_.map(start_addr, static_cast<std::size_t>(length), read|write) != MemoryError::ok) break;
+                put(mem_, entry_ptr, start_addr);
+                mappings_[start_addr] = length;
+                next_virtual_ = std::max(next_virtual_, start_addr + length);
+            } else if (operation == 1) { // unmap
+                auto it = mappings_.find(start_addr);
+                if (it != mappings_.end()) {
+                    mem_.unmap(it->first);
+                    mappings_.erase(it);
+                }
+            } else if (operation == 2 || operation == 4) { // protect
+                // no-op no ambiente emulado
+            }
+        }
+        if (processed_addr) put<std::int32_t>(mem_, processed_addr, done);
+        return (done == count) ? 0 : invalid;
     }
     if (n=="sceKernelReleaseDirectMemory") {
         auto it=physical_.find(a(0)); if (it==physical_.end() || it->second!=a(1)) return invalid;
@@ -1482,34 +2028,36 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     // Kernel semaphores
     if (n=="sceKernelCreateSema") {
-        bool is_sdk = is_likely_string_ptr(mem_, a(0)) || a(0) == 0;
         std::string sema_name = "sema";
         std::uint32_t attr = SCE_KERNEL_SEMA_ATTR_TH_FIFO;
         std::int32_t init_val = 0, max_val = 1;
         std::uint64_t out_id_addr = 0;
+        bool is_sdk = false;
 
-        if (is_sdk) {
+        if (a(4) > 0) {
+            // Standard Orbis API: sceKernelCreateSema(out_id, name, attr, init, max, opt)
+            out_id_addr = a(0);
+            if (!out_id_addr) return invalid;
+            if (a(1)) sema_name = read_guest_string(a(1), 32);
+            attr = static_cast<std::uint32_t>(a(2));
+            init_val = static_cast<std::int32_t>(a(3));
+            max_val = static_cast<std::int32_t>(a(4));
+            is_sdk = false;
+        } else if ((a(2) >> 16) > 0) {
+            // Packed legacy test format: a(0)=out, a(1)=name, a(2)=max<<16|init
+            out_id_addr = a(0);
+            if (!out_id_addr) return invalid;
+            if (a(1)) sema_name = read_guest_string(a(1), 32);
+            init_val = static_cast<std::int32_t>(a(2) & 0xFFFF);
+            max_val = static_cast<std::int32_t>((a(2) >> 16) & 0xFFFF);
+            is_sdk = false;
+        } else {
+            // Unit test SDK format: a(0)=name, a(1)=attr, a(2)=init, a(3)=max -> returns handle
             if (a(0)) sema_name = read_guest_string(a(0), 32);
             attr = static_cast<std::uint32_t>(a(1));
             init_val = static_cast<std::int32_t>(a(2));
             max_val = static_cast<std::int32_t>(a(3));
-        } else {
-            out_id_addr = a(0);
-            if (!out_id_addr) return invalid;
-            if (a(1)) sema_name = read_guest_string(a(1), 32);
-            if (a(3) != 0 && (a(3) >> 16) != 0) {
-                init_val = static_cast<std::int32_t>(a(3) & 0xFFFF);
-                max_val = static_cast<std::int32_t>((a(3) >> 16) & 0xFFFF);
-            } else if (a(2) != 0 && (a(2) >> 16) != 0) {
-                init_val = static_cast<std::int32_t>(a(2) & 0xFFFF);
-                max_val = static_cast<std::int32_t>((a(2) >> 16) & 0xFFFF);
-            } else if (a(3) != 0) {
-                init_val = static_cast<std::int32_t>(a(2));
-                max_val = static_cast<std::int32_t>(a(3));
-            } else {
-                init_val = static_cast<std::int32_t>(a(2));
-                max_val = std::max<std::int32_t>(1, init_val);
-            }
+            is_sdk = true;
         }
         if (max_val <= 0) max_val = std::max<std::int32_t>(1, init_val);
         if (init_val < 0 || max_val <= 0 || init_val > max_val) return invalid;
@@ -1580,63 +2128,148 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (mem_.store(a(1), &info, to_write) != MemoryError::ok) return invalid;
         return 0;
     }
-    // pthread thread attributes (scePthreadAttr*)
-    if (n=="scePthreadAttrInit") {
+    // pthread thread attributes (scePthreadAttr* / pthread_attr_*)
+    if (n=="scePthreadAttrInit" || n=="pthread_attr_init") {
         if (!a(0)) return invalid;
-        auto h=next_handle_++; put(mem_,a(0),h); attr_defaults_[h]={}; return 0;
+        auto h = next_handle_++;
+        put(mem_, a(0), h);
+        auto& at = attr_defaults_[h];
+        at = {};
+        at.affinity = 0x7F;
+        at.stack_size = 0x100000;
+        return 0;
     }
-    if (n=="scePthreadAttrDestroy") {
-        attr_defaults_.erase(a(0)); return 0;
+    if (n=="scePthreadAttrDestroy" || n=="pthread_attr_destroy") {
+        if (a(0)) {
+            std::uint64_t h = 0;
+            if (mem_.load(a(0), &h, 8) == MemoryError::ok) {
+                attr_defaults_.erase(h);
+                put<std::uint64_t>(mem_, a(0), 0);
+            }
+            attr_defaults_.erase(a(0));
+        }
+        return 0;
     }
-    if (n=="scePthreadAttrSetstacksize") {
+    if (n=="scePthreadAttrSetstacksize" || n=="pthread_attr_setstacksize") {
         if (!a(0) || !a(1)) return invalid;
-        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
-        it->second.stack_size=a(1); return 0;
+        auto* at = find_attr(a(0));
+        if (!at) return invalid;
+        at->stack_size = a(1);
+        return 0;
     }
-    if (n=="scePthreadAttrSetdetachstate") {
-        if (!a(0)) return invalid;
-        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
-        it->second.detach_state=static_cast<std::uint32_t>(a(1)); return 0;
-    }
-    if (n=="scePthreadAttrSetschedpolicy") {
-        if (!a(0)) return invalid;
-        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
-        it->second.sched_policy=static_cast<std::uint32_t>(a(1)); return 0;
-    }
-    if (n=="scePthreadAttrSetschedparam") {
+    if (n=="scePthreadAttrGetstacksize" || n=="pthread_attr_getstacksize") {
         if (!a(0) || !a(1)) return invalid;
-        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
-        std::uint32_t param=0; if (mem_.load(a(1),&param,4)!=MemoryError::ok) return invalid;
-        it->second.sched_param=param; return 0;
+        auto* at = find_attr(a(0));
+        std::uint64_t sz = at && at->stack_size ? at->stack_size : (2 * 1024 * 1024);
+        put<std::uint64_t>(mem_, a(1), sz);
+        return 0;
+    }
+    if (n=="scePthreadAttrSetguardsize" || n=="pthread_attr_setguardsize") {
+        return 0;
+    }
+    if (n=="scePthreadAttrGetguardsize" || n=="pthread_attr_getguardsize") {
+        if (a(1)) put<std::uint64_t>(mem_, a(1), 4096);
+        return 0;
+    }
+    if (n=="scePthreadAttrSetstack" || n=="pthread_attr_setstack") {
+        if (!a(0) || !a(2)) return invalid;
+        auto* at = find_attr(a(0));
+        if (at) at->stack_size = a(2);
+        return 0;
+    }
+    if (n=="scePthreadAttrGetstack" || n=="pthread_attr_getstack") {
+        if (!a(0) || !a(1) || !a(2)) return invalid;
+        auto* at = find_attr(a(0));
+        std::uint64_t sz = at && at->stack_size ? at->stack_size : (2 * 1024 * 1024);
+        put<std::uint64_t>(mem_, a(1), 0);
+        put<std::uint64_t>(mem_, a(2), sz);
+        return 0;
+    }
+    if (n=="scePthreadAttrSetdetachstate" || n=="pthread_attr_setdetachstate") {
+        if (!a(0)) return invalid;
+        auto* at = find_attr(a(0));
+        if (!at) return invalid;
+        at->detach_state = static_cast<std::uint32_t>(a(1));
+        return 0;
+    }
+    if (n=="scePthreadAttrGetdetachstate" || n=="pthread_attr_getdetachstate") {
+        if (!a(0) || !a(1)) return invalid;
+        auto* at = find_attr(a(0));
+        put<std::uint32_t>(mem_, a(1), at ? at->detach_state : 0);
+        return 0;
+    }
+    if (n=="scePthreadAttrSetschedpolicy" || n=="pthread_attr_setschedpolicy") {
+        if (!a(0)) return invalid;
+        auto* at = find_attr(a(0));
+        if (!at) return invalid;
+        at->sched_policy = static_cast<std::uint32_t>(a(1));
+        return 0;
+    }
+    if (n=="scePthreadAttrGetschedpolicy" || n=="pthread_attr_getschedpolicy") {
+        if (!a(0) || !a(1)) return invalid;
+        auto* at = find_attr(a(0));
+        put<std::uint32_t>(mem_, a(1), at ? at->sched_policy : 0);
+        return 0;
+    }
+    if (n=="scePthreadAttrSetschedparam" || n=="pthread_attr_setschedparam") {
+        if (!a(0) || !a(1)) return invalid;
+        auto* at = find_attr(a(0));
+        if (!at) return invalid;
+        std::uint32_t param = 0;
+        if (mem_.load(a(1), &param, 4) != MemoryError::ok) return invalid;
+        at->sched_param = param;
+        return 0;
+    }
+    if (n=="scePthreadAttrGetschedparam" || n=="pthread_attr_getschedparam") {
+        if (!a(0) || !a(1)) return invalid;
+        auto* at = find_attr(a(0));
+        put<std::uint32_t>(mem_, a(1), at ? at->sched_param : 0);
+        return 0;
     }
     if (n=="scePthreadAttrSetaffinity") {
         if (!a(0) || !a(1)) return invalid;
-        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
-        std::uint64_t affinity=0; if (mem_.load(a(1),&affinity,8)!=MemoryError::ok) return invalid;
-        it->second.affinity=affinity; return 0;
+        auto* at = find_attr(a(0));
+        if (!at) return invalid;
+        std::uint64_t affinity = 0;
+        if (mem_.load(a(1), &affinity, 8) != MemoryError::ok) return invalid;
+        at->affinity = affinity;
+        return 0;
     }
-    if (n=="scePthreadAttrSetinheritsched") {
+    if (n=="scePthreadAttrSetinheritsched" || n=="pthread_attr_setinheritsched") {
         if (!a(0)) return invalid;
-        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
-        it->second.inherit_sched=static_cast<std::uint32_t>(a(1)); return 0;
+        auto* at = find_attr(a(0));
+        if (!at) return invalid;
+        at->inherit_sched = static_cast<std::uint32_t>(a(1));
+        return 0;
+    }
+    if (n=="scePthreadAttrGetinheritsched" || n=="pthread_attr_getinheritsched") {
+        if (!a(0) || !a(1)) return invalid;
+        auto* at = find_attr(a(0));
+        put<std::uint32_t>(mem_, a(1), at ? at->inherit_sched : 0);
+        return 0;
     }
     if (n=="scePthreadAttrGet") {
         if (!a(0) || !a(1)) return invalid;
-        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
-        if (mem_.store(a(1),&it->second,sizeof(PthreadAttrDefaults))!=MemoryError::ok) return invalid;
+        auto* at = find_attr(a(1));
+        if (!at) return invalid;
+        at->affinity = 0x7F;
+        at->stack_size = 0x100000;
+        at->detach_state = 0;
+        at->sched_policy = 1;
         return 0;
     }
     if (n=="scePthreadAttrGetaffinity") {
         if (!a(0) || !a(1)) return invalid;
-        auto it=attr_defaults_.find(a(0)); if (it==attr_defaults_.end()) return invalid;
-        if (mem_.store(a(1),&it->second.affinity,8)!=MemoryError::ok) return invalid;
+        auto* at = find_attr(a(0));
+        const std::uint64_t aff = at ? at->affinity : 0x7F;
+        if (mem_.store(a(1), &aff, 8) != MemoryError::ok) return invalid;
         return 0;
     }
     // pthread thread functions (stubs for non-scheduler mode)
-    if (n=="scePthreadSelf") {
+    if (n=="scePthreadSelf" || n=="pthread_self" || n=="pthread_getthreadid_np") {
         return 1; // main thread ID
     }
-    if (n=="scePthreadCreate") {
+    if (n=="scePthreadCreate" || n=="pthread_create" || n=="pthread_create_name_np") {
         // Simplified: allocate a thread ID and return success
         if (!a(0) || !a(2)) return invalid;
         std::uint64_t tid = next_handle_++;
@@ -1787,6 +2420,21 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0x80020010;
     }
     if (n=="sceKernelUsleep" || n=="usleep") return 0; // yield cooperativo
+    if (n=="sceKernelReadTsc") {
+        if (scheduler_) return scheduler_->now();
+        static std::uint64_t tsc_val = 1000000;
+        return tsc_val += 100;
+    }
+    if (n=="sceKernelGetTscFrequency") {
+        return 1600000000ULL;
+    }
+    if (n=="_Assert") {
+        std::string expr = a(0) ? read_guest_string(a(0)) : "";
+        std::string file = a(1) ? read_guest_string(a(1)) : "";
+        std::printf("[GUEST ASSERT] expr='%s' file='%s' line=%llu\n",
+                    expr.c_str(), file.c_str(), (unsigned long long)a(2));
+        return 0;
+    }
     if (n=="sceKernelGetProcessTime") {
         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     }
@@ -1796,7 +2444,381 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
         put<std::int64_t>(mem_,a(1),ns/1000000000); put<std::int64_t>(mem_,a(1)+8,ns%1000000000); return 0;
     }
-    if (n=="sceSysmoduleLoadModule" || n=="sceSysmoduleUnloadModule" || n=="sceSysmoduleIsLoaded" || n=="sceAppContentInitialize" || n=="sceAppContentAppParamGetInt" || n=="sceAppContentGetAddcontInfoList") return 0x80020002; // serviço indisponível
+    if (n=="sceSysmoduleLoadModule") {
+        const auto id = static_cast<std::uint16_t>(a(0));
+        if (!id) return 0x805A1000; // SCE_SYSMODULE_ERROR_INVALID_VALUE
+        return 0; // SCE_SYSMODULE_OK
+    }
+    if (n=="sceSysmoduleUnloadModule") {
+        const auto id = static_cast<std::uint16_t>(a(0));
+        if (!id) return 0x805A1000;
+        return 0;
+    }
+    if (n=="sceSysmoduleIsLoaded") {
+        const auto id = static_cast<std::uint16_t>(a(0));
+        if (!id) return 0x805A1000;
+        return 0; // SCE_SYSMODULE_LOADED
+    }
+    if (n=="sceAppContentInitialize") {
+        const auto boot_param_addr = a(1);
+        if (boot_param_addr) {
+            std::uint8_t zero[40] = {};
+            mem_.store(boot_param_addr, zero, sizeof(zero));
+        }
+        return 0; // SCE_APP_CONTENT_OK
+    }
+    if (n=="sceAppContentAppParamGetInt") {
+        const auto param_id = static_cast<std::uint32_t>(a(0));
+        const auto out_addr = a(1);
+        if (!out_addr) return 0x80D90002; // SCE_APP_CONTENT_ERROR_PARAMETER
+        std::int32_t val = 0;
+        if (param_id == 0) val = 3; // SCE_APP_CONTENT_SKU_FLAG_FULL
+        else if (param_id == 1) val = 13; // USER_DEFINED_PARAM_1 (param.sfo Bloodborne)
+        else if (param_id <= 4) val = 0;
+        else return 0x80D90002;
+        mem_.store(out_addr, &val, sizeof(val));
+        return 0;
+    }
+    if (n=="sceAppContentGetAddcontInfoList") {
+        const auto hits_addr = a(3);
+        if (hits_addr) {
+            std::uint32_t hits = 0;
+            mem_.store(hits_addr, &hits, sizeof(hits));
+        }
+        return 0;
+    }
+    // Dialog HLE: CommonDialog, MsgDialog, ImeDialog, SaveDataDialog, NpProfileDialog, NpCommerceDialog
+    if (n=="sceCommonDialogInitialize") {
+        return default_dialog_manager().sceCommonDialogInitialize();
+    }
+    if (n=="sceCommonDialogGetStatus") {
+        return default_dialog_manager().sceCommonDialogGetStatus();
+    }
+    if (n=="sceMsgDialogInitialize") {
+        return default_dialog_manager().sceMsgDialogInitialize();
+    }
+    if (n=="sceMsgDialogOpen") {
+        return default_dialog_manager().sceMsgDialogOpen(mem_, a(0));
+    }
+    if (n=="sceMsgDialogGetStatus") {
+        return default_dialog_manager().sceMsgDialogGetStatus();
+    }
+    if (n=="sceMsgDialogUpdateStatus") {
+        return default_dialog_manager().sceMsgDialogUpdateStatus();
+    }
+    if (n=="sceMsgDialogGetResult") {
+        return default_dialog_manager().sceMsgDialogGetResult(mem_, a(0));
+    }
+    if (n=="sceMsgDialogTerminate") {
+        return default_dialog_manager().sceMsgDialogTerminate();
+    }
+    if (n=="sceImeDialogInit") {
+        return default_dialog_manager().sceImeDialogInit(mem_, a(0));
+    }
+    if (n=="sceImeDialogGetStatus") {
+        return default_dialog_manager().sceImeDialogGetStatus();
+    }
+    if (n=="sceImeDialogGetResult") {
+        return default_dialog_manager().sceImeDialogGetResult(mem_, a(0));
+    }
+    if (n=="sceImeDialogTerm") {
+        return default_dialog_manager().sceImeDialogTerm();
+    }
+    if (n=="sceImeDialogAbort") {
+        return default_dialog_manager().sceImeDialogAbort();
+    }
+    if (n=="sceSaveDataDialogInitialize") return 0;
+    if (n=="sceSaveDataDialogOpen") return 0;
+    if (n=="sceSaveDataDialogUpdateStatus") return 3; // FINISHED
+    if (n=="sceSaveDataDialogTerminate") return 0;
+    if (n=="sceNpProfileDialogInitialize") return 0;
+    if (n=="sceNpProfileDialogOpen") return 0;
+    if (n=="sceNpProfileDialogUpdateStatus") return 3; // FINISHED
+    if (n=="sceNpProfileDialogGetResult") {
+        if (a(0)) put<std::uint32_t>(mem_, a(0), 0);
+        return 0;
+    }
+    if (n=="sceNpProfileDialogTerminate") return 0;
+    if (n=="sceNpCommerceDialogInitialize") return 0;
+    if (n=="sceNpCommerceDialogOpen") return 0;
+    if (n=="sceNpCommerceDialogUpdateStatus") return 3; // FINISHED
+    if (n=="sceNpCommerceDialogTerminate") return 0;
+
+    // libSceSystemService HLE
+    if (n == "sceSystemServiceParamGetInt") {
+        auto id = static_cast<std::int32_t>(a(0));
+        auto out = a(1);
+        if (!out) return 0x80A10003; // SYSTEM_PARAMETER
+        std::int32_t val = 0;
+        switch (id) {
+            case 1: val = 1; break; // Language (1 = English US)
+            case 2: val = 1; break; // Date format DD/MM/YYYY
+            case 3: val = 1; break; // 24-hour clock
+            case 4: val = -180; break; // UTC offset in minutes (-3h)
+            case 5: val = 0; break; // Summer time off
+            case 7: val = 0; break; // Parental level off
+            case 1000: val = 1; break; // Enter button = cross
+            default: val = 0; break;
+        }
+        mem_.store(out, &val, sizeof(val));
+        return 0;
+    }
+    if (n == "sceSystemServiceGetStatus") {
+        auto out = a(0);
+        if (!out) return 0x80A10003;
+        std::uint8_t status[12] = {}; // event_num=0, no overlay, foreground, normal CPU mode
+        mem_.store(out, status, sizeof(status));
+        return 0;
+    }
+    if (n == "sceSystemServiceReceiveEvent") {
+        return 0x80A10004; // SYSTEM_NO_EVENT
+    }
+    if (n == "sceSystemServiceHideSplashScreen" || n == "sceSystemServiceLaunchWebBrowser") {
+        return 0;
+    }
+
+    // libScePlayGo HLE
+    if (n == "scePlayGoInitialize") return 0;
+    if (n == "scePlayGoOpen") {
+        auto handle_addr = a(0);
+        if (!handle_addr) return 0x80B2000A; // PLAYGO_BAD_POINTER
+        std::int32_t h = 1;
+        mem_.store(handle_addr, &h, sizeof(h));
+        return 0;
+    }
+    if (n == "scePlayGoGetChunkId") {
+        auto handle = static_cast<std::int32_t>(a(0));
+        auto ids_addr = a(1);
+        auto count = static_cast<std::uint32_t>(a(2));
+        auto out_addr = a(3);
+        if (handle != 1) return 0x80B20009; // PLAYGO_BAD_HANDLE
+        if (!out_addr) return 0x80B2000A; // PLAYGO_BAD_POINTER
+        if (ids_addr && !count) return 0x80B2000B; // PLAYGO_BAD_SIZE
+        if (!ids_addr) {
+            std::uint32_t total = 1;
+            mem_.store(out_addr, &total, sizeof(total));
+            return 0;
+        }
+        std::uint16_t chunk_id = 0;
+        mem_.store(ids_addr, &chunk_id, sizeof(chunk_id));
+        std::uint32_t written = 1;
+        mem_.store(out_addr, &written, sizeof(written));
+        return 0;
+    }
+    if (n == "scePlayGoGetLocus") {
+        auto handle = static_cast<std::int32_t>(a(0));
+        auto ids_addr = a(1);
+        auto count = static_cast<std::uint32_t>(a(2));
+        auto loci_addr = a(3);
+        if (handle != 1) return 0x80B20009;
+        if (!ids_addr || !loci_addr) return 0x80B2000A;
+        if (!count) return 0x80B2000B;
+        std::vector<std::int8_t> loci(count, 3); // 3 = LocalFast (instalado localmente)
+        mem_.store(loci_addr, loci.data(), loci.size());
+        return 0;
+    }
+    if (n == "scePlayGoSetInstallSpeed") {
+        return 0;
+    }
+
+    // libSceDiscMap HLE
+    if (n == "sceDiscMapIsRequestOnHDD" || n == "sceDiscMap_8A828CAEE7EDD5E9") {
+        return 0x81100004; // DISC_MAP_NO_BITMAP (jogo totalmente instalado no HDD/armazenamento)
+    }
+
+    // libSceMouse HLE
+    if (n == "sceMouseInit") return 0;
+    if (n == "sceMouseOpen") return 1;
+    if (n == "sceMouseRead") {
+        auto data_addr = a(1);
+        auto count = a(2);
+        if (!data_addr || count < 1) return 0x80DF0001;
+        std::uint8_t empty_mouse[40] = {};
+        mem_.store(data_addr, empty_mouse, sizeof(empty_mouse));
+        return 1;
+    }
+    if (n == "sceMouseClose") return 0;
+
+    // libSceAudioIn HLE
+    if (n == "sceAudioInOpen" || n == "sceAudioInInput" || n == "sceAudioInClose") {
+        return 0x80260109; // AUDIO_IN_NOT_OPENED
+    }
+
+    // libSceVoice HLE
+    if (n == "sceVoiceInit" || n == "sceVoiceEnd" || n == "sceVoiceDeletePort" ||
+        n == "sceVoiceConnectIPortToOPort" || n == "sceVoiceDisconnectIPortFromOPort" ||
+        n == "sceVoiceStart" || n == "sceVoiceStop" || n == "sceVoiceReadFromOPort" ||
+        n == "sceVoiceWriteToIPort") {
+        return 0;
+    }
+    if (n == "sceVoiceCreatePort") {
+        if (a(0)) put<std::int32_t>(mem_, a(0), 1);
+        return 0;
+    }
+    if (n == "sceVoiceGetPortInfo") {
+        if (a(1)) {
+            std::uint8_t info[40] = {};
+            mem_.store(a(1), info, sizeof(info));
+        }
+        return 0;
+    }
+
+    if (n == "sceAjmInitialize") {
+        if (a(1)) put<std::int32_t>(mem_, a(1), 1);
+        else if (a(0)) put<std::int32_t>(mem_, a(0), 1);
+        return 0;
+    }
+    if (n == "sceAjmFinalize") {
+        return 0;
+    }
+    if (n == "sceAjmModuleRegister" || n == "sceAjmModuleUnregister") {
+        return 0;
+    }
+    if (n == "sceAjmInstanceCreate") {
+        if (a(2)) put<std::int32_t>(mem_, a(2), 1);
+        else if (a(1)) put<std::int32_t>(mem_, a(1), 1);
+        return 0;
+    }
+    if (n == "sceAjmInstanceDestroy") {
+        return 0;
+    }
+    if (n == "sceAjmBatchStartBuffer") {
+        if (a(3)) put<std::int32_t>(mem_, a(3), 1);
+        return 0;
+    }
+    if (n == "sceAjmBatchWait" || n == "sceAjmBatchCancel" ||
+        n == "sceAjmBatchJobRunBufferRa" || n == "sceAjmBatchJobControlBufferRa" ||
+        n == "sceAjmBatchErrorDump") {
+        return 0;
+    }
+
+    // libSceNpTrophy HLE
+    if (n == "sceNpTrophyCreateContext" || n == "sceNpTrophyCreateHandle") {
+        if (a(0)) put<std::int32_t>(mem_, a(0), 1);
+        return 0;
+    }
+    if (n == "sceNpTrophyRegisterContext" || n == "sceNpTrophyUnlockTrophy") {
+        return 0;
+    }
+    if (n == "sceNpTrophyGetGameInfo" || n == "sceNpTrophyGetTrophyInfo") {
+        auto ptr = (n == "sceNpTrophyGetGameInfo") ? a(2) : a(3);
+        if (ptr) {
+            std::uint8_t info[64] = {};
+            mem_.store(ptr, info, sizeof(info));
+        }
+        return 0;
+    }
+
+    // libSceNet / libSceNetCtl / libSceSsl / libSceHttp HLE
+    if (n == "sceNetInit" || n == "sceNetTerm") return 0;
+    if (n == "sceNetErrnoLoc") return 0;
+    if (n == "sceNetPoolCreate" || n == "sceNetEpollCreate" || n == "sceNetResolverCreate") return 1;
+    if (n == "sceNetPoolDestroy" || n == "sceNetEpollDestroy" || n == "sceNetResolverDestroy") return 0;
+    if (n == "sceNetHtons" || n == "sceNetNtohs") {
+        return static_cast<std::uint16_t>(((a(0) & 0xff) << 8) | ((a(0) >> 8) & 0xff));
+    }
+    if (n == "sceNetHtonl" || n == "sceNetNtohl") {
+        auto v = static_cast<std::uint32_t>(a(0));
+        return ((v & 0xff) << 24) | (((v >> 8) & 0xff) << 16) | (((v >> 16) & 0xff) << 8) | ((v >> 24) & 0xff);
+    }
+    if (n == "sceNetInetPton" || n == "sceNetInetNtop") return 0;
+    if (n == "sceNetSocket" || n == "sceNetConnect" || n == "sceNetBind" || n == "sceNetListen" ||
+        n == "sceNetAccept" || n == "sceNetSend" || n == "sceNetSendto" || n == "sceNetRecv" ||
+        n == "sceNetRecvfrom" || n == "sceNetSetsockopt" || n == "sceNetGetsockopt" ||
+        n == "sceNetGetsockname" || n == "sceNetShutdown" || n == "sceNetSocketClose" ||
+        n == "sceNetSocketAbort" || n == "sceNetEpollControl" || n == "sceNetEpollWait" ||
+        n == "sceNetEpollAbort" || n == "sceNetResolverStartNtoa" || n == "sceNetResolverStartAton") {
+        return 0x80410133; // NET_ENETUNREACH
+    }
+    if (n == "sceNetCtlGetState") {
+        if (a(0)) put<std::int32_t>(mem_, a(0), 0); // Desconectado
+        return 0;
+    }
+    if (n == "sceNetCtlGetInfo") return 0x80412108; // NET_CTL_NOT_CONNECTED
+    if (n == "sceNetCtlRegisterCallback") {
+        if (a(2)) put<std::int32_t>(mem_, a(2), 1);
+        return 0;
+    }
+    if (n == "sceNetCtlCheckCallback" || n == "sceNetCtlUnregisterCallback") return 0;
+    if (n == "sceNetCtlGetNatInfo") {
+        if (a(0)) {
+            std::uint32_t nat[4] = {0, 0, 3, 0};
+            mem_.store(a(0), nat, sizeof(nat));
+        }
+        return 0;
+    }
+    if (n == "sceSslInit") return 1;
+    if (n == "sceSslTerm") return 0;
+    if (n == "sceHttpInit" || n == "sceHttpCreateTemplate" || n == "sceHttpCreateConnectionWithURL" ||
+        n == "sceHttpCreateRequestWithURL" || n == "sceHttpCreateEpoll") return 1;
+    if (n == "sceHttpTerm" || n == "sceHttpDeleteTemplate" || n == "sceHttpSetNonblock" ||
+        n == "sceHttpSetConnectTimeOut" || n == "sceHttpsEnableOption" || n == "sceHttpsDisableOption" ||
+        n == "sceHttpAddRequestHeader" || n == "sceHttpSetRequestContentLength" ||
+        n == "sceHttpDeleteConnection" || n == "sceHttpDeleteRequest" || n == "sceHttpAbortWaitRequest" ||
+        n == "sceHttpDestroyEpoll" || n == "sceHttpSetEpoll" || n == "sceHttpUnsetEpoll") return 0;
+    if (n == "sceHttpSendRequest" || n == "sceHttpWaitRequest" || n == "sceHttpGetStatusCode" ||
+        n == "sceHttpGetResponseContentLength" || n == "sceHttpReadData") return 0x80431063; // HTTP_NETWORK
+
+    // libSceNp / libSceNpWebApi / libSceNpMatching2 / libSceNpSignaling / libSceNpScore HLE
+    if (n == "sceNpGetState") {
+        if (a(1)) put<std::int32_t>(mem_, a(1), 0); // signed out
+        return 0;
+    }
+    if (n == "sceNpGetOnlineId" || n == "sceNpGetNpId" || n == "sceNpCheckNpAvailability" ||
+        n == "sceNpGetParentalControlInfo" || n == "sceNpCheckPlus" || n == "sceNpGetGamePresenceStatus") {
+        return 0x80550006; // NP_SIGNED_OUT
+    }
+    if (n == "sceNpRegisterStateCallback" || n == "sceNpRegisterPlusEventCallback") {
+        if (a(2)) put<std::int32_t>(mem_, a(2), 1);
+        return 0;
+    }
+    if (n == "sceNpUnregisterStateCallback" || n == "sceNpRegisterGamePresenceCallback" ||
+        n == "sceNpUnregisterPlusEventCallback" || n == "sceNpCheckCallback" ||
+        n == "sceNpSetNpTitleId" || n == "sceNpNotifyPlusFeature" || n == "sceNpSetContentRestriction" ||
+        n == "sceNpDeleteRequest" || n == "sceNpAbortRequest" || n == "sceNpPollAsync") return 0;
+    if (n == "sceNpCreateAsyncRequest") return 1;
+    if (n == "sceNpCmpNpId" || n == "sceNpCmpOnlineId") return 0;
+    if (n == "sceNpAuthCreateAsyncRequest") return 1;
+    if (n == "sceNpAuthDeleteRequest" || n == "sceNpAuthPollAsync") return 0;
+    if (n == "sceNpAuthGetAuthorizationCode") return 0x80550006;
+    if (n == "sceNpLookupCreateTitleCtx" || n == "sceNpLookupCreateAsyncRequest") return 1;
+    if (n == "sceNpLookupDeleteTitleCtx" || n == "sceNpLookupDeleteRequest" ||
+        n == "sceNpLookupAbortRequest" || n == "sceNpLookupPollAsync") return 0;
+    if (n == "sceNpLookupNpId") return 0x80550006;
+    if (n == "sceNpScoreCreateNpTitleCtx" || n == "sceNpScoreCreateRequest") return 1;
+    if (n == "sceNpScoreDeleteNpTitleCtx" || n == "sceNpScoreDeleteRequest" ||
+        n == "sceNpScoreAbortRequest" || n == "sceNpScoreSetPlayerCharacterId") return 0;
+    if (n == "sceNpScoreCensorComment" || n == "sceNpScoreSanitizeComment" ||
+        n == "sceNpScoreGetBoardInfo" || n == "sceNpScoreGetGameData" ||
+        n == "sceNpScoreGetRankingByNpIdPcId" || n == "sceNpScoreGetRankingByRange" ||
+        n == "sceNpScoreRecordGameData" || n == "sceNpScoreRecordScore") return 0x80550006;
+    if (n == "sceNpWebApiInitialize") return 1;
+    if (n == "sceNpWebApiTerminate" || n == "sceNpWebApiDeletePushEventFilter" ||
+        n == "sceNpWebApiDeleteContext" || n == "sceNpWebApiDeleteRequest" ||
+        n == "sceNpWebApiAbortRequest" || n == "sceNpWebApiUnregisterPushEventCallback") return 0;
+    if (n == "sceNpWebApiCreateContext" || n == "sceNpWebApiCreateRequest" ||
+        n == "sceNpWebApiSendRequest" || n == "sceNpWebApiReadData" ||
+        n == "sceNpWebApiGetHttpStatusCode" || n == "sceNpWebApiGetHttpResponseHeaderValue" ||
+        n == "sceNpWebApiGetHttpResponseHeaderValueLength" || n == "sceNpWebApiCreatePushEventFilter" ||
+        n == "sceNpWebApiRegisterPushEventCallback" || n == "sceNpWebApiUtilityParseNpId") return 0x80550006;
+    if (n == "sceNpMatching2Initialize" || n == "sceNpMatching2Terminate" ||
+        n == "sceNpMatching2ContextStop" || n == "sceNpMatching2DestroyContext" ||
+        n == "sceNpMatching2RegisterContextCallback" || n == "sceNpMatching2RegisterLobbyEventCallback" ||
+        n == "sceNpMatching2RegisterRoomEventCallback" || n == "sceNpMatching2RegisterSignalingCallback" ||
+        n == "sceNpMatching2SetDefaultRequestOptParam") return 0;
+    if (n == "sceNpMatching2CreateContext" || n == "sceNpMatching2ContextStart" ||
+        n == "sceNpMatching2CreateJoinRoom" || n == "sceNpMatching2JoinRoom" ||
+        n == "sceNpMatching2LeaveRoom" || n == "sceNpMatching2SearchRoom" ||
+        n == "sceNpMatching2GetServerId" || n == "sceNpMatching2GetWorldInfoList" ||
+        n == "sceNpMatching2GetLobbyInfoList" || n == "sceNpMatching2JoinLobby" ||
+        n == "sceNpMatching2LeaveLobby" || n == "sceNpMatching2GrantRoomOwner" ||
+        n == "sceNpMatching2KickoutRoomMember" || n == "sceNpMatching2SetRoomDataExternal" ||
+        n == "sceNpMatching2SetRoomDataInternal" || n == "sceNpMatching2SetRoomMemberDataInternal" ||
+        n == "sceNpMatching2SignalingGetConnectionStatus" || n == "sceNpMatching2SignalingGetPingInfo") return 0x80550006;
+    if (n == "sceNpSignalingInitialize" || n == "sceNpSignalingTerminate" ||
+        n == "sceNpSignalingDeleteContext" || n == "sceNpSignalingDeactivateConnection") return 0;
+    if (n == "sceNpSignalingCreateContext" || n == "sceNpSignalingActivateConnection" ||
+        n == "sceNpSignalingGetConnectionStatus") return 0x80550006;
     if (n=="memset" || n=="memcpy" || n=="memmove" || n=="memcmp") {
         const auto len=a(2); if (len>logical_limit || len>std::numeric_limits<std::size_t>::max()) throw std::runtime_error("tamanho libc inválido");
         if (!len) return n=="memcmp" ? 0 : a(0);
@@ -1993,6 +3015,333 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
 
     // stdio: FILE* implementation with opaque handles and memory-safe transfers
+    auto fill_stat = [&](const std::string& host_path, SceKernelStat& sb) -> bool {
+        std::error_code ec;
+        auto status = std::filesystem::status(host_path, ec);
+        if (ec || !std::filesystem::exists(status)) return false;
+        sb = {};
+        sb.st_nlink = 1;
+        if (std::filesystem::is_directory(status)) {
+            sb.st_mode = 0040777; // S_IFDIR | 0777
+            sb.st_size = 65536;
+            sb.st_blksize = 65536;
+            sb.st_blocks = 128;
+        } else {
+            sb.st_mode = 0100777; // S_IFREG | 0777
+            sb.st_size = static_cast<std::int64_t>(std::filesystem::file_size(host_path, ec));
+            sb.st_blksize = 4096;
+            sb.st_blocks = (sb.st_size + 511) / 512;
+        }
+        auto ftime = std::filesystem::last_write_time(host_path, ec);
+        if (!ec) {
+            auto sctp = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+                ftime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+            auto secs = std::chrono::time_point_cast<std::chrono::seconds>(sctp);
+            auto nsecs = std::chrono::duration_cast<std::chrono::nanoseconds>(sctp - secs);
+            sb.st_mtime_sec = static_cast<std::int64_t>(secs.time_since_epoch().count());
+            sb.st_mtime_nsec = static_cast<std::int64_t>(nsecs.count());
+            sb.st_atime_sec = sb.st_mtime_sec;
+            sb.st_ctime_sec = sb.st_mtime_sec;
+            sb.st_birthtime_sec = sb.st_mtime_sec;
+        }
+        return true;
+    };
+
+    // Kernel & libc filesystem operations
+    if (n == "sceKernelStat" || n == "stat") {
+        if (!a(0) || !a(1)) return (n == "stat") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+        auto path = read_guest_string(a(0));
+        auto host_path = resolve_guest_path(path);
+        SceKernelStat sb{};
+        if (!fill_stat(host_path, sb)) {
+            return (n == "stat") ? static_cast<std::uint64_t>(-1) : 0x80020002; // ENOENT
+        }
+        if (mem_.store(a(1), &sb, sizeof(sb)) != MemoryError::ok) {
+            return (n == "stat") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+        }
+        return 0;
+    }
+
+    if (n == "sceKernelFstat" || n == "fstat") {
+        int fd = static_cast<int>(a(0));
+        if (!a(1)) return (n == "fstat") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+        auto it = kernel_files_.find(fd);
+        if (it == kernel_files_.end()) {
+            return (n == "fstat") ? static_cast<std::uint64_t>(-1) : 0x80020009; // EBADF
+        }
+        SceKernelStat sb{};
+        if (!fill_stat(it->second.path, sb)) {
+            sb.st_mode = 0100777;
+            sb.st_size = static_cast<std::int64_t>(it->second.size);
+            sb.st_blksize = 4096;
+            sb.st_blocks = (sb.st_size + 511) / 512;
+            sb.st_nlink = 1;
+        }
+        if (mem_.store(a(1), &sb, sizeof(sb)) != MemoryError::ok) {
+            return (n == "fstat") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+        }
+        return 0;
+    }
+
+    if (n == "sceKernelOpen" || n == "open") {
+        if (!a(0)) return (n == "open") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+        auto path = read_guest_string(a(0));
+        auto host_path = resolve_guest_path(path);
+        int flags = static_cast<int>(a(1));
+        std::printf("[FILE] %s: '%s' -> '%s' (flags=0x%x)\n", n.c_str(), path.c_str(), host_path.c_str(), flags);
+        
+        const char* fmode = "rb";
+        if (flags & 0x0200) { // O_CREAT
+            if (flags & 0x0400) fmode = (flags & 0x0002) ? "w+b" : "wb"; // O_TRUNC
+            else if (flags & 0x0008) fmode = (flags & 0x0002) ? "a+b" : "ab"; // O_APPEND
+            else fmode = (flags & 0x0002) ? "r+b" : "wb";
+        } else if (flags & 0x0008) { // O_APPEND
+            fmode = (flags & 0x0002) ? "a+b" : "ab";
+        } else if ((flags & 0x0003) == 0x0002) { // O_RDWR
+            fmode = "r+b";
+        } else if ((flags & 0x0003) == 0x0001) { // O_WRONLY
+            fmode = "wb";
+        } else {
+            fmode = "rb";
+        }
+
+        FILE* fp = portable_fopen(host_path, fmode);
+        if (!fp && (flags & 0x0200)) {
+            fp = portable_fopen(host_path, "w+b");
+        }
+        if (!fp) {
+            return (n == "open") ? static_cast<std::uint64_t>(-1) : 0x80020002; // ENOENT
+        }
+
+        std::uint64_t fsz = 0;
+        std::error_code ec;
+        if (std::filesystem::exists(host_path, ec) && !std::filesystem::is_directory(host_path, ec)) {
+            fsz = std::filesystem::file_size(host_path, ec);
+        }
+
+        int fd = next_kernel_fd_++;
+        kernel_files_[fd] = KernelFileEntry{fp, host_path, flags, fsz};
+        std::printf("[FILE] %s: '%s' -> fd=%d size=%llu\n", n.c_str(), path.c_str(), fd, (unsigned long long)fsz);
+        return static_cast<std::uint64_t>(fd);
+    }
+
+    if (n == "sceKernelClose" || n == "close") {
+        int fd = static_cast<int>(a(0));
+        auto it = kernel_files_.find(fd);
+        if (it == kernel_files_.end()) {
+            std::printf("[FILE] %s: fd=%d EBADF\n", n.c_str(), fd);
+            return (n == "close") ? static_cast<std::uint64_t>(-1) : 0x80020009; // EBADF
+        }
+        std::printf("[FILE] %s: fd=%d ('%s')\n", n.c_str(), fd, it->second.path.c_str());
+        if (it->second.fp) std::fclose(it->second.fp);
+        kernel_files_.erase(it);
+        return 0;
+    }
+
+    if (n == "sceKernelRead" || n == "read" || n == "_read") {
+        int fd = static_cast<int>(a(0));
+        std::uint64_t buf = a(1);
+        std::size_t nbyte = static_cast<std::size_t>(a(2));
+        auto it = kernel_files_.find(fd);
+        if (it != kernel_files_.end()) {
+            std::printf("[FILE] %s: fd=%d ('%s') nbyte=%zu\n", n.c_str(), fd, it->second.path.c_str(), nbyte);
+        }
+        if (!buf) return (n == "sceKernelRead") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+        if (it == kernel_files_.end() || !it->second.fp) {
+            return (n == "sceKernelRead") ? 0x80020009 : static_cast<std::uint64_t>(-1);
+        }
+        constexpr std::size_t max_chunk = 64ull * 1024 * 1024;
+        std::size_t to_read = std::min(nbyte, max_chunk);
+        std::vector<std::uint8_t> tmp(to_read);
+        std::size_t bytes_read = std::fread(tmp.data(), 1, to_read, it->second.fp);
+        if (bytes_read > 0) {
+            if (mem_.store(buf, tmp.data(), bytes_read) != MemoryError::ok) {
+                return (n == "sceKernelRead") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+            }
+        }
+        return static_cast<std::uint64_t>(bytes_read);
+    }
+
+    if (n == "sceKernelPread") {
+        int fd = static_cast<int>(a(0));
+        std::uint64_t buf = a(1);
+        std::size_t nbyte = static_cast<std::size_t>(a(2));
+        std::int64_t offset = static_cast<std::int64_t>(a(3));
+        auto it = kernel_files_.find(fd);
+        if (it != kernel_files_.end()) {
+            std::printf("[FILE] sceKernelPread: fd=%d ('%s') off=%lld nbyte=%zu\n",
+                        fd, it->second.path.c_str(), (long long)offset, nbyte);
+        }
+        if (!buf) return 0x80020016;
+        if (it == kernel_files_.end() || !it->second.fp) {
+            return 0x80020009;
+        }
+        auto fp = it->second.fp;
+#if defined(_WIN32)
+        std::int64_t cur = _ftelli64(fp);
+        if (_fseeki64(fp, offset, SEEK_SET) != 0) return 0x80020016;
+#else
+        off_t cur = ftello(fp);
+        if (fseeko(fp, offset, SEEK_SET) != 0) return 0x80020016;
+#endif
+        constexpr std::size_t max_chunk = 64ull * 1024 * 1024;
+        std::size_t to_read = std::min(nbyte, max_chunk);
+        std::vector<std::uint8_t> tmp(to_read);
+        std::size_t bytes_read = std::fread(tmp.data(), 1, to_read, fp);
+        if (bytes_read > 0) {
+            if (mem_.store(buf, tmp.data(), bytes_read) != MemoryError::ok) {
+#if defined(_WIN32)
+                _fseeki64(fp, cur, SEEK_SET);
+#else
+                fseeko(fp, cur, SEEK_SET);
+#endif
+                return 0x80020016;
+            }
+        }
+#if defined(_WIN32)
+        _fseeki64(fp, cur, SEEK_SET);
+#else
+        fseeko(fp, cur, SEEK_SET);
+#endif
+        return static_cast<std::uint64_t>(bytes_read);
+    }
+
+    if (n == "sceKernelWrite" || n == "write" || n == "_write") {
+        int fd = static_cast<int>(a(0));
+        std::uint64_t buf = a(1);
+        std::size_t nbyte = static_cast<std::size_t>(a(2));
+        if (!buf) return (n == "sceKernelWrite") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+        if (fd == 1 || fd == 2) {
+            std::vector<char> tmp(nbyte + 1, 0);
+            if (mem_.load(buf, tmp.data(), nbyte) == MemoryError::ok) {
+                std::fwrite(tmp.data(), 1, nbyte, (fd == 2) ? stderr : stdout);
+                std::fflush((fd == 2) ? stderr : stdout);
+            }
+            return nbyte;
+        }
+        auto it = kernel_files_.find(fd);
+        if (it == kernel_files_.end() || !it->second.fp) {
+            return (n == "sceKernelWrite") ? 0x80020009 : static_cast<std::uint64_t>(-1);
+        }
+        constexpr std::size_t max_chunk = 64ull * 1024 * 1024;
+        std::size_t to_write = std::min(nbyte, max_chunk);
+        std::vector<std::uint8_t> tmp(to_write);
+        if (mem_.load(buf, tmp.data(), to_write) != MemoryError::ok) {
+            return (n == "sceKernelWrite") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+        }
+        std::size_t bytes_written = std::fwrite(tmp.data(), 1, to_write, it->second.fp);
+        return static_cast<std::uint64_t>(bytes_written);
+    }
+
+    if (n == "sceKernelPwrite") {
+        int fd = static_cast<int>(a(0));
+        std::uint64_t buf = a(1);
+        std::size_t nbyte = static_cast<std::size_t>(a(2));
+        std::int64_t offset = static_cast<std::int64_t>(a(3));
+        if (!buf) return 0x80020016;
+        auto it = kernel_files_.find(fd);
+        if (it == kernel_files_.end() || !it->second.fp) {
+            return 0x80020009;
+        }
+        auto fp = it->second.fp;
+#if defined(_WIN32)
+        std::int64_t cur = _ftelli64(fp);
+        if (_fseeki64(fp, offset, SEEK_SET) != 0) return 0x80020016;
+#else
+        off_t cur = ftello(fp);
+        if (fseeko(fp, offset, SEEK_SET) != 0) return 0x80020016;
+#endif
+        constexpr std::size_t max_chunk = 64ull * 1024 * 1024;
+        std::size_t to_write = std::min(nbyte, max_chunk);
+        std::vector<std::uint8_t> tmp(to_write);
+        if (mem_.load(buf, tmp.data(), to_write) != MemoryError::ok) {
+#if defined(_WIN32)
+            _fseeki64(fp, cur, SEEK_SET);
+#else
+            fseeko(fp, cur, SEEK_SET);
+#endif
+            return 0x80020016;
+        }
+        std::size_t written = std::fwrite(tmp.data(), 1, to_write, fp);
+#if defined(_WIN32)
+        _fseeki64(fp, cur, SEEK_SET);
+#else
+        fseeko(fp, cur, SEEK_SET);
+#endif
+        return static_cast<std::uint64_t>(written);
+    }
+
+    if (n == "sceKernelLseek" || n == "lseek") {
+        int fd = static_cast<int>(a(0));
+        std::int64_t offset = static_cast<std::int64_t>(a(1));
+        int whence = static_cast<int>(a(2));
+        auto it = kernel_files_.find(fd);
+        if (it == kernel_files_.end() || !it->second.fp) {
+            return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020009;
+        }
+#if defined(_WIN32)
+        if (_fseeki64(it->second.fp, offset, whence) != 0) {
+            return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+        }
+        return static_cast<std::uint64_t>(_ftelli64(it->second.fp));
+#else
+        if (fseeko(it->second.fp, offset, whence) != 0) {
+            return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+        }
+        return static_cast<std::uint64_t>(ftello(it->second.fp));
+#endif
+    }
+
+    if (n == "sceKernelFtruncate" || n == "ftruncate") {
+        int fd = static_cast<int>(a(0));
+        std::int64_t length = static_cast<std::int64_t>(a(1));
+        auto it = kernel_files_.find(fd);
+        if (it == kernel_files_.end() || !it->second.fp) {
+            return (n == "ftruncate") ? static_cast<std::uint64_t>(-1) : 0x80020009;
+        }
+#if defined(_WIN32)
+        int win_fd = _fileno(it->second.fp);
+        if (win_fd >= 0) {
+            _chsize_s(win_fd, length);
+        }
+#else
+        int posix_fd = fileno(it->second.fp);
+        if (posix_fd >= 0) {
+            ftruncate(posix_fd, length);
+        }
+#endif
+        return 0;
+    }
+
+    if (n == "sceKernelCheckReachability") {
+        if (!a(0)) return 0x80020016;
+        auto path = read_guest_string(a(0));
+        auto host_path = resolve_guest_path(path);
+        std::error_code ec;
+        if (!std::filesystem::exists(host_path, ec)) {
+            return 0x80020002; // ENOENT
+        }
+        return 0;
+    }
+
+    if (n == "mkdir") {
+        if (!a(0)) return static_cast<std::uint64_t>(-1);
+        auto path = read_guest_string(a(0));
+        auto host_path = resolve_guest_path(path);
+        std::error_code ec;
+        std::filesystem::create_directories(host_path, ec);
+        return ec ? static_cast<std::uint64_t>(-1) : 0;
+    }
+
+    if (n == "rename") {
+        if (!a(0) || !a(1)) return static_cast<std::uint64_t>(-1);
+        auto old_p = resolve_guest_path(read_guest_string(a(0)));
+        auto new_p = resolve_guest_path(read_guest_string(a(1)));
+        std::error_code ec;
+        std::filesystem::rename(old_p, new_p, ec);
+        return ec ? static_cast<std::uint64_t>(-1) : 0;
+    }
+
     auto get_file = [&](std::uint64_t handle) -> FILE* {
         auto it = open_files_.find(handle);
         return it != open_files_.end() ? it->second : nullptr;
@@ -2001,7 +3350,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         std::string path = read_guest_string(a(0));
         std::string mode = read_guest_string(a(1));
         if (path.empty() || mode.empty() || path.find("..") != std::string::npos) return 0;
-        FILE* fp = std::fopen(path.c_str(), mode.c_str());
+        auto host_path = resolve_guest_path(path);
+        FILE* fp = portable_fopen(host_path, mode.c_str());
         if (!fp) return 0;
         std::uint64_t handle = next_handle_++;
         open_files_[handle] = fp;
@@ -2150,32 +3500,17 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         // Stub: do nothing
         return 0;
     }
-    if (n=="pthread_attr_init") {
-        std::uint64_t attr = a(0);
-        if (!attr) return 0x16; // EINVAL
-        put<std::uint32_t>(mem_, attr, 0); // default attr
+    if (n=="pthread_setname_np" || n=="scePthreadRename" || n=="scePthreadSetName") {
         return 0;
     }
-    if (n=="pthread_attr_destroy") {
-        std::uint64_t attr = a(0);
-        if (!attr) return 0x16;
-        put<std::uint32_t>(mem_, attr, 0xDEAD);
-        return 0;
-    }
-    if (n=="pthread_attr_setdetachstate") {
-        std::uint64_t attr = a(0);
-        int state = static_cast<int>(a(1));
-        if (!attr) return 0x16;
-        // Store detach state in attr (simplified)
-        put<std::uint32_t>(mem_, attr + 4, static_cast<std::uint32_t>(state));
-        return 0;
-    }
-    if (n=="pthread_attr_getdetachstate") {
-        std::uint64_t attr = a(0);
-        std::uint64_t state_ptr = a(1);
-        if (!attr || !state_ptr) return 0x16;
-        std::uint32_t state = get<std::uint32_t>(mem_, attr + 4);
-        put<std::uint32_t>(mem_, state_ptr, state);
+    if (n=="pthread_getname_np") {
+        if (a(1) && a(2) > 0) {
+            std::string name = "guest_thread";
+            std::size_t len = std::min<std::size_t>(name.size(), a(2) - 1);
+            mem_.store(a(1), name.c_str(), len);
+            char zero = 0;
+            mem_.store(a(1) + len, &zero, 1);
+        }
         return 0;
     }
 
@@ -2212,6 +3547,56 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n=="sigismember") {
         // Stub: return 0 (not a member)
+        return 0;
+    }
+    if (n=="sigprocmask" || n=="_sigprocmask") {
+        auto how = a(0);
+        auto set = a(1);
+        auto old = a(2);
+        static std::uint32_t current_mask[4] = {0, 0, 0, 0};
+        if (old) {
+            mem_.store(old, current_mask, sizeof(current_mask));
+        }
+        if (set) {
+            std::uint32_t new_mask[4] = {};
+            if (mem_.load(set, new_mask, sizeof(new_mask)) == MemoryError::ok) {
+                for (int i = 0; i < 4; ++i) {
+                    if (how == 1) current_mask[i] |= new_mask[i]; // SIG_BLOCK
+                    else if (how == 2) current_mask[i] &= ~new_mask[i]; // SIG_UNBLOCK
+                    else if (how == 3) current_mask[i] = new_mask[i]; // SIG_SETMASK
+                }
+            }
+        }
+        return 0;
+    }
+    if (n=="getrusage") {
+        (void)a(0); // who
+        auto out = a(1);
+        if (!out) return 0x16; // EINVAL
+        std::uint8_t usage[144] = {};
+        mem_.store(out, usage, sizeof(usage));
+        return 0;
+    }
+    if (n=="sysctl") {
+        auto name_ptr = a(0);
+        auto namelen = a(1);
+        auto old_ptr = a(2);
+        auto oldlen_ptr = a(3);
+        if (!name_ptr || namelen < 2) return 0x16; // EINVAL
+        std::int32_t name[2] = {};
+        if (mem_.load(name_ptr, name, sizeof(name)) == MemoryError::ok) {
+            if (name[0] == 1 && name[1] == 37) { // CTL_KERN, KERN_ARANDOM
+                if (old_ptr && oldlen_ptr) {
+                    std::uint64_t len = 0;
+                    if (mem_.load(oldlen_ptr, &len, sizeof(len)) == MemoryError::ok && len > 0) {
+                        std::vector<std::uint8_t> rand_data(len);
+                        for (std::size_t i = 0; i < len; ++i) rand_data[i] = static_cast<std::uint8_t>(std::rand() & 0xFF);
+                        mem_.store(old_ptr, rand_data.data(), len);
+                        return 0;
+                    }
+                }
+            }
+        }
         return 0;
     }
 
@@ -2278,6 +3663,50 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             put<std::int32_t>(mem_, buf + 32, tm->tm_isdst);
         }
         return buf;
+    }
+    if (n=="gmtime_s") {
+        uint64_t p0 = a(0), p1 = a(1);
+        if (!p0 || !p1) return invalid;
+        uint64_t timer_ptr = p0, result_ptr = p1;
+        std::time_t t0 = 0, t1 = 0;
+        mem_.load(p0, &t0, sizeof(t0));
+        mem_.load(p1, &t1, sizeof(t1));
+        if (t1 > 1000000000LL && t1 < 2500000000LL) {
+            timer_ptr = p1;
+            result_ptr = p0;
+        } else {
+            timer_ptr = p0;
+            result_ptr = p1;
+        }
+        std::time_t t = 0;
+        mem_.load(timer_ptr, &t, sizeof(t));
+        std::tm* tm = std::gmtime(&t);
+        if (tm) {
+            put<std::int32_t>(mem_, result_ptr + 0, tm->tm_sec);
+            put<std::int32_t>(mem_, result_ptr + 4, tm->tm_min);
+            put<std::int32_t>(mem_, result_ptr + 8, tm->tm_hour);
+            put<std::int32_t>(mem_, result_ptr + 12, tm->tm_mday);
+            put<std::int32_t>(mem_, result_ptr + 16, tm->tm_mon);
+            put<std::int32_t>(mem_, result_ptr + 20, tm->tm_year);
+            put<std::int32_t>(mem_, result_ptr + 24, tm->tm_wday);
+            put<std::int32_t>(mem_, result_ptr + 28, tm->tm_yday);
+            put<std::int32_t>(mem_, result_ptr + 32, tm->tm_isdst);
+        }
+        return 0;
+    }
+    if (n=="sceDiscMapUnknownIoKM" || n=="ioKMruft1ek" || n=="sceDiscMapIsRequestOnHDD") {
+        if (n == "sceDiscMapIsRequestOnHDD") {
+            std::uint64_t ret_ptr = a(3);
+            if (ret_ptr) put<std::int32_t>(mem_, ret_ptr, 1);
+        } else {
+            std::uint64_t flags_ptr = a(3);
+            std::uint64_t ret1_ptr = a(4);
+            std::uint64_t ret2_ptr = a(5);
+            if (flags_ptr) put<std::int32_t>(mem_, flags_ptr, 0);
+            if (ret1_ptr) put<std::int32_t>(mem_, ret1_ptr, 0);
+            if (ret2_ptr) put<std::int32_t>(mem_, ret2_ptr, 0);
+        }
+        return 0;
     }
     if (n=="asctime") {
         std::uint64_t tm_ptr = a(0);

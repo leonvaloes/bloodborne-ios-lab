@@ -31,6 +31,7 @@ struct HostBridgeConfig {
     bool require_essential_assets{false};
     double target_fps{60.0};            // FPS alvo para update()
     bool enable_hle{true};
+    bool use_scheduler{true};
 };
 
 // Diagnósticos agregados do HostBridge

@@ -119,6 +119,7 @@ void GameBootCoordinator::reset() {
     package_mgr_.clear();
     vfs_ = std::make_unique<VirtualFileSystem>();
 
+    scheduler_.reset();
     cpu_.reset();
     runtime_.reset();
     guest_memory_.reset();
@@ -421,6 +422,53 @@ bool GameBootCoordinator::phase4_initialize_runtime(const BootConfig& config) {
     // Configura o ponto de entrada principal do jogo
     Ps4Bootstrap::game_entry(*guest_memory_, cpu_->state, image_);
 
+    if (config_.use_scheduler) {
+        scheduler_ = std::make_unique<GuestScheduler>(*guest_memory_, 25000);
+        scheduler_->add_trap_range(0x7f000000, 32 * (image_.imports.size() + 1));
+        scheduler_->add_trap_range(0x7e000000, 4096 * (image_.imports.size() + 1));
+        scheduler_->add_trap_range(Ps4Bootstrap::exit_trap, 64);
+        runtime_->attach_scheduler(*scheduler_);
+        const std::uint64_t return_trap = Ps4Bootstrap::exit_trap + 32;
+
+        scheduler_->set_trap([this, return_trap](GuestScheduler& s, GuestScheduler::Id tid, CpuState& st) -> bool {
+            if (st.rip == return_trap) {
+                if (runtime_->has_pending_callback(tid)) {
+                    runtime_->complete_callback(st, tid);
+                    return true;
+                }
+                s.exit(tid, st.gpr[0]);
+                return true;
+            }
+            if (st.rip == Ps4Bootstrap::exit_trap) {
+                s.exit(tid, st.gpr[0]);
+                return true;
+            }
+            if (st.rip >= 0x7f000000 && st.rip < 0x7f000000 + 32 * image_.imports.size()) {
+                auto index = (st.rip - 0x7f000000) / 32;
+                const auto& imp = image_.imports[static_cast<std::size_t>(index)];
+                import_call_counts_[imp.name]++;
+                total_import_calls_++;
+                last_import_called_ = imp.name;
+
+                auto inv = runtime_->invoke_trap(imp.name, st, tid, return_trap);
+                if (inv.action == OrbisRuntime::InvocationResult::Action::returned) {
+                    std::uint64_t ret = 0;
+                    if (guest_memory_->load(st.gpr[4], &ret, 8) != MemoryError::ok) {
+                        return false;
+                    }
+                    st.gpr[4] += 8;
+                    st.rip = ret;
+                    st.gpr[0] = inv.value;
+                }
+                return true;
+            }
+            return false;
+        });
+
+        scheduler_->adopt(cpu_->state, Ps4Bootstrap::stack_base,
+                          Ps4Bootstrap::stack_base + Ps4Bootstrap::stack_size);
+    }
+
     state_ = BootState::modules_initialized;
     return true;
 }
@@ -431,6 +479,38 @@ std::uint64_t GameBootCoordinator::step(std::uint64_t max_steps) {
     }
     if (state_ != BootState::running || !cpu_ || !guest_memory_) {
         return 0;
+    }
+
+    if (scheduler_) {
+        std::uint64_t steps_executed = 0;
+        std::uint64_t chunk = 50000;
+        while (steps_executed < max_steps && state_ == BootState::running) {
+            std::uint64_t slice = std::min(chunk, max_steps - steps_executed);
+            auto sched_res = scheduler_->run(slice);
+            steps_executed += sched_res.steps;
+            total_steps_ += sched_res.steps;
+            if (sched_res.stop == GuestScheduler::Stop::budget) {
+                continue;
+            }
+            if (sched_res.stop == GuestScheduler::Stop::idle) {
+                state_ = BootState::halted;
+                last_stop_reason_ = "idle";
+                break;
+            }
+            if (sched_res.stop == GuestScheduler::Stop::deadlock) {
+                last_stop_reason_ = "idle_waiting";
+                break;
+            }
+            if (sched_res.stop == GuestScheduler::Stop::fault) {
+                state_ = BootState::error;
+                error_message_ = "Fault in thread " + std::to_string(sched_res.thread) + ": " + sched_res.cpu.describe();
+                break;
+            }
+        }
+        if (scheduler_->has_thread(1)) {
+            cpu_->state = scheduler_->cpu(1);
+        }
+        return steps_executed;
     }
 
     std::uint64_t steps_executed = 0;

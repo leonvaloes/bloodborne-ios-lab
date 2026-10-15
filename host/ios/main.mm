@@ -13,6 +13,7 @@
 #include "game_boot_coordinator.h"
 #include "vfs.h"
 #include "video_out.h"
+#include "touch_controls.h"
 #include <exception>
 #include <sys/utsname.h>
 #include <simd/simd.h>
@@ -30,6 +31,7 @@
 @interface LabController : UIViewController <MTKViewDelegate>
 - (void)setLeftStickX:(float)x y:(float)y;
 - (void)setRightStickX:(float)x y:(float)y;
+- (void)handleTouchId:(uint64_t)tid x:(float)x y:(float)y phase:(bb::TouchPhase)phase;
 @end
 
 @implementation LabMTKView
@@ -39,32 +41,16 @@
     CGSize size = self.bounds.size;
     if (size.width <= 0 || size.height <= 0) return;
 
-    if (loc.x < size.width * 0.5f) {
-        if ([phase isEqualToString:@"ended"] || [phase isEqualToString:@"cancelled"]) {
-            [self.controller setLeftStickX:0.0f y:0.0f];
-        } else {
-            float cx = (float)(size.width * 0.25);
-            float cy = (float)(size.height * 0.5);
-            float maxR = std::min<float>(cx, cy) * 0.8f;
-            if (maxR < 10.0f) maxR = 50.0f;
-            float nx = std::clamp<float>((float)(loc.x - cx) / maxR, -1.0f, 1.0f);
-            float ny = std::clamp<float>((float)(cy - loc.y) / maxR, -1.0f, 1.0f);
-            [self.controller setLeftStickX:nx y:ny];
-        }
-    } else {
-        if ([phase isEqualToString:@"ended"] || [phase isEqualToString:@"cancelled"]) {
-            [self.controller setRightStickX:0.0f y:0.0f];
-        } else {
-            float cx = (float)(size.width * 0.75);
-            float cy = (float)(size.height * 0.5);
-            float halfW = (float)(size.width * 0.25);
-            float maxR = std::min<float>(halfW, cy) * 0.8f;
-            if (maxR < 10.0f) maxR = 50.0f;
-            float nx = std::clamp<float>((float)(loc.x - cx) / maxR, -1.0f, 1.0f);
-            float ny = std::clamp<float>((float)(cy - loc.y) / maxR, -1.0f, 1.0f);
-            [self.controller setRightStickX:nx y:ny];
-        }
-    }
+    float nx = (float)(loc.x / size.width);
+    float ny = (float)(loc.y / size.height);
+    uint64_t tid = (uint64_t)(uintptr_t)touch;
+
+    bb::TouchPhase tp = bb::TouchPhase::Began;
+    if ([phase isEqualToString:@"moved"]) tp = bb::TouchPhase::Moved;
+    else if ([phase isEqualToString:@"ended"]) tp = bb::TouchPhase::Ended;
+    else if ([phase isEqualToString:@"cancelled"]) tp = bb::TouchPhase::Cancelled;
+
+    [self.controller handleTouchId:tid x:nx y:ny phase:tp];
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     for (UITouch *t in touches) [self handleTouch:t phase:@"began"];
@@ -109,6 +95,7 @@
     uint32_t _indexCount;
     id<MTLBuffer> _lightingBuffer;
     id<MTLTexture> _diffuseTexture;
+    id<MTLTexture> _guestScreenTexture;
     id<MTLSamplerState> _samplerState;
     NSMutableDictionary *_report;
     NSUInteger _completedFrames;
@@ -117,6 +104,7 @@
     bb::FramePacingTracker _pacingTracker;
     bb::MemoryMonitor _memoryMonitor;
     bb::InputManager _inputManager;
+    bb::TouchControlsOverlay _touchOverlay;
     uint32_t _modelVertexCount;
     uint32_t _modelTriangleCount;
 }
@@ -135,6 +123,7 @@
         @"gamepad_connected": @NO} mutableCopy];
 
     _lastFrameTime = std::chrono::steady_clock::now();
+    _touchOverlay.bind_input_manager(&_inputManager);
 
     UILabel *title = [UILabel new];
     title.text = @"BB Lab — Host iOS 26.6";
@@ -611,6 +600,10 @@
     }
 }
 
+- (void)handleTouchId:(uint64_t)tid x:(float)x y:(float)y phase:(bb::TouchPhase)phase {
+    _touchOverlay.on_touch(tid, x, y, phase);
+}
+
 - (void)toggleContinuousExecution {
     _continuousExecution = !_continuousExecution;
     if (_continuousExecution) {
@@ -828,6 +821,7 @@
     config.guest_memory_size = 768u << 20;
     config.require_essential_assets = false;
     config.enable_hle = true;
+    config.use_scheduler = true;
 
     _bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
     _bootCoordinator->attach_input_manager(&_inputManager);
@@ -938,6 +932,21 @@
             _report[@"guest_frame_seq"] = @(guestFrame.flip_sequence);
             _report[@"guest_frame_w"] = @(guestFrame.width);
             _report[@"guest_frame_h"] = @(guestFrame.height);
+
+            if (!_guestScreenTexture || _guestScreenTexture.width != guestFrame.width || _guestScreenTexture.height != guestFrame.height) {
+                MTLTextureDescriptor *screenDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                                     width:guestFrame.width
+                                                                                                    height:guestFrame.height
+                                                                                                 mipmapped:NO];
+                screenDesc.usage = MTLTextureUsageShaderRead;
+                _guestScreenTexture = [view.device newTextureWithDescriptor:screenDesc];
+            }
+            if (_guestScreenTexture && !guestFrame.pixel_data.empty()) {
+                [_guestScreenTexture replaceRegion:MTLRegionMake2D(0, 0, guestFrame.width, guestFrame.height)
+                                       mipmapLevel:0
+                                         withBytes:guestFrame.pixel_data.data()
+                                       bytesPerRow:guestFrame.pitch > 0 ? guestFrame.pitch : guestFrame.width * 4];
+            }
         }
     }
 
@@ -976,7 +985,9 @@
     [encoder setVertexBytes:&mvpUniforms length:sizeof(mvpUniforms) atIndex:1];
 
     [encoder setFragmentBuffer:_lightingBuffer offset:0 atIndex:1];
-    if (_diffuseTexture) {
+    if (_guestScreenTexture) {
+        [encoder setFragmentTexture:_guestScreenTexture atIndex:0];
+    } else if (_diffuseTexture) {
         [encoder setFragmentTexture:_diffuseTexture atIndex:0];
     }
     if (_samplerState) {

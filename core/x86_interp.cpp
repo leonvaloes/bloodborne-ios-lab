@@ -28,6 +28,22 @@ inline bool parity_even(std::uint64_t v) {
     b ^= b >> 4; b ^= b >> 2; b ^= b >> 1;
     return (b & 1) == 0;
 }
+
+template <typename T>
+inline T round_fp(T val, unsigned imm8, std::uint32_t mxcsr = 0) {
+    if (std::isnan(val)) return val;
+    int rc = imm8 & 3;
+    if (imm8 & 8) {
+        rc = (mxcsr >> 13) & 3;
+    }
+    switch (rc) {
+        case 0: return std::nearbyint(val);
+        case 1: return std::floor(val);
+        case 2: return std::ceil(val);
+        case 3: return std::trunc(val);
+        default: return std::nearbyint(val);
+    }
+}
 void mul64(std::uint64_t a, std::uint64_t b, std::uint64_t& hi, std::uint64_t& lo) {
     const std::uint64_t a0 = a & 0xFFFFFFFFULL, a1 = a >> 32, b0 = b & 0xFFFFFFFFULL, b1 = b >> 32;
     const std::uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
@@ -79,8 +95,9 @@ struct Exec {
     bool p66 = false, rep = false, repne = false, rex = false, rw = false, rr = false, rx = false,
          rb = false, fs = false, gs = false, addr32 = false;
     bool branched = false;
+    std::uint64_t& tsc;
 
-    Exec(CpuState& st, GuestMemory& mem) : s(st), m(mem) {}
+    Exec(CpuState& st, GuestMemory& mem, std::uint64_t& tsc_ref) : s(st), m(mem), tsc(tsc_ref) {}
 
     // ---- fetch ----
     std::uint8_t u8() { if (pos >= 15) throw UdEx{}; if (pos >= n) throw Fault{start + pos}; return buf[pos++]; }
@@ -274,6 +291,32 @@ struct Exec {
     static double f64(std::uint64_t v) { double d; std::memcpy(&d, &v, 8); return d; }
     static std::uint64_t bits32(float f) { std::uint32_t u; std::memcpy(&u, &f, 4); return u; }
     static std::uint64_t bits64(double d) { std::uint64_t u; std::memcpy(&u, &d, 8); return u; }
+    template <typename T>
+    static inline bool eval_cmp_pred(T a, T b, unsigned imm) {
+        const bool nan_a = std::isnan(a);
+        const bool nan_b = std::isnan(b);
+        const bool unord = nan_a || nan_b;
+        const unsigned pred = imm & 0x1F;
+        switch (pred & 0x0F) {
+        case 0: return !unord && (a == b);
+        case 1: return !unord && (a < b);
+        case 2: return !unord && (a <= b);
+        case 3: return unord;
+        case 4: return unord || (a != b);
+        case 5: return unord || !(a < b);
+        case 6: return unord || !(a <= b);
+        case 7: return !unord;
+        case 8: return unord || (a == b);
+        case 9: return unord || !(a >= b);
+        case 10: return unord || !(a > b);
+        case 11: return false;
+        case 12: return !unord && (a != b);
+        case 13: return !unord && (a >= b);
+        case 14: return !unord && (a > b);
+        case 15: return true;
+        default: return false;
+        }
+    }
     void rd_xmm_rm(const Rm& r, std::uint64_t out[2]) const {
         if (r.reg) { out[0] = s.xmm[r.r][0]; out[1] = s.xmm[r.r][1]; return; }
         out[0] = rd_mem(r.addr, 8);
@@ -301,11 +344,635 @@ void Exec::avx(bool three) {
     const int len = (v2 & 4) ? 4 : 2;
     const int src1 = (~(v2 >> 3)) & 15;
     const bool w = three && ((v2 & 0x80) != 0);
-    if (map != 1 || p66 || rep || repne || rex) throw Unsupported{};
+    if ((map != 1 && map != 2 && map != 3) || p66 || rep || repne || rex) throw Unsupported{};
     rr = !(v1 & 0x80); rx = three && !(v1 & 0x40); rb = three && !(v1 & 0x20);
+    if (map == 3) {
+        // 0F 3A map
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 1);
+        const unsigned imm = u8();
+        std::uint64_t s1[4] = {}, s2[4] = {}, dst[4] = {};
+        for (int i = 0; i < len; ++i) s1[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+        const int s2_bytes = (op == 0x18) ? 16 : (op == 0x21 || op == 0x0A) ? 4 : (op == 0x0B) ? 8 : (len * 8);
+        if (rm.reg) {
+            for (int i = 0; i < len; ++i) s2[i] = i < 2 ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2];
+        } else {
+            for (int i = 0; i < (s2_bytes + 7) / 8; ++i) s2[i] = rd_mem(rm.addr + i * 8, (s2_bytes < 8) ? s2_bytes : 8);
+        }
+        if (op == 0x0A) { // VROUNDSS xmm1, xmm2, xmm3/m32, imm8
+            if (pp != 1 || len != 2) throw Unsupported{};
+            float f = 0.0f;
+            std::memcpy(&f, s2, 4);
+            float r = round_fp(f, imm);
+            std::uint32_t r_bits = 0;
+            std::memcpy(&r_bits, &r, 4);
+            dst[0] = (s1[0] & 0xFFFFFFFF00000000ULL) | r_bits;
+            dst[1] = s1[1];
+        } else if (op == 0x0B) { // VROUNDSD xmm1, xmm2, xmm3/m64, imm8
+            if (pp != 1 || len != 2) throw Unsupported{};
+            double d = 0.0;
+            std::memcpy(&d, s2, 8);
+            double r = round_fp(d, imm);
+            std::uint64_t r_bits = 0;
+            std::memcpy(&r_bits, &r, 8);
+            dst[0] = r_bits;
+            dst[1] = s1[1];
+        } else if (op == 0x08) { // VROUNDPS xmm1/ymm1, xmm2/ymm2/m, imm8
+            if (pp != 1) throw Unsupported{};
+            const int total_floats = len * 2;
+            float src_f[8], dst_f[8];
+            std::memcpy(src_f, s2, len * 8);
+            for (int i = 0; i < total_floats; ++i) {
+                dst_f[i] = round_fp(src_f[i], imm);
+            }
+            std::memcpy(dst, dst_f, len * 8);
+        } else if (op == 0x09) { // VROUNDPD xmm1/ymm1, xmm2/ymm2/m, imm8
+            if (pp != 1) throw Unsupported{};
+            const int total_doubles = len;
+            double src_d[4], dst_d[4];
+            std::memcpy(src_d, s2, len * 8);
+            for (int i = 0; i < total_doubles; ++i) {
+                dst_d[i] = round_fp(src_d[i], imm);
+            }
+            std::memcpy(dst, dst_d, len * 8);
+        } else if (op == 0x40) { // VDPPS xmm1/ymm1, xmm2/ymm2, xmm3/ymm3/m, imm8
+            if (pp != 1) throw Unsupported{};
+            const int lanes = len / 2; // 1 for 128-bit, 2 for 256-bit
+            float src1_f[8], src2_f[8], dst_f[8] = {};
+            std::memcpy(src1_f, s1, len * 8);
+            std::memcpy(src2_f, s2, len * 8);
+            for (int l = 0; l < lanes; ++l) {
+                const int base = l * 4;
+                float sum = 0.0f;
+                if (imm & 0x10) sum += src1_f[base + 0] * src2_f[base + 0];
+                if (imm & 0x20) sum += src1_f[base + 1] * src2_f[base + 1];
+                if (imm & 0x40) sum += src1_f[base + 2] * src2_f[base + 2];
+                if (imm & 0x80) sum += src1_f[base + 3] * src2_f[base + 3];
+
+                dst_f[base + 0] = (imm & 0x01) ? sum : 0.0f;
+                dst_f[base + 1] = (imm & 0x02) ? sum : 0.0f;
+                dst_f[base + 2] = (imm & 0x04) ? sum : 0.0f;
+                dst_f[base + 3] = (imm & 0x08) ? sum : 0.0f;
+            }
+            std::memcpy(dst, dst_f, len * 8);
+        } else if (op == 0x41) { // VDPPD xmm1, xmm2, xmm3/m128, imm8
+            if (pp != 1 || len != 2) throw Unsupported{};
+            double src1_d[2], src2_d[2], dst_d[2] = {};
+            std::memcpy(src1_d, s1, 16);
+            std::memcpy(src2_d, s2, 16);
+            double sum = 0.0;
+            if (imm & 0x10) sum += src1_d[0] * src2_d[0];
+            if (imm & 0x20) sum += src1_d[1] * src2_d[1];
+            dst_d[0] = (imm & 0x01) ? sum : 0.0;
+            dst_d[1] = (imm & 0x02) ? sum : 0.0;
+            std::memcpy(dst, dst_d, 16);
+        } else if (op == 0x4A || op == 0x4B || op == 0x4C) { // VBLENDVPS / VBLENDVPD / VPBLENDVB
+            if (pp != 1) throw Unsupported{};
+            const int mask_reg = (imm >> 4) & 15;
+            std::uint64_t mask[4] = {};
+            for (int i = 0; i < len; ++i) mask[i] = i < 2 ? s.xmm[mask_reg][i] : s.ymm_hi[mask_reg][i - 2];
+            const int elem_width = (op == 0x4B) ? 8 : (op == 0x4A) ? 4 : 1;
+            const int total_bytes = len * 8;
+            std::uint8_t a[32], b[32], m[32], out[32];
+            std::memcpy(a, s1, total_bytes);
+            std::memcpy(b, s2, total_bytes);
+            std::memcpy(m, mask, total_bytes);
+            for (int i = 0; i < total_bytes; i += elem_width) {
+                const bool select_b = (m[i + elem_width - 1] & 0x80) != 0;
+                std::memcpy(out + i, select_b ? (b + i) : (a + i), elem_width);
+            }
+            std::memcpy(dst, out, total_bytes);
+        } else if (op == 0x0C || op == 0x0D || op == 0x0E) { // VBLENDPS / VBLENDPD / VPBLENDW
+            if (pp != 1) throw Unsupported{};
+            const int elem_width = (op == 0x0D) ? 8 : (op == 0x0C) ? 4 : 2;
+            const int total_bytes = len * 8;
+            std::uint8_t a[32], b[32], out[32];
+            std::memcpy(a, s1, total_bytes);
+            std::memcpy(b, s2, total_bytes);
+            const int num_elems = total_bytes / elem_width;
+            for (int i = 0; i < num_elems; ++i) {
+                const bool select_b = ((imm >> i) & 1) != 0;
+                std::memcpy(out + i * elem_width, select_b ? (b + i * elem_width) : (a + i * elem_width), elem_width);
+            }
+            std::memcpy(dst, out, total_bytes);
+        } else if (op == 0x0F) { // VPALIGNR
+            if (pp != 1) throw Unsupported{};
+            std::uint8_t a[32], b[32], out[32];
+            std::memcpy(a, s1, len * 8);
+            std::memcpy(b, s2, len * 8);
+            for (int lane = 0; lane < len / 2; ++lane) {
+                const std::uint8_t* lane_a = a + lane * 16;
+                const std::uint8_t* lane_b = b + lane * 16;
+                std::uint8_t* lane_out = out + lane * 16;
+                for (unsigned i = 0; i < 16; ++i) {
+                    const unsigned j = imm + i;
+                    lane_out[i] = j < 16 ? lane_b[j] : j < 32 ? lane_a[j - 16] : 0;
+                }
+            }
+            std::memcpy(dst, out, len * 8);
+        } else if (op == 0x18) { // VINSERTF128 ymm, ymm, xmm/m128, imm8
+            if (pp != 1 || len != 4) throw Unsupported{};
+            if ((imm & 1) == 0) {
+                dst[0] = s2[0]; dst[1] = s2[1];
+                dst[2] = s1[2]; dst[3] = s1[3];
+            } else {
+                dst[0] = s1[0]; dst[1] = s1[1];
+                dst[2] = s2[0]; dst[3] = s2[1];
+            }
+        } else if (op == 0x19) { // VEXTRACTF128 xmm/m128, ymm, imm8
+            if (pp != 1 || len != 4) throw Unsupported{};
+            const int half = (imm & 1) ? 2 : 0;
+            if (rm.reg) {
+                s.xmm[rm.r][0] = s1[half + 0];
+                s.xmm[rm.r][1] = s1[half + 1];
+                s.ymm_hi[rm.r][0] = 0;
+                s.ymm_hi[rm.r][1] = 0;
+            } else {
+                wr_mem(rm.addr + 0, 8, s1[half + 0]);
+                wr_mem(rm.addr + 8, 8, s1[half + 1]);
+            }
+            return;
+        } else if (op == 0x21) { // VINSERTPS xmm1, xmm2, xmm3/m32, imm8
+            if (pp != 1 || len != 2) throw Unsupported{};
+            const int src_idx = (imm >> 6) & 3;
+            const int dst_idx = (imm >> 4) & 3;
+            const unsigned zmask = imm & 15;
+            std::uint32_t val = 0;
+            if (rm.reg) {
+                std::uint32_t words[4];
+                std::memcpy(words, s2, 16);
+                val = words[src_idx];
+            } else {
+                val = static_cast<std::uint32_t>(rd_mem(rm.addr, 4));
+            }
+            std::uint32_t words[4];
+            std::memcpy(words, s1, 16);
+            words[dst_idx] = val;
+            for (int i = 0; i < 4; ++i) {
+                if ((zmask >> i) & 1) words[i] = 0;
+            }
+            std::memcpy(dst, words, 16);
+        } else if (op == 0x14 || op == 0x15 || op == 0x16 || op == 0x17) { // VPEXTRB / VPEXTRW / VPEXTRD / VPEXTRQ / VEXTRACTPS
+            if (pp != 1 || len != 2) throw Unsupported{};
+            if (op == 0x16 || op == 0x17) {
+                if (w && op == 0x16) { // VPEXTRQ
+                    const unsigned idx = imm & 1;
+                    const std::uint64_t val = s.xmm[rg][idx];
+                    if (rm.reg) wr_reg(rm.r, 8, val);
+                    else wr_mem(rm.addr, 8, val);
+                } else { // VPEXTRD / VEXTRACTPS
+                    const unsigned idx = imm & 3;
+                    const std::uint32_t val = static_cast<std::uint32_t>((s.xmm[rg][idx / 2] >> ((idx % 2) * 32)) & 0xFFFFFFFFULL);
+                    if (rm.reg) wr_reg(rm.r, 4, val);
+                    else wr_mem(rm.addr, 4, val);
+                }
+            } else if (op == 0x15) { // VPEXTRW
+                const unsigned idx = imm & 7;
+                const std::uint16_t val = static_cast<std::uint16_t>((s.xmm[rg][idx / 4] >> ((idx % 4) * 16)) & 0xFFFF);
+                if (rm.reg) wr_reg(rm.r, 4, val);
+                else wr_mem(rm.addr, 2, val);
+            } else { // VPEXTRB (op == 0x14)
+                const unsigned idx = imm & 15;
+                const std::uint8_t val = static_cast<std::uint8_t>((s.xmm[rg][idx / 8] >> ((idx % 8) * 8)) & 0xFF);
+                if (rm.reg) wr_reg(rm.r, 4, val);
+                else wr_mem(rm.addr, 1, val);
+            }
+            return;
+        } else if (op == 0x20 || op == 0x22) { // VPINSRB / VPINSRD / VPINSRQ
+            if (pp != 1 || len != 2) throw Unsupported{};
+            std::uint64_t val = 0;
+            if (op == 0x22) {
+                const int sz = w ? 8 : 4;
+                val = rm.reg ? rd_reg(rm.r, sz) : rd_mem(rm.addr, sz);
+                for (int i = 0; i < 2; ++i) dst[i] = s1[i];
+                if (w) {
+                    const unsigned idx = imm & 1;
+                    dst[idx] = val;
+                } else {
+                    const unsigned idx = imm & 3;
+                    const int word = idx / 2, shift = (idx % 2) * 32;
+                    dst[word] = (dst[word] & ~(0xFFFFFFFFULL << shift)) | ((val & 0xFFFFFFFFULL) << shift);
+                }
+            } else { // VPINSRB (op == 0x20)
+                val = rm.reg ? (rd_reg(rm.r, 4) & 0xFF) : rd_mem(rm.addr, 1);
+                for (int i = 0; i < 2; ++i) dst[i] = s1[i];
+                const unsigned idx = imm & 15;
+                const int word = idx / 8, shift = (idx % 8) * 8;
+                dst[word] = (dst[word] & ~(0xFFULL << shift)) | ((val & 0xFFULL) << shift);
+            }
+        } else {
+            throw Unsupported{};
+        }
+        for (int i = 0; i < 2; ++i) s.xmm[rg][i] = dst[i];
+        for (int i = 0; i < 2; ++i) s.ymm_hi[rg][i] = (len == 4) ? dst[i + 2] : 0;
+        return;
+    }
+    if (map == 2) {
+        // 0F 38 map
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        std::uint64_t s1[4] = {}, s2[4] = {}, dst[4] = {};
+        for (int i = 0; i < len; ++i) s1[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+        const int s2_bytes = (op == 0x18 || op == 0x58) ? 4 : (op == 0x19 || op == 0x59) ? 8 : (op == 0x1A) ? 16 : (len * 8);
+        if (rm.reg) {
+            for (int i = 0; i < len; ++i) s2[i] = i < 2 ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2];
+        } else {
+            for (int i = 0; i < (s2_bytes + 7) / 8; ++i) {
+                const int chunk = (s2_bytes - i * 8 < 8) ? (s2_bytes - i * 8) : 8;
+                s2[i] = rd_mem(rm.addr + i * 8, chunk);
+            }
+        }
+        if (op == 0x18 || op == 0x19 || op == 0x1A) { // VBROADCASTSS / VBROADCASTSD / VBROADCASTF128
+            if (pp != 1 || src1 != 0) throw Unsupported{};
+            if (op == 0x18) { // VBROADCASTSS xmm/ymm, m32
+                std::uint64_t val = 0;
+                if (rm.reg) val = s.xmm[rm.r][0] & 0xFFFFFFFFULL;
+                else val = s2[0] & 0xFFFFFFFFULL;
+                const std::uint64_t dword = val | (val << 32);
+                for (int i = 0; i < len; ++i) dst[i] = dword;
+            } else if (op == 0x19) { // VBROADCASTSD ymm, m64
+                if (len != 4) throw Unsupported{};
+                std::uint64_t val = rm.reg ? s.xmm[rm.r][0] : s2[0];
+                for (int i = 0; i < len; ++i) dst[i] = val;
+            } else if (op == 0x1A) { // VBROADCASTF128 ymm, m128
+                if (len != 4) throw Unsupported{};
+                std::uint64_t val0 = rm.reg ? s.xmm[rm.r][0] : s2[0];
+                std::uint64_t val1 = rm.reg ? s.xmm[rm.r][1] : s2[1];
+                dst[0] = val0; dst[1] = val1;
+                dst[2] = val0; dst[3] = val1;
+            }
+        } else if (op == 0x00) { // VPSHUFB
+            if (pp != 1) throw Unsupported{};
+            std::uint8_t a[32], b[32], out[32];
+            std::memcpy(a, s1, len * 8);
+            std::memcpy(b, s2, len * 8);
+            for (int lane = 0; lane < len / 2; ++lane) {
+                for (int i = 0; i < 16; ++i) {
+                    const std::uint8_t ctrl = b[lane * 16 + i];
+                    out[lane * 16 + i] = (ctrl & 0x80) ? 0 : a[lane * 16 + (ctrl & 15)];
+                }
+            }
+            std::memcpy(dst, out, len * 8);
+        } else if (op == 0x01 || op == 0x02 || op == 0x03) { // VPHADDW / VPHADDD / VPHADDSW
+            if (pp != 1) throw Unsupported{};
+            for (int lane = 0; lane < len / 2; ++lane) {
+                if (op == 0x02) { // VPHADDD
+                    std::uint32_t a[4], b[4], out[4];
+                    std::memcpy(a, &s1[lane * 2], 16);
+                    std::memcpy(b, &s2[lane * 2], 16);
+                    out[0] = a[0] + a[1];
+                    out[1] = a[2] + a[3];
+                    out[2] = b[0] + b[1];
+                    out[3] = b[2] + b[3];
+                    std::memcpy(&dst[lane * 2], out, 16);
+                } else if (op == 0x01) { // VPHADDW
+                    std::uint16_t a[8], b[8], out[8];
+                    std::memcpy(a, &s1[lane * 2], 16);
+                    std::memcpy(b, &s2[lane * 2], 16);
+                    for (int i = 0; i < 4; ++i) out[i] = a[i * 2] + a[i * 2 + 1];
+                    for (int i = 0; i < 4; ++i) out[4 + i] = b[i * 2] + b[i * 2 + 1];
+                    std::memcpy(&dst[lane * 2], out, 16);
+                } else { // VPHADDSW
+                    std::int16_t a[8], b[8], out[8];
+                    std::memcpy(a, &s1[lane * 2], 16);
+                    std::memcpy(b, &s2[lane * 2], 16);
+                    auto sat16 = [](std::int32_t v) -> std::int16_t {
+                        return static_cast<std::int16_t>(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
+                    };
+                    for (int i = 0; i < 4; ++i) out[i] = sat16(static_cast<std::int32_t>(a[i * 2]) + a[i * 2 + 1]);
+                    for (int i = 0; i < 4; ++i) out[4 + i] = sat16(static_cast<std::int32_t>(b[i * 2]) + b[i * 2 + 1]);
+                    std::memcpy(&dst[lane * 2], out, 16);
+                }
+            }
+        } else if (op == 0x40) { // VPMULLD
+            if (pp != 1) throw Unsupported{};
+            for (int i = 0; i < len * 2; ++i) {
+                const std::uint32_t a = static_cast<std::uint32_t>(s1[i / 2] >> ((i % 2) * 32));
+                const std::uint32_t b = static_cast<std::uint32_t>(s2[i / 2] >> ((i % 2) * 32));
+                const std::uint32_t c = a * b;
+                const int word = i / 2, shift = (i % 2) * 32;
+                dst[word] = (dst[word] & ~(0xFFFFFFFFULL << shift)) | (static_cast<std::uint64_t>(c) << shift);
+            }
+        } else if (op == 0x58 || op == 0x59) { // VPBROADCASTD / VPBROADCASTQ
+            if (pp != 1 || src1 != 0) throw Unsupported{};
+            const int width = (op == 0x59) ? 8 : 4;
+            std::uint64_t val = 0;
+            if (rm.reg) {
+                val = s.xmm[rm.r][0] & mask_of(width);
+            } else {
+                val = rd_mem(rm.addr, width);
+            }
+            if (width == 8) {
+                for (int i = 0; i < len; ++i) dst[i] = val;
+            } else {
+                const std::uint64_t dword = val | (val << 32);
+                for (int i = 0; i < len; ++i) dst[i] = dword;
+            }
+        } else if (op >= 0x38 && op <= 0x3F) {
+            // VPMINSB(0x38), VPMINSD(0x39), VPMINUW(0x3A), VPMINUD(0x3B),
+            // VPMAXSB(0x3C), VPMAXSD(0x3D), VPMAXUW(0x3E), VPMAXUD(0x3F)
+            if (pp != 1) throw Unsupported{};
+            const bool is_max = (op >= 0x3C);
+            const int elem_width = (op == 0x38 || op == 0x3C) ? 1
+                                 : (op == 0x3A || op == 0x3E) ? 2 : 4;
+            const bool is_signed = (op == 0x38 || op == 0x39 || op == 0x3C || op == 0x3D);
+            std::uint8_t a[32], b[32], out[32];
+            std::memcpy(a, s1, len * 8);
+            std::memcpy(b, s2, len * 8);
+            for (int i = 0; i < len * 8; i += elem_width) {
+                if (elem_width == 1) {
+                    if (is_signed) {
+                        std::int8_t x = static_cast<std::int8_t>(a[i]), y = static_cast<std::int8_t>(b[i]);
+                        out[i] = static_cast<std::uint8_t>(is_max ? std::max(x, y) : std::min(x, y));
+                    } else {
+                        std::uint8_t x = a[i], y = b[i];
+                        out[i] = is_max ? std::max(x, y) : std::min(x, y);
+                    }
+                } else if (elem_width == 2) {
+                    std::uint16_t x16, y16;
+                    std::memcpy(&x16, a + i, 2);
+                    std::memcpy(&y16, b + i, 2);
+                    if (is_signed) {
+                        std::int16_t x = static_cast<std::int16_t>(x16), y = static_cast<std::int16_t>(y16);
+                        std::int16_t z = is_max ? std::max(x, y) : std::min(x, y);
+                        std::memcpy(out + i, &z, 2);
+                    } else {
+                        std::uint16_t z = is_max ? std::max(x16, y16) : std::min(x16, y16);
+                        std::memcpy(out + i, &z, 2);
+                    }
+                } else { // elem_width == 4
+                    std::uint32_t x32, y32;
+                    std::memcpy(&x32, a + i, 4);
+                    std::memcpy(&y32, b + i, 4);
+                    if (is_signed) {
+                        std::int32_t x = static_cast<std::int32_t>(x32), y = static_cast<std::int32_t>(y32);
+                        std::int32_t z = is_max ? std::max(x, y) : std::min(x, y);
+                        std::memcpy(out + i, &z, 4);
+                    } else {
+                        std::uint32_t z = is_max ? std::max(x32, y32) : std::min(x32, y32);
+                        std::memcpy(out + i, &z, 4);
+                    }
+                }
+            }
+            std::memcpy(dst, out, len * 8);
+        } else if (op >= 0x1C && op <= 0x1E) { // VPABSB / VPABSW / VPABSD
+            if (pp != 1 || src1 != 0) throw Unsupported{};
+            const int elem_width = (op == 0x1C) ? 1 : (op == 0x1D) ? 2 : 4;
+            std::uint8_t b[32], out[32];
+            std::memcpy(b, s2, len * 8);
+            for (int i = 0; i < len * 8; i += elem_width) {
+                if (elem_width == 1) {
+                    std::int8_t v = static_cast<std::int8_t>(b[i]);
+                    out[i] = static_cast<std::uint8_t>(v < 0 ? -v : v);
+                } else if (elem_width == 2) {
+                    std::int16_t v; std::memcpy(&v, b + i, 2);
+                    v = static_cast<std::int16_t>(v < 0 ? -v : v);
+                    std::memcpy(out + i, &v, 2);
+                } else {
+                    std::int32_t v; std::memcpy(&v, b + i, 4);
+                    v = v < 0 ? -v : v;
+                    std::memcpy(out + i, &v, 4);
+                }
+            }
+            std::memcpy(dst, out, len * 8);
+        } else if (op == 0x29 || op == 0x37) { // VPCMPEQQ (0x29) / VPCMPGTQ (0x37)
+            if (pp != 1) throw Unsupported{};
+            for (int i = 0; i < len; ++i) {
+                if (op == 0x29) {
+                    dst[i] = (s1[i] == s2[i]) ? ~0ULL : 0ULL;
+                } else {
+                    const std::int64_t a = static_cast<std::int64_t>(s1[i]);
+                    const std::int64_t b = static_cast<std::int64_t>(s2[i]);
+                    dst[i] = (a > b) ? ~0ULL : 0ULL;
+                }
+            }
+        } else if (op == 0x28) { // VPMULDQ
+            if (pp != 1) throw Unsupported{};
+            for (int i = 0; i < len; ++i) {
+                std::int32_t a = static_cast<std::int32_t>(s1[i] & 0xFFFFFFFFULL);
+                std::int32_t b = static_cast<std::int32_t>(s2[i] & 0xFFFFFFFFULL);
+                dst[i] = static_cast<std::uint64_t>(static_cast<std::int64_t>(a) * static_cast<std::int64_t>(b));
+            }
+        } else if (op == 0x2B) { // VPACKUSDW
+            if (pp != 1) throw Unsupported{};
+            for (int lane = 0; lane < len / 2; ++lane) {
+                std::uint16_t out16[8];
+                for (int i = 0; i < 4; ++i) {
+                    std::int32_t v = static_cast<std::int32_t>(s1[lane * 2 + i / 2] >> ((i % 2) * 32));
+                    out16[i] = static_cast<std::uint16_t>(v < 0 ? 0 : v > 65535 ? 65535 : v);
+                }
+                for (int i = 0; i < 4; ++i) {
+                    std::int32_t v = static_cast<std::int32_t>(s2[lane * 2 + i / 2] >> ((i % 2) * 32));
+                    out16[4 + i] = static_cast<std::uint16_t>(v < 0 ? 0 : v > 65535 ? 65535 : v);
+                }
+                std::memcpy(&dst[lane * 2], out16, 16);
+            }
+        } else if (op == 0x2A) { // VMOVNTDQA
+            if (pp != 1 || src1 != 0) throw Unsupported{};
+            for (int i = 0; i < len; ++i) dst[i] = s2[i];
+        } else if ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35)) {
+            if (pp != 1 || src1 != 0) throw Unsupported{};
+            const bool is_signed = (op >= 0x20 && op <= 0x25);
+            const int sub = is_signed ? (op - 0x20) : (op - 0x30);
+            const int src_elem_bytes = (sub == 0 || sub == 1 || sub == 2) ? 1 : (sub == 3 || sub == 4) ? 2 : 4;
+            const int dst_elem_bytes = (sub == 0) ? 2 : (sub == 1 || sub == 3) ? 4 : 8;
+            const int total_elems = (len * 8) / dst_elem_bytes;
+            const int total_src_bytes = total_elems * src_elem_bytes;
+            std::uint8_t src_raw[32] = {};
+            if (rm.reg) {
+                std::memcpy(src_raw, s.xmm[rm.r], 16);
+            } else {
+                for (int b = 0; b < total_src_bytes; ++b) {
+                    src_raw[b] = static_cast<std::uint8_t>(rd_mem(rm.addr + b, 1));
+                }
+            }
+            std::uint8_t out[32] = {};
+            for (int i = 0; i < total_elems; ++i) {
+                std::uint64_t v = 0;
+                std::memcpy(&v, src_raw + i * src_elem_bytes, src_elem_bytes);
+                if (is_signed) {
+                    v = sext(v, src_elem_bytes);
+                }
+                std::memcpy(out + i * dst_elem_bytes, &v, dst_elem_bytes);
+            }
+            std::memcpy(dst, out, len * 8);
+        } else {
+            throw Unsupported{};
+        }
+        for (int i = 0; i < 2; ++i) s.xmm[rg][i] = dst[i];
+        for (int i = 0; i < 2; ++i) s.ymm_hi[rg][i] = (len == 4) ? dst[i + 2] : 0;
+        return;
+    }
     if (op == 0x77 && pp == 0 && len == 2 && src1 == 0 && !w) {
         for (int i = 0; i < 16; ++i) s.ymm_hi[i][0] = s.ymm_hi[i][1] = 0;
         return;
+    }
+    if ((op == 0x71 || op == 0x72 || op == 0x73) && pp == 1) {
+        // VPSLLW / VPSRLW / VPSRAW (0x71)
+        // VPSLLD / VPSRLD / VPSRAD (0x72)
+        // VPSLLQ / VPSRLQ / VPSLLDQ / VPSRLDQ (0x73)
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 1);
+        const int sub = rg & 7;
+        const unsigned count = u8();
+        std::uint64_t source[4] = {}, dest[4] = {};
+        if (rm.reg) {
+            for (int i = 0; i < len; ++i) source[i] = i < 2 ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2];
+        } else {
+            for (int i = 0; i < len; ++i) source[i] = rd_mem(rm.addr + i * 8, 8);
+        }
+        if (op == 0x71) {
+            std::uint16_t words[16];
+            std::memcpy(words, source, len * 8);
+            for (int i = 0; i < len * 4; ++i) {
+                if (sub == 2) words[i] = (count >= 16) ? 0 : (words[i] >> count);
+                else if (sub == 4) {
+                    std::int16_t sw = static_cast<std::int16_t>(words[i]);
+                    words[i] = static_cast<std::uint16_t>(count >= 16 ? (sw < 0 ? -1 : 0) : (sw >> count));
+                }
+                else if (sub == 6) words[i] = (count >= 16) ? 0 : (words[i] << count);
+                else throw Unsupported{};
+            }
+            std::memcpy(dest, words, len * 8);
+        } else if (op == 0x72) {
+            std::uint32_t dwords[8];
+            std::memcpy(dwords, source, len * 8);
+            for (int i = 0; i < len * 2; ++i) {
+                if (sub == 2) dwords[i] = (count >= 32) ? 0 : (dwords[i] >> count);
+                else if (sub == 4) {
+                    std::int32_t sd = static_cast<std::int32_t>(dwords[i]);
+                    dwords[i] = static_cast<std::uint32_t>(count >= 32 ? (sd < 0 ? -1 : 0) : (sd >> count));
+                }
+                else if (sub == 6) dwords[i] = (count >= 32) ? 0 : (dwords[i] << count);
+                else throw Unsupported{};
+            }
+            std::memcpy(dest, dwords, len * 8);
+        } else if (op == 0x73) {
+            if (sub == 2) {
+                for (int i = 0; i < len; ++i) dest[i] = (count >= 64) ? 0 : (source[i] >> count);
+            } else if (sub == 6) {
+                for (int i = 0; i < len; ++i) dest[i] = (count >= 64) ? 0 : (source[i] << count);
+            } else if (sub == 3) {
+                std::uint8_t b_in[32] = {}, b_out[32] = {};
+                std::memcpy(b_in, source, len * 8);
+                for (int lane = 0; lane < len / 2; ++lane) {
+                    const std::uint8_t* in_l = b_in + lane * 16;
+                    std::uint8_t* out_l = b_out + lane * 16;
+                    for (unsigned b = 0; b < 16; ++b) out_l[b] = (b + count < 16) ? in_l[b + count] : 0;
+                }
+                std::memcpy(dest, b_out, len * 8);
+            } else if (sub == 7) {
+                std::uint8_t b_in[32] = {}, b_out[32] = {};
+                std::memcpy(b_in, source, len * 8);
+                for (int lane = 0; lane < len / 2; ++lane) {
+                    const std::uint8_t* in_l = b_in + lane * 16;
+                    std::uint8_t* out_l = b_out + lane * 16;
+                    for (unsigned b = 0; b < 16; ++b) out_l[b] = (b >= count) ? in_l[b - count] : 0;
+                }
+                std::memcpy(dest, b_out, len * 8);
+            } else throw Unsupported{};
+        }
+        for (int i = 0; i < 2; ++i) s.xmm[src1][i] = dest[i];
+        for (int i = 0; i < 2; ++i) s.ymm_hi[src1][i] = (len == 4) ? dest[i + 2] : 0;
+        return;
+    }
+    if (((op >= 0xD1 && op <= 0xD3) || (op >= 0xE1 && op <= 0xE2) || (op >= 0xF1 && op <= 0xF3)) && pp == 1) {
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        std::uint64_t count_src[4] = {};
+        if (rm.reg) { for (int i = 0; i < len; ++i) count_src[i] = i < 2 ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2]; }
+        else { for (int i = 0; i < len; ++i) count_src[i] = rd_mem(rm.addr + i * 8, 8); }
+        const std::uint64_t count = count_src[0];
+
+        std::uint64_t source[4] = {}, dest[4] = {};
+        for (int i = 0; i < len; ++i) source[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+
+        if (op == 0xD1 || op == 0xE1 || op == 0xF1) {
+            std::uint16_t words[16];
+            std::memcpy(words, source, len * 8);
+            for (int i = 0; i < len * 4; ++i) {
+                if (op == 0xD1) words[i] = (count >= 16) ? 0 : (words[i] >> count);
+                else if (op == 0xE1) {
+                    std::int16_t sw = static_cast<std::int16_t>(words[i]);
+                    words[i] = static_cast<std::uint16_t>(count >= 16 ? (sw < 0 ? -1 : 0) : (sw >> count));
+                } else words[i] = (count >= 16) ? 0 : (words[i] << count);
+            }
+            std::memcpy(dest, words, len * 8);
+        } else if (op == 0xD2 || op == 0xE2 || op == 0xF2) {
+            std::uint32_t dwords[8];
+            std::memcpy(dwords, source, len * 8);
+            for (int i = 0; i < len * 2; ++i) {
+                if (op == 0xD2) dwords[i] = (count >= 32) ? 0 : (dwords[i] >> count);
+                else if (op == 0xE2) {
+                    std::int32_t sd = static_cast<std::int32_t>(dwords[i]);
+                    dwords[i] = static_cast<std::uint32_t>(count >= 32 ? (sd < 0 ? -1 : 0) : (sd >> count));
+                } else dwords[i] = (count >= 32) ? 0 : (dwords[i] << count);
+            }
+            std::memcpy(dest, dwords, len * 8);
+        } else if (op == 0xD3 || op == 0xF3) {
+            for (int i = 0; i < len; ++i) {
+                if (op == 0xD3) dest[i] = (count >= 64) ? 0 : (source[i] >> count);
+                else dest[i] = (count >= 64) ? 0 : (source[i] << count);
+            }
+        }
+        for (int i = 0; i < 2; ++i) s.xmm[rg][i] = dest[i];
+        for (int i = 0; i < 2; ++i) s.ymm_hi[rg][i] = (len == 4) ? dest[i + 2] : 0;
+        return;
+    }
+    if (op == 0x50 && (pp == 0 || pp == 1)) { // vmovmskps / vmovmskpd
+        if (src1 != 0) throw Unsupported{};
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        if (!rm.reg) throw UdEx{};
+        unsigned mask = 0;
+        if (pp == 0) { // vmovmskps
+            const int total_floats = len * 2;
+            for (int i = 0; i < total_floats; ++i) {
+                const std::uint64_t qw = (i < 4) ? s.xmm[rm.r][i / 2] : s.ymm_hi[rm.r][(i - 4) / 2];
+                const unsigned sign_bit = static_cast<unsigned>((qw >> ((i % 2) * 32 + 31)) & 1);
+                mask |= (sign_bit << i);
+            }
+        } else { // vmovmskpd
+            const int total_doubles = len;
+            for (int i = 0; i < total_doubles; ++i) {
+                const std::uint64_t qw = (i < 2) ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2];
+                const unsigned sign_bit = static_cast<unsigned>((qw >> 63) & 1);
+                mask |= (sign_bit << i);
+            }
+        }
+        wr_reg(rg, 4, mask);
+        return;
+    }
+    if (op == 0xD7 && pp == 1) { // vpmovmskb
+        if (src1 != 0) throw Unsupported{};
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        if (!rm.reg) throw UdEx{};
+        unsigned mask = 0;
+        const int total_bytes = len * 8;
+        for (int i = 0; i < total_bytes; ++i) {
+            const std::uint64_t qw = (i < 16) ? s.xmm[rm.r][i / 8] : s.ymm_hi[rm.r][(i - 16) / 8];
+            const unsigned sign_bit = static_cast<unsigned>((qw >> ((i % 8) * 8 + 7)) & 1);
+            mask |= (sign_bit << i);
+        }
+        wr_reg(rg, 4, mask);
+        return;
+    }
+    if (op == 0xAE && pp == 0 && len == 2 && src1 == 0) { // vstmxcsr / vldmxcsr
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        if (rm.reg) throw UdEx{};
+        const int sub = rg & 7;
+        if (sub == 2) {
+            // VLDMXCSR m32
+            s.mxcsr = static_cast<std::uint32_t>(rd_mem(rm.addr, 4));
+            return;
+        } else if (sub == 3) {
+            // VSTMXCSR m32
+            wr_mem(rm.addr, 4, s.mxcsr);
+            return;
+        }
+        throw Unsupported{};
     }
     if (op == 0x6E) { // vmovd / vmovq xmm, r/m
         if (pp != 1 || len != 2 || src1 != 0) throw Unsupported{};
@@ -383,6 +1050,120 @@ void Exec::avx(bool three) {
         else out = static_cast<std::int64_t>(d);
         if (sz == 4 && (out > INT32_MAX || out < INT32_MIN)) out = INT32_MIN;
         wr_reg(rg, sz, static_cast<std::uint64_t>(out));
+        return;
+    }
+    if (op == 0x5A) { // vcvtss2sd / vcvtsd2ss / vcvtps2pd / vcvtpd2ps
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        if (pp == 2) { // vcvtss2sd xmm1, xmm2, xmm3/m32
+            if (len != 2) throw Unsupported{};
+            const float src = f32(rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 4));
+            const double d = static_cast<double>(src);
+            s.xmm[rg][0] = bits64(d);
+            s.xmm[rg][1] = s.xmm[src1][1];
+            s.ymm_hi[rg][0] = 0;
+            s.ymm_hi[rg][1] = 0;
+            return;
+        }
+        if (pp == 3) { // vcvtsd2ss xmm1, xmm2, xmm3/m64
+            if (len != 2) throw Unsupported{};
+            const double src = f64(rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 8));
+            const float f = static_cast<float>(src);
+            s.xmm[rg][0] = (s.xmm[src1][0] & ~0xFFFFFFFFULL) | bits32(f);
+            s.xmm[rg][1] = s.xmm[src1][1];
+            s.ymm_hi[rg][0] = 0;
+            s.ymm_hi[rg][1] = 0;
+            return;
+        }
+        if (pp == 0) { // vcvtps2pd (128-bit: xmm, xmm/m64 -> 2 doubles; 256-bit: ymm, xmm/m128 -> 4 doubles)
+            if (src1 != 0) throw Unsupported{};
+            if (len == 2) {
+                const std::uint64_t raw = rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 8);
+                const float f0 = f32(raw & 0xFFFFFFFFULL);
+                const float f1 = f32(raw >> 32);
+                s.xmm[rg][0] = bits64(static_cast<double>(f0));
+                s.xmm[rg][1] = bits64(static_cast<double>(f1));
+                s.ymm_hi[rg][0] = 0;
+                s.ymm_hi[rg][1] = 0;
+            } else {
+                std::uint64_t raw[2] = {};
+                if (rm.reg) { raw[0] = s.xmm[rm.r][0]; raw[1] = s.xmm[rm.r][1]; }
+                else { raw[0] = rd_mem(rm.addr, 8); raw[1] = rd_mem(rm.addr + 8, 8); }
+                const float f0 = f32(raw[0] & 0xFFFFFFFFULL);
+                const float f1 = f32(raw[0] >> 32);
+                const float f2 = f32(raw[1] & 0xFFFFFFFFULL);
+                const float f3 = f32(raw[1] >> 32);
+                s.xmm[rg][0] = bits64(static_cast<double>(f0));
+                s.xmm[rg][1] = bits64(static_cast<double>(f1));
+                s.ymm_hi[rg][0] = bits64(static_cast<double>(f2));
+                s.ymm_hi[rg][1] = bits64(static_cast<double>(f3));
+            }
+            return;
+        }
+        if (pp == 1) { // vcvtpd2ps (128-bit: xmm, xmm/m128 -> 2 floats; 256-bit: xmm, ymm/m256 -> 4 floats)
+            if (src1 != 0) throw Unsupported{};
+            if (len == 2) {
+                std::uint64_t raw[2] = {};
+                if (rm.reg) { raw[0] = s.xmm[rm.r][0]; raw[1] = s.xmm[rm.r][1]; }
+                else { raw[0] = rd_mem(rm.addr, 8); raw[1] = rd_mem(rm.addr + 8, 8); }
+                const float f0 = static_cast<float>(f64(raw[0]));
+                const float f1 = static_cast<float>(f64(raw[1]));
+                s.xmm[rg][0] = bits32(f0) | (static_cast<std::uint64_t>(bits32(f1)) << 32);
+                s.xmm[rg][1] = 0;
+                s.ymm_hi[rg][0] = 0;
+                s.ymm_hi[rg][1] = 0;
+            } else {
+                std::uint64_t raw[4] = {};
+                for (int i = 0; i < 4; ++i) {
+                    raw[i] = rm.reg ? (i < 2 ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2]) : rd_mem(rm.addr + i * 8, 8);
+                }
+                const float f0 = static_cast<float>(f64(raw[0]));
+                const float f1 = static_cast<float>(f64(raw[1]));
+                const float f2 = static_cast<float>(f64(raw[2]));
+                const float f3 = static_cast<float>(f64(raw[3]));
+                s.xmm[rg][0] = bits32(f0) | (static_cast<std::uint64_t>(bits32(f1)) << 32);
+                s.xmm[rg][1] = bits32(f2) | (static_cast<std::uint64_t>(bits32(f3)) << 32);
+                s.ymm_hi[rg][0] = 0;
+                s.ymm_hi[rg][1] = 0;
+            }
+            return;
+        }
+    }
+    if (op == 0x5B) { // vcvtdq2ps / vcvtps2dq / vcvttps2dq
+        if (src1 != 0) throw Unsupported{};
+        int rg = 0;
+        const Rm rm = decode_rm(rg, 0);
+        const int num_lanes = len * 2;
+        std::uint32_t src[8] = {}, out[8] = {};
+        if (rm.reg) {
+            for (int i = 0; i < len; ++i) {
+                const std::uint64_t val = (i < 2) ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2];
+                src[i * 2 + 0] = static_cast<std::uint32_t>(val);
+                src[i * 2 + 1] = static_cast<std::uint32_t>(val >> 32);
+            }
+        } else {
+            for (int i = 0; i < num_lanes; ++i) src[i] = static_cast<std::uint32_t>(rd_mem(rm.addr + i * 4, 4));
+        }
+        if (pp == 0) { // vcvtdq2ps: 32-bit int -> float
+            for (int i = 0; i < num_lanes; ++i) {
+                const std::int32_t si = static_cast<std::int32_t>(src[i]);
+                const float f = static_cast<float>(si);
+                out[i] = static_cast<std::uint32_t>(bits32(f));
+            }
+        } else if (pp == 1 || pp == 2) { // vcvtps2dq / vcvttps2dq: float -> 32-bit int
+            for (int i = 0; i < num_lanes; ++i) {
+                const float f = f32(src[i]);
+                std::int32_t val = 0;
+                if (std::isnan(f) || f >= 2147483648.0f || f < -2147483648.0f) val = INT32_MIN;
+                else if (pp == 2) val = static_cast<std::int32_t>(f);
+                else val = static_cast<std::int32_t>(std::nearbyint(f));
+                out[i] = static_cast<std::uint32_t>(val);
+            }
+        } else {
+            throw Unsupported{};
+        }
+        for (int i = 0; i < 2; ++i) s.xmm[rg][i] = static_cast<std::uint64_t>(out[i * 2]) | (static_cast<std::uint64_t>(out[i * 2 + 1]) << 32);
+        for (int i = 0; i < 2; ++i) s.ymm_hi[rg][i] = (len == 4) ? (static_cast<std::uint64_t>(out[4 + i * 2]) | (static_cast<std::uint64_t>(out[4 + i * 2 + 1]) << 32)) : 0;
         return;
     }
     if ((op == 0x10 || op == 0x11) && pp >= 2) { // vmovss / vmovsd
@@ -552,7 +1333,8 @@ void Exec::avx(bool three) {
         return;
     }
     const bool mov = ((op == 0x10 || op == 0x11 || op == 0x28 || op == 0x29) && pp <= 1) ||
-                     ((op == 0x6F || op == 0x7F) && (pp == 1 || pp == 2));
+                     ((op == 0x6F || op == 0x7F) && (pp == 1 || pp == 2)) ||
+                     ((op == 0x2B && pp <= 1) || (op == 0xE7 && pp == 1));
     const bool logic = (op == 0x57) || (pp == 0 && (op == 0x54 || op == 0x55 || op == 0x56)) ||
                        (pp == 1 && (op == 0xEF || op == 0xDB || op == 0xEB || op == 0xDF ||
                                     op == 0x54 || op == 0x55 || op == 0x56 || op == 0x57));
@@ -564,12 +1346,17 @@ void Exec::avx(bool three) {
         ((op >= 0x60 && op <= 0x62) || op == 0x6C ||
          (op >= 0x68 && op <= 0x6A) || op == 0x6D)) ||
         (pp <= 1 && (op == 0x14 || op == 0x15));
+    const bool pack = pp == 1 && (op == 0x63 || op == 0x67 || op == 0x6B);
     const bool padd_sub = pp == 1 &&
         (op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4 ||
          op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB);
+    const bool compare = op == 0xC2;
+    const bool pcmpeq = pp == 1 && (op >= 0x74 && op <= 0x76);
+    const bool pcmpgt = pp == 1 && (op >= 0x64 && op <= 0x66);
+    const bool pcmp = pcmpeq || pcmpgt;
     const bool shuffle = (op == 0x70 && pp == 1) || (op == 0xC6 && pp <= 1);
-    if ((!mov && !logic && !arith && !unpack && !padd_sub && !shuffle && !hadd_sub) ||
-        (pp > 1 && !arith && !mov && !hadd_sub) ||
+    if ((!mov && !logic && !arith && !unpack && !pack && !padd_sub && !shuffle && !hadd_sub && !compare && !pcmp) ||
+        (pp > 1 && !arith && !mov && !hadd_sub && !compare) ||
         (pp > 1 && len != 2 && !mov && !hadd_sub) ||
         (logic && op != 0x57 && pp != 1 && pp != 0))
         throw Unsupported{};
@@ -587,13 +1374,17 @@ void Exec::avx(bool three) {
         if (len != 2 && len != 4) throw Unsupported{}; // 128 or 256 bit only
         if (op == 0x70 && src1 != 0) throw Unsupported{}; // vpshufd requires vvvv = 1111b
     }
+    if (compare) {
+        if (len != 2 && len != 4) throw Unsupported{};
+        if (pp > 1 && len != 2) throw Unsupported{};
+    }
     int rg = 0;
-    const Rm rm = decode_rm(rg, shuffle ? 1 : 0);
+    const Rm rm = decode_rm(rg, (shuffle || compare) ? 1 : 0);
     std::uint64_t source[4] = {}, dest[4] = {};
-    const bool scalar = arith && pp >= 2;
+    const bool scalar = (arith || compare) && pp >= 2;
     const int width = (pp == 1 || pp == 3) ? 8 : 4;
     const int bytes = scalar ? width : len * 8;
-    if (mov && (op == 0x11 || op == 0x29 || op == 0x7F)) {
+    if (mov && (op == 0x11 || op == 0x29 || op == 0x7F || op == 0x2B || op == 0xE7)) {
         for (int i = 0; i < len; ++i) source[i] = i < 2 ? s.xmm[rg][i] : s.ymm_hi[rg][i - 2];
         if (rm.reg) {
             for (int i = 0; i < len; ++i) (i < 2 ? s.xmm[rm.r][i] : s.ymm_hi[rm.r][i - 2]) = source[i];
@@ -627,6 +1418,52 @@ void Exec::avx(bool three) {
             }
         }
         std::memcpy(dest, out, len * 8);
+    } else if (pack) {
+        // VPACKSSWB (0x63), VPACKUSWB (0x67), VPACKSSDW (0x6B)
+        std::uint64_t s1[4] = {};
+        for (int i = 0; i < len; ++i) s1[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+        const int num_lanes = len / 2;
+        for (int lane = 0; lane < num_lanes; ++lane) {
+            const std::uint8_t* lane_s1 = reinterpret_cast<const std::uint8_t*>(&s1[lane * 2]);
+            const std::uint8_t* lane_s2 = reinterpret_cast<const std::uint8_t*>(&source[lane * 2]);
+            std::uint8_t lane_dst[16] = {};
+            if (op == 0x63) { // VPACKSSWB: s16 -> s8
+                for (int i = 0; i < 8; ++i) {
+                    std::int16_t v = 0;
+                    std::memcpy(&v, lane_s1 + i * 2, 2);
+                    lane_dst[i] = static_cast<std::uint8_t>(v > 127 ? 127 : v < -128 ? -128 : v);
+                }
+                for (int i = 0; i < 8; ++i) {
+                    std::int16_t v = 0;
+                    std::memcpy(&v, lane_s2 + i * 2, 2);
+                    lane_dst[8 + i] = static_cast<std::uint8_t>(v > 127 ? 127 : v < -128 ? -128 : v);
+                }
+            } else if (op == 0x67) { // VPACKUSWB: s16 -> u8
+                for (int i = 0; i < 8; ++i) {
+                    std::int16_t v = 0;
+                    std::memcpy(&v, lane_s1 + i * 2, 2);
+                    lane_dst[i] = static_cast<std::uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+                for (int i = 0; i < 8; ++i) {
+                    std::int16_t v = 0;
+                    std::memcpy(&v, lane_s2 + i * 2, 2);
+                    lane_dst[8 + i] = static_cast<std::uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+            } else if (op == 0x6B) { // VPACKSSDW: s32 -> s16
+                std::int16_t* dst16 = reinterpret_cast<std::int16_t*>(lane_dst);
+                for (int i = 0; i < 4; ++i) {
+                    std::int32_t v = 0;
+                    std::memcpy(&v, lane_s1 + i * 4, 4);
+                    dst16[i] = static_cast<std::int16_t>(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+                }
+                for (int i = 0; i < 4; ++i) {
+                    std::int32_t v = 0;
+                    std::memcpy(&v, lane_s2 + i * 4, 4);
+                    dst16[4 + i] = static_cast<std::int16_t>(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+                }
+            }
+            std::memcpy(&dest[lane * 2], lane_dst, 16);
+        }
     } else if (padd_sub) {
         for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
         const bool is_add = (op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4);
@@ -643,6 +1480,27 @@ void Exec::avx(bool three) {
             std::memcpy(&y, b + i, elem_width);
             if (is_add) z = x + y;
             else z = x - y;
+            std::memcpy(out + i, &z, elem_width);
+        }
+        std::memcpy(dest, out, len * 8);
+    } else if (pcmp) {
+        for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+        const int elem_width = (op == 0x76 || op == 0x66) ? 4
+                             : (op == 0x75 || op == 0x65) ? 2 : 1;
+        std::uint8_t a[32], b[32], out[32];
+        std::memcpy(a, dest, len * 8);
+        std::memcpy(b, source, len * 8);
+        const int total_bytes = len * 8;
+        for (int i = 0; i < total_bytes; i += elem_width) {
+            std::uint64_t x = 0, y = 0, z = 0;
+            std::memcpy(&x, a + i, elem_width);
+            std::memcpy(&y, b + i, elem_width);
+            if (pcmpeq) {
+                z = (x == y) ? mask_of(elem_width) : 0;
+            } else {
+                const std::int64_t sx = sext(x, elem_width), sy = sext(y, elem_width);
+                z = (sx > sy) ? mask_of(elem_width) : 0;
+            }
             std::memcpy(out + i, &z, elem_width);
         }
         std::memcpy(dest, out, len * 8);
@@ -742,6 +1600,19 @@ void Exec::avx(bool three) {
                 }
             }
         }
+    } else if (compare) {
+        const unsigned imm = u8();
+        for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
+        const int lanes = scalar ? 1 : bytes / width;
+        for (int i = 0; i < lanes; ++i) {
+            const int word = i * width / 8, shift = (i * width % 8) * 8;
+            const std::uint64_t mask = mask_of(width);
+            const std::uint64_t a = (dest[word] >> shift) & mask, b = (source[word] >> shift) & mask;
+            const std::uint64_t val = (width == 8)
+                ? (eval_cmp_pred(f64(a), f64(b), imm) ? mask : 0ULL)
+                : (eval_cmp_pred(f32(a), f32(b), imm) ? mask : 0ULL);
+            dest[word] = (dest[word] & ~(mask << shift)) | ((val & mask) << shift);
+        }
     } else {
         for (int i = 0; i < len; ++i) dest[i] = i < 2 ? s.xmm[src1][i] : s.ymm_hi[src1][i - 2];
         for (int i = 0; i < bytes / width; ++i) {
@@ -750,9 +1621,9 @@ void Exec::avx(bool three) {
             const std::uint64_t a = (dest[word] >> shift) & mask, b = (source[word] >> shift) & mask;
             std::uint64_t value = 0;
             if (logic) {
-                if (op == 0xDB || (pp == 1 && op == 0x54)) value = a & b;
-                else if (op == 0xEB || (pp == 1 && op == 0x56)) value = a | b;
-                else if (op == 0xDF || (pp == 1 && op == 0x55)) value = (~a) & b;
+                if (op == 0xDB || op == 0x54) value = a & b;
+                else if (op == 0xEB || op == 0x56) value = a | b;
+                else if (op == 0xDF || op == 0x55) value = (~a) & b;
                 else value = a ^ b; // 0x57, 0xEF
             } else if (width == 8) {
                 const double x = f64(a), y = f64(b);
@@ -782,34 +1653,306 @@ void Exec::two_byte(int opsz) {
     if (op2 == 0x05) throw HaltEx{}; // syscall: trap, nunca chamar o kernel do host
     if (op2 == 0x38 || op2 == 0x3A) {
         const unsigned op3 = u8();
-        if (!p66 || (op2 == 0x38 && op3 != 0x00 && op3 != 0x40) ||
-            (op2 == 0x3A && op3 != 0x0F)) throw Unsupported{};
+        if (op2 == 0x38 && (op3 == 0xF0 || op3 == 0xF1)) {
+            const Rm rm = decode_rm(rg, 0);
+            if (rm.reg) throw UdEx{};
+            const int sz = (opsz == 2) ? 2 : (opsz == 8) ? 8 : 4;
+            if (op3 == 0xF0) { // MOVBE r, m (load)
+                std::uint64_t val = rd_mem(rm.addr, sz);
+                std::uint64_t swapped = 0;
+                if (sz == 2) swapped = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF);
+                else if (sz == 4) swapped = __builtin_bswap32(static_cast<std::uint32_t>(val));
+                else swapped = __builtin_bswap64(val);
+                wr_reg(rg, sz, swapped);
+            } else { // MOVBE m, r (store)
+                std::uint64_t val = rd_reg(rg, sz);
+                std::uint64_t swapped = 0;
+                if (sz == 2) swapped = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF);
+                else if (sz == 4) swapped = __builtin_bswap32(static_cast<std::uint32_t>(val));
+                else swapped = __builtin_bswap64(val);
+                wr_mem(rm.addr, sz, swapped);
+            }
+            return;
+        }
+        if (!p66 || (op2 == 0x38 && op3 != 0x00 && op3 != 0x40 &&
+                     op3 != 0x01 && op3 != 0x02 && op3 != 0x03 &&
+                     !(op3 >= 0x38 && op3 <= 0x3F) && !(op3 >= 0x1C && op3 <= 0x1E) &&
+                     op3 != 0x28 && op3 != 0x29 && op3 != 0x2A && op3 != 0x2B &&
+                     !((op3 >= 0x20 && op3 <= 0x25) || (op3 >= 0x30 && op3 <= 0x35))) ||
+            (op2 == 0x3A && op3 != 0x08 && op3 != 0x09 && op3 != 0x0A && op3 != 0x0B &&
+             op3 != 0x0F && !(op3 >= 0x14 && op3 <= 0x17) && op3 != 0x20 && op3 != 0x22)) throw Unsupported{};
         const int imm = op2 == 0x3A ? 1 : 0;
         const Rm rm = decode_rm(rg, imm);
-        std::uint64_t src[2]; rd_xmm_rm(rm, src);
-        std::uint8_t a[16], b[16], out[16];
+        std::uint64_t src[2] = {};
+        if ((op3 >= 0x20 && op3 <= 0x25) || (op3 >= 0x30 && op3 <= 0x35)) {
+            const bool is_signed = (op3 >= 0x20 && op3 <= 0x25);
+            const int sub = is_signed ? (op3 - 0x20) : (op3 - 0x30);
+            const int src_elem_bytes = (sub == 0 || sub == 1 || sub == 2) ? 1 : (sub == 3 || sub == 4) ? 2 : 4;
+            const int dst_elem_bytes = (sub == 0) ? 2 : (sub == 1 || sub == 3) ? 4 : 8;
+            const int total_elems = 16 / dst_elem_bytes;
+            const int total_src_bytes = total_elems * src_elem_bytes;
+            std::uint8_t src_raw[16] = {};
+            if (rm.reg) std::memcpy(src_raw, s.xmm[rm.r], 16);
+            else { for (int b = 0; b < total_src_bytes; ++b) src_raw[b] = static_cast<std::uint8_t>(rd_mem(rm.addr + b, 1)); }
+            std::uint8_t out[16] = {};
+            for (int i = 0; i < total_elems; ++i) {
+                std::uint64_t v = 0;
+                std::memcpy(&v, src_raw + i * src_elem_bytes, src_elem_bytes);
+                if (is_signed) v = sext(v, src_elem_bytes);
+                std::memcpy(out + i * dst_elem_bytes, &v, dst_elem_bytes);
+            }
+            std::memcpy(s.xmm[rg], out, 16);
+            return;
+        }
+        rd_xmm_rm(rm, src);
+        std::uint8_t a[16], b[16], out[16] = {};
         std::memcpy(a, s.xmm[rg], 16); std::memcpy(b, src, 16);
-        if (op2 == 0x3A) { // palignr concatena src:dest, deslocamento em bytes
-            const unsigned shift = u8();
-            for (unsigned i = 0; i < 16; ++i) {
-                const unsigned j = shift + i;
-                out[i] = j < 16 ? b[j] : j < 32 ? a[j - 16] : 0;
+        if (op2 == 0x3A) {
+            const unsigned imm8 = u8();
+            if (op3 == 0x0A) { // ROUNDSS xmm1, xmm2/m32, imm8
+                float f = 0.0f;
+                std::memcpy(&f, b, 4);
+                float r = round_fp(f, imm8);
+                std::memcpy(out, a, 16);
+                std::memcpy(out, &r, 4);
+            } else if (op3 == 0x0B) { // ROUNDSD xmm1, xmm2/m64, imm8
+                double d = 0.0;
+                std::memcpy(&d, b, 8);
+                double r = round_fp(d, imm8);
+                std::memcpy(out, a, 16);
+                std::memcpy(out, &r, 8);
+            } else if (op3 == 0x08) { // ROUNDPS xmm1, xmm2/m128, imm8
+                float src_f[4], dst_f[4];
+                std::memcpy(src_f, b, 16);
+                for (int i = 0; i < 4; ++i) dst_f[i] = round_fp(src_f[i], imm8);
+                std::memcpy(out, dst_f, 16);
+            } else if (op3 == 0x09) { // ROUNDPD xmm1, xmm2/m128, imm8
+                double src_d[2], dst_d[2];
+                std::memcpy(src_d, b, 16);
+                for (int i = 0; i < 2; ++i) dst_d[i] = round_fp(src_d[i], imm8);
+                std::memcpy(out, dst_d, 16);
+            } else if (op3 == 0x0F) { // palignr
+                for (unsigned i = 0; i < 16; ++i) {
+                    const unsigned j = imm8 + i;
+                    out[i] = j < 16 ? b[j] : j < 32 ? a[j - 16] : 0;
+                }
+            } else if (op3 == 0x14 || op3 == 0x15 || op3 == 0x16 || op3 == 0x17) {
+                if (op3 == 0x16 || op3 == 0x17) {
+                    if (rw && op3 == 0x16) { // PEXTRQ
+                        const unsigned idx = imm8 & 1;
+                        std::uint64_t val = 0;
+                        std::memcpy(&val, a + idx * 8, 8);
+                        if (rm.reg) wr_reg(rm.r, 8, val);
+                        else wr_mem(rm.addr, 8, val);
+                    } else { // PEXTRD / EXTRACTPS
+                        const unsigned idx = imm8 & 3;
+                        std::uint32_t val = 0;
+                        std::memcpy(&val, a + idx * 4, 4);
+                        if (rm.reg) wr_reg(rm.r, 4, val);
+                        else wr_mem(rm.addr, 4, val);
+                    }
+                } else if (op3 == 0x15) {
+                    const unsigned idx = imm8 & 7;
+                    std::uint16_t val = 0;
+                    std::memcpy(&val, a + idx * 2, 2);
+                    if (rm.reg) wr_reg(rm.r, 4, val);
+                    else wr_mem(rm.addr, 2, val);
+                } else {
+                    const unsigned idx = imm8 & 15;
+                    std::uint8_t val = a[idx];
+                    if (rm.reg) wr_reg(rm.r, 4, val);
+                    else wr_mem(rm.addr, 1, val);
+                }
+                return;
+            } else if (op3 == 0x20 || op3 == 0x22) {
+                std::memcpy(out, a, 16);
+                if (op3 == 0x22) {
+                    const int sz = rw ? 8 : 4;
+                    std::uint64_t val = rm.reg ? rd_reg(rm.r, sz) : rd_mem(rm.addr, sz);
+                    if (rw) {
+                        const unsigned idx = imm8 & 1;
+                        std::memcpy(out + idx * 8, &val, 8);
+                    } else {
+                        const unsigned idx = imm8 & 3;
+                        std::memcpy(out + idx * 4, &val, 4);
+                    }
+                } else {
+                    std::uint8_t val = static_cast<std::uint8_t>(rm.reg ? rd_reg(rm.r, 4) : rd_mem(rm.addr, 1));
+                    const unsigned idx = imm8 & 15;
+                    out[idx] = val;
+                }
+            } else if (op3 == 0x40) { // DPPS xmm1, xmm2/m128, imm8
+                float a_f[4], b_f[4], dst_f[4] = {};
+                std::memcpy(a_f, a, 16);
+                std::memcpy(b_f, b, 16);
+                float sum = 0.0f;
+                if (imm8 & 0x10) sum += a_f[0] * b_f[0];
+                if (imm8 & 0x20) sum += a_f[1] * b_f[1];
+                if (imm8 & 0x40) sum += a_f[2] * b_f[2];
+                if (imm8 & 0x80) sum += a_f[3] * b_f[3];
+
+                dst_f[0] = (imm8 & 0x01) ? sum : 0.0f;
+                dst_f[1] = (imm8 & 0x02) ? sum : 0.0f;
+                dst_f[2] = (imm8 & 0x04) ? sum : 0.0f;
+                dst_f[3] = (imm8 & 0x08) ? sum : 0.0f;
+                std::memcpy(out, dst_f, 16);
+            } else if (op3 == 0x41) { // DPPD xmm1, xmm2/m128, imm8
+                double a_d[2], b_d[2], dst_d[2] = {};
+                std::memcpy(a_d, a, 16);
+                std::memcpy(b_d, b, 16);
+                double sum = 0.0;
+                if (imm8 & 0x10) sum += a_d[0] * b_d[0];
+                if (imm8 & 0x20) sum += a_d[1] * b_d[1];
+                dst_d[0] = (imm8 & 0x01) ? sum : 0.0;
+                dst_d[1] = (imm8 & 0x02) ? sum : 0.0;
+                std::memcpy(out, dst_d, 16);
             }
         } else if (op3 == 0x00) { // pshufb: controle de alta bit zera o byte
             for (int i = 0; i < 16; ++i) out[i] = b[i] & 0x80 ? 0 : a[b[i] & 15];
-        } else { // pmulld (produto modular de 32 bits)
+        } else if (op3 == 0x01 || op3 == 0x02 || op3 == 0x03) {
+            // PHADDW (0x01), PHADDD (0x02), PHADDSW (0x03)
+            if (op3 == 0x02) {
+                std::uint32_t a32[4], b32[4], out32[4];
+                std::memcpy(a32, a, 16);
+                std::memcpy(b32, b, 16);
+                out32[0] = a32[0] + a32[1];
+                out32[1] = a32[2] + a32[3];
+                out32[2] = b32[0] + b32[1];
+                out32[3] = b32[2] + b32[3];
+                std::memcpy(out, out32, 16);
+            } else if (op3 == 0x01) {
+                std::uint16_t a16[8], b16[8], out16[8];
+                std::memcpy(a16, a, 16);
+                std::memcpy(b16, b, 16);
+                for (int i = 0; i < 4; ++i) out16[i] = a16[i * 2] + a16[i * 2 + 1];
+                for (int i = 0; i < 4; ++i) out16[4 + i] = b16[i * 2] + b16[i * 2 + 1];
+                std::memcpy(out, out16, 16);
+            } else {
+                std::int16_t a16[8], b16[8], out16[8];
+                std::memcpy(a16, a, 16);
+                std::memcpy(b16, b, 16);
+                auto sat16 = [](std::int32_t v) -> std::int16_t {
+                    return static_cast<std::int16_t>(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
+                };
+                for (int i = 0; i < 4; ++i) out16[i] = sat16(static_cast<std::int32_t>(a16[i * 2]) + a16[i * 2 + 1]);
+                for (int i = 0; i < 4; ++i) out16[4 + i] = sat16(static_cast<std::int32_t>(b16[i * 2]) + b16[i * 2 + 1]);
+                std::memcpy(out, out16, 16);
+            }
+        } else if (op3 == 0x40) { // pmulld (produto modular de 32 bits)
             for (int i = 0; i < 4; ++i) {
                 std::uint32_t x, y;
                 std::memcpy(&x, a + i * 4, 4); std::memcpy(&y, b + i * 4, 4);
                 const std::uint32_t z = x * y;
                 std::memcpy(out + i * 4, &z, 4);
             }
+        } else if (op3 >= 0x38 && op3 <= 0x3F) {
+            const bool is_max = (op3 >= 0x3C);
+            const int elem_width = (op3 == 0x38 || op3 == 0x3C) ? 1
+                                 : (op3 == 0x3A || op3 == 0x3E) ? 2 : 4;
+            const bool is_signed = (op3 == 0x38 || op3 == 0x39 || op3 == 0x3C || op3 == 0x3D);
+            for (int i = 0; i < 16; i += elem_width) {
+                if (elem_width == 1) {
+                    if (is_signed) {
+                        std::int8_t x = static_cast<std::int8_t>(a[i]), y = static_cast<std::int8_t>(b[i]);
+                        out[i] = static_cast<std::uint8_t>(is_max ? std::max(x, y) : std::min(x, y));
+                    } else {
+                        std::uint8_t x = a[i], y = b[i];
+                        out[i] = is_max ? std::max(x, y) : std::min(x, y);
+                    }
+                } else if (elem_width == 2) {
+                    std::uint16_t x16, y16;
+                    std::memcpy(&x16, a + i, 2); std::memcpy(&y16, b + i, 2);
+                    if (is_signed) {
+                        std::int16_t x = static_cast<std::int16_t>(x16), y = static_cast<std::int16_t>(y16);
+                        std::int16_t z = is_max ? std::max(x, y) : std::min(x, y);
+                        std::memcpy(out + i, &z, 2);
+                    } else {
+                        std::uint16_t z = is_max ? std::max(x16, y16) : std::min(x16, y16);
+                        std::memcpy(out + i, &z, 2);
+                    }
+                } else {
+                    std::uint32_t x32, y32;
+                    std::memcpy(&x32, a + i, 4); std::memcpy(&y32, b + i, 4);
+                    if (is_signed) {
+                        std::int32_t x = static_cast<std::int32_t>(x32), y = static_cast<std::int32_t>(y32);
+                        std::int32_t z = is_max ? std::max(x, y) : std::min(x, y);
+                        std::memcpy(out + i, &z, 4);
+                    } else {
+                        std::uint32_t z = is_max ? std::max(x32, y32) : std::min(x32, y32);
+                        std::memcpy(out + i, &z, 4);
+                    }
+                }
+            }
+        } else if (op3 >= 0x1C && op3 <= 0x1E) {
+            const int elem_width = (op3 == 0x1C) ? 1 : (op3 == 0x1D) ? 2 : 4;
+            for (int i = 0; i < 16; i += elem_width) {
+                if (elem_width == 1) {
+                    std::int8_t v = static_cast<std::int8_t>(b[i]);
+                    out[i] = static_cast<std::uint8_t>(v < 0 ? -v : v);
+                } else if (elem_width == 2) {
+                    std::int16_t v; std::memcpy(&v, b + i, 2);
+                    v = static_cast<std::int16_t>(v < 0 ? -v : v);
+                    std::memcpy(out + i, &v, 2);
+                } else {
+                    std::int32_t v; std::memcpy(&v, b + i, 4);
+                    v = v < 0 ? -v : v;
+                    std::memcpy(out + i, &v, 4);
+                }
+            }
+        } else if (op3 == 0x29 || op3 == 0x37) {
+            for (int i = 0; i < 2; ++i) {
+                std::uint64_t x64, y64;
+                std::memcpy(&x64, a + i * 8, 8); std::memcpy(&y64, b + i * 8, 8);
+                std::uint64_t z = 0;
+                if (op3 == 0x29) {
+                    z = (x64 == y64) ? ~0ULL : 0ULL;
+                } else {
+                    z = (static_cast<std::int64_t>(x64) > static_cast<std::int64_t>(y64)) ? ~0ULL : 0ULL;
+                }
+                std::memcpy(out + i * 8, &z, 8);
+            }
+        } else if (op3 == 0x28) {
+            for (int i = 0; i < 2; ++i) {
+                std::int32_t x32, y32;
+                std::memcpy(&x32, a + i * 8, 4); std::memcpy(&y32, b + i * 8, 4);
+                std::uint64_t z = static_cast<std::uint64_t>(static_cast<std::int64_t>(x32) * static_cast<std::int64_t>(y32));
+                std::memcpy(out + i * 8, &z, 8);
+            }
+        } else if (op3 == 0x2B) {
+            std::uint16_t out16[8];
+            for (int i = 0; i < 4; ++i) {
+                std::int32_t v; std::memcpy(&v, a + i * 4, 4);
+                out16[i] = static_cast<std::uint16_t>(v < 0 ? 0 : v > 65535 ? 65535 : v);
+            }
+            for (int i = 0; i < 4; ++i) {
+                std::int32_t v; std::memcpy(&v, b + i * 4, 4);
+                out16[4 + i] = static_cast<std::uint16_t>(v < 0 ? 0 : v > 65535 ? 65535 : v);
+            }
+            std::memcpy(out, out16, 16);
+        } else if (op3 == 0x2A) {
+            std::memcpy(out, b, 16);
         }
         std::memcpy(s.xmm[rg], out, 16);
         return;
     }
-    if (op2 == 0x31) { // contador determinístico sem relógio do host
-        s.gpr[0] = 0; s.gpr[2] = 0; return;
+    if (op2 == 0x31) { // RDTSC: contador monotônico determinístico
+        s.gpr[0] = tsc & 0xFFFFFFFFULL;
+        s.gpr[2] = (tsc >> 32) & 0xFFFFFFFFULL;
+        return;
+    }
+    if (op2 == 0x01) { // RDTSCP / XGETBV
+        const std::uint8_t mrm = u8();
+        if (mrm == 0xF9) { // RDTSCP
+            s.gpr[0] = tsc & 0xFFFFFFFFULL;
+            s.gpr[2] = (tsc >> 32) & 0xFFFFFFFFULL;
+            s.gpr[1] = 0; // processor ID
+            return;
+        }
+        if (mrm == 0xD0) { // XGETBV
+            s.gpr[0] = 7; s.gpr[2] = 0;
+            return;
+        }
+        throw Unsupported{};
     }
     if (op2 == 0xA2) { // CPUID: perfil conservador Jaguar, sem anunciar AVX sem XSAVE
         const std::uint32_t leaf = static_cast<std::uint32_t>(s.gpr[0]);
@@ -969,6 +2112,41 @@ void Exec::two_byte(int opsz) {
         set_flag(FLAG_ZF, out == 0);
         return;
     }
+    case 0xAE: {
+        const Rm rm = decode_rm(rg, 0);
+        const int sub = rg & 7;
+        if (sub == 2) {
+            // LDMXCSR m32
+            s.mxcsr = static_cast<std::uint32_t>(rd_rm(rm, 4));
+        } else if (sub == 3) {
+            // STMXCSR m32: grava MXCSR
+            wr_rm(rm, 4, s.mxcsr);
+        } else if (sub == 0) {
+            // FXSAVE m512byte: salva estado FPU/MMX/SSE
+            if (!rm.reg) {
+                std::uint8_t fx[512] = {};
+                fx[0] = 0x7F; fx[1] = 0x03; // FCW = 0x037F
+                fx[24] = 0x80; fx[25] = 0x1F; // MXCSR = 0x1F80
+                fx[28] = 0xFF; fx[29] = 0xFF; // MXCSR_MASK = 0xFFFF
+                for (int i = 0; i < 16; ++i) {
+                    std::memcpy(&fx[160 + i * 16], s.xmm[i], 16);
+                }
+                m.store(rm.addr, fx, sizeof(fx));
+            }
+        } else if (sub == 1) {
+            // FXRSTOR m512byte: restaura estado
+            if (!rm.reg) {
+                std::uint8_t fx[512] = {};
+                if (m.load(rm.addr, fx, sizeof(fx)) == MemoryError::ok) {
+                    for (int i = 0; i < 16; ++i) {
+                        std::memcpy(s.xmm[i], &fx[160 + i * 16], 16);
+                    }
+                }
+            }
+        }
+        // LFENCE, MFENCE, SFENCE, CLFLUSH
+        return;
+    }
     default: break;
     }
     if (op2 >= 0xC8 && op2 <= 0xCF) {  // bswap
@@ -1082,8 +2260,9 @@ void Exec::sse(std::uint8_t op2, int opsz) {
         wr_mem(rm.addr, 8, s.xmm[rg][1]);
         return;
     }
-    case 0x28: case 0x29: case 0x6F: case 0x7F: {
+    case 0x28: case 0x29: case 0x6F: case 0x7F: case 0x2B: case 0xE7: {
         if ((op2 == 0x6F || op2 == 0x7F) && !(p66 || rep)) throw Unsupported{};  // MMX
+        if (op2 == 0xE7 && !p66) throw Unsupported{};
         const Rm rm = decode_rm(rg, 0);
         if (op2 == 0x28 || op2 == 0x6F) { std::uint64_t v[2]; rd_xmm_rm(rm, v); s.xmm[rg][0] = v[0]; s.xmm[rg][1] = v[1]; }
         else wr_xmm_rm(rm, s.xmm[rg]);
@@ -1111,6 +2290,26 @@ void Exec::sse(std::uint8_t op2, int opsz) {
         const Rm rm = decode_rm(rg, 0);
         if (rm.reg) { s.xmm[rm.r][0] = s.xmm[rg][0]; s.xmm[rm.r][1] = 0; }
         else wr_mem(rm.addr, 8, s.xmm[rg][0]);
+        return;
+    }
+    case 0x50: { // movmskps / movmskpd
+        const Rm rm = decode_rm(rg, 0);
+        if (!rm.reg) throw UdEx{};
+        unsigned mask = 0;
+        if (!pd) { // movmskps
+            for (int i = 0; i < 4; ++i) {
+                const std::uint64_t qw = s.xmm[rm.r][i / 2];
+                const unsigned sign_bit = static_cast<unsigned>((qw >> ((i % 2) * 32 + 31)) & 1);
+                mask |= (sign_bit << i);
+            }
+        } else { // movmskpd
+            for (int i = 0; i < 2; ++i) {
+                const std::uint64_t qw = s.xmm[rm.r][i];
+                const unsigned sign_bit = static_cast<unsigned>((qw >> 63) & 1);
+                mask |= (sign_bit << i);
+            }
+        }
+        wr_reg(rg, 4, mask);
         return;
     }
     case 0xEF: case 0x57: case 0x54: case 0x55: case 0x56: case 0xDB: case 0xDF: case 0xEB: {
@@ -1191,6 +2390,75 @@ void Exec::sse(std::uint8_t op2, int opsz) {
         } else throw Unsupported{};
         return;
     }
+    case 0xC2: {  // cmpps / cmppd / cmpss / cmpsd
+        const Rm rm = decode_rm(rg, 1);
+        const unsigned imm = u8();
+        const bool scalar = rep || repne;
+        const bool dbl = repne || (!scalar && pd);
+        const int width = dbl ? 8 : 4;
+        const int lanes = scalar ? 1 : 16 / width;
+        std::uint64_t src[2] = {};
+        if (rm.reg) { src[0] = s.xmm[rm.r][0]; src[1] = s.xmm[rm.r][1]; }
+        else if (scalar) src[0] = rd_mem(rm.addr, width);
+        else rd_xmm_rm(rm, src);
+        for (int i = 0; i < lanes; ++i) {
+            const int word = (i * width) / 8, shift = (i * width % 8) * 8;
+            const std::uint64_t mask = mask_of(width);
+            const std::uint64_t a = (s.xmm[rg][word] >> shift) & mask, b = (src[word] >> shift) & mask;
+            const std::uint64_t res = dbl
+                ? (eval_cmp_pred(f64(a), f64(b), imm) ? mask : 0ULL)
+                : (eval_cmp_pred(f32(a), f32(b), imm) ? mask : 0ULL);
+            s.xmm[rg][word] = (s.xmm[rg][word] & ~(mask << shift)) | ((res & mask) << shift);
+        }
+        return;
+    }
+    case 0x5A: { // cvtss2sd / cvtsd2ss / cvtps2pd / cvtpd2ps
+        const Rm rm = decode_rm(rg, 0);
+        if (rep) { // cvtss2sd xmm1, xmm2/m32
+            const float src = f32(rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 4));
+            s.xmm[rg][0] = bits64(static_cast<double>(src));
+        } else if (repne) { // cvtsd2ss xmm1, xmm2/m64
+            const double src = f64(rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 8));
+            s.xmm[rg][0] = (s.xmm[rg][0] & ~0xFFFFFFFFULL) | bits32(static_cast<float>(src));
+        } else if (pd) { // cvtpd2ps xmm1, xmm2/m128
+            std::uint64_t raw[2] = {};
+            rd_xmm_rm(rm, raw);
+            const float f0 = static_cast<float>(f64(raw[0]));
+            const float f1 = static_cast<float>(f64(raw[1]));
+            s.xmm[rg][0] = bits32(f0) | (static_cast<std::uint64_t>(bits32(f1)) << 32);
+            s.xmm[rg][1] = 0;
+        } else { // cvtps2pd xmm1, xmm2/m64
+            const std::uint64_t raw = rm.reg ? s.xmm[rm.r][0] : rd_mem(rm.addr, 8);
+            s.xmm[rg][0] = bits64(static_cast<double>(f32(raw & 0xFFFFFFFFULL)));
+            s.xmm[rg][1] = bits64(static_cast<double>(f32(raw >> 32)));
+        }
+        return;
+    }
+    case 0x5B: { // cvtdq2ps / cvtps2dq / cvttps2dq
+        const Rm rm = decode_rm(rg, 0);
+        std::uint64_t raw[2] = {};
+        rd_xmm_rm(rm, raw);
+        std::uint32_t src[4] = {
+            static_cast<std::uint32_t>(raw[0]), static_cast<std::uint32_t>(raw[0] >> 32),
+            static_cast<std::uint32_t>(raw[1]), static_cast<std::uint32_t>(raw[1] >> 32)
+        };
+        std::uint32_t out[4] = {};
+        if (!rep && !repne && !pd) { // cvtdq2ps
+            for (int i = 0; i < 4; ++i) out[i] = static_cast<std::uint32_t>(bits32(static_cast<float>(static_cast<std::int32_t>(src[i]))));
+        } else if (rep || pd) { // cvttps2dq (rep) or cvtps2dq (pd)
+            for (int i = 0; i < 4; ++i) {
+                const float f = f32(src[i]);
+                std::int32_t val = 0;
+                if (std::isnan(f) || f >= 2147483648.0f || f < -2147483648.0f) val = INT32_MIN;
+                else if (rep) val = static_cast<std::int32_t>(f);
+                else val = static_cast<std::int32_t>(std::nearbyint(f));
+                out[i] = static_cast<std::uint32_t>(val);
+            }
+        } else throw Unsupported{};
+        s.xmm[rg][0] = static_cast<std::uint64_t>(out[0]) | (static_cast<std::uint64_t>(out[1]) << 32);
+        s.xmm[rg][1] = static_cast<std::uint64_t>(out[2]) | (static_cast<std::uint64_t>(out[3]) << 32);
+        return;
+    }
     case 0xD7: {  // pmovmskb
         if (!pd) throw Unsupported{};
         const Rm rm = decode_rm(rg, 0);
@@ -1201,21 +2469,59 @@ void Exec::sse(std::uint8_t op2, int opsz) {
         wr_reg(rg, 4, bits);
         return;
     }
-    case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A:
+    case 0x60: case 0x61: case 0x62: case 0x63: case 0x67: case 0x68: case 0x69: case 0x6A: case 0x6B:
     case 0x6C: case 0x6D:
+    case 0x64: case 0x65: case 0x66:
     case 0xFC: case 0xFD: case 0xFE: case 0xD4:
     case 0xF8: case 0xF9: case 0xFA: case 0xFB:
     case 0x74: case 0x75: case 0x76: case 0xD5: {
         if (!pd) throw Unsupported{};
         const Rm rm = decode_rm(rg, 0);
         std::uint64_t src[2]; rd_xmm_rm(rm, src);
-        std::uint8_t a[16], b[16], out[16];
+        std::uint8_t a[16], b[16], out[16] = {};
         std::memcpy(a, s.xmm[rg], 16); std::memcpy(b, src, 16);
+        const bool pack = op2 == 0x63 || op2 == 0x67 || op2 == 0x6B;
         const bool unpack = (op2 >= 0x60 && op2 <= 0x62) || op2 == 0x6C || (op2 >= 0x68 && op2 <= 0x6A) || op2 == 0x6D;
         const int width = (op2 == 0xD4 || op2 == 0xFB || op2 == 0x6C || op2 == 0x6D) ? 8
-                        : (op2 == 0xFE || op2 == 0xFA || op2 == 0x76) ? 4
-                        : (op2 == 0xFD || op2 == 0xF9 || op2 == 0x75 || op2 == 0xD5 || op2 == 0x61 || op2 == 0x69) ? 2 : 1;
-        if (unpack) {
+                        : (op2 == 0xFE || op2 == 0xFA || op2 == 0x76 || op2 == 0x66) ? 4
+                        : (op2 == 0xFD || op2 == 0xF9 || op2 == 0x75 || op2 == 0xD5 || op2 == 0x61 || op2 == 0x69 || op2 == 0x65) ? 2 : 1;
+        if (pack) {
+            if (op2 == 0x63) { // PACKSSWB
+                for (int i = 0; i < 8; ++i) {
+                    std::int16_t v = 0;
+                    std::memcpy(&v, a + i * 2, 2);
+                    out[i] = static_cast<std::uint8_t>(v > 127 ? 127 : v < -128 ? -128 : v);
+                }
+                for (int i = 0; i < 8; ++i) {
+                    std::int16_t v = 0;
+                    std::memcpy(&v, b + i * 2, 2);
+                    out[8 + i] = static_cast<std::uint8_t>(v > 127 ? 127 : v < -128 ? -128 : v);
+                }
+            } else if (op2 == 0x67) { // PACKUSWB
+                for (int i = 0; i < 8; ++i) {
+                    std::int16_t v = 0;
+                    std::memcpy(&v, a + i * 2, 2);
+                    out[i] = static_cast<std::uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+                for (int i = 0; i < 8; ++i) {
+                    std::int16_t v = 0;
+                    std::memcpy(&v, b + i * 2, 2);
+                    out[8 + i] = static_cast<std::uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+            } else if (op2 == 0x6B) { // PACKSSDW
+                std::int16_t* dst16 = reinterpret_cast<std::int16_t*>(out);
+                for (int i = 0; i < 4; ++i) {
+                    std::int32_t v = 0;
+                    std::memcpy(&v, a + i * 4, 4);
+                    dst16[i] = static_cast<std::int16_t>(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+                }
+                for (int i = 0; i < 4; ++i) {
+                    std::int32_t v = 0;
+                    std::memcpy(&v, b + i * 4, 4);
+                    dst16[4 + i] = static_cast<std::int16_t>(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+                }
+            }
+        } else if (unpack) {
             const int first = ((op2 >= 0x68 && op2 <= 0x6A) || op2 == 0x6D) ? 8 : 0;
             for (int i = 0; i < 8 / width; ++i) {
                 std::memcpy(out + 2 * i * width, a + first + i * width, width);
@@ -1226,6 +2532,7 @@ void Exec::sse(std::uint8_t op2, int opsz) {
                 std::uint64_t x = 0, y = 0, z = 0;
                 std::memcpy(&x, a + i, width); std::memcpy(&y, b + i, width);
                 if (op2 >= 0x74 && op2 <= 0x76) z = x == y ? mask_of(width) : 0;
+                else if (op2 >= 0x64 && op2 <= 0x66) z = (sext(x, width) > sext(y, width)) ? mask_of(width) : 0;
                 else if (op2 == 0xD5) z = x * y;
                 else if (op2 == 0xFC || op2 == 0xFD || op2 == 0xFE || op2 == 0xD4) z = x + y;
                 else z = x - y;
@@ -1267,6 +2574,109 @@ void Exec::sse(std::uint8_t op2, int opsz) {
         else if (a > b) {}
         else if (a < b) s.rflags |= FLAG_CF;
         else s.rflags |= FLAG_ZF;
+        return;
+    }
+    case 0x71: case 0x72: case 0x73: {
+        if (!pd) throw Unsupported{};
+        const Rm rm = decode_rm(rg, 1);
+        const int sub = rg & 7;
+        const unsigned count = u8();
+        std::uint64_t source[2] = {}, dest[2] = {};
+        if (rm.reg) { source[0] = s.xmm[rm.r][0]; source[1] = s.xmm[rm.r][1]; }
+        else { rd_xmm_rm(rm, source); }
+
+        if (op2 == 0x71) {
+            std::uint16_t words[8];
+            std::memcpy(words, source, 16);
+            for (int i = 0; i < 8; ++i) {
+                if (sub == 2) words[i] = (count >= 16) ? 0 : (words[i] >> count);
+                else if (sub == 4) {
+                    std::int16_t sw = static_cast<std::int16_t>(words[i]);
+                    words[i] = static_cast<std::uint16_t>(count >= 16 ? (sw < 0 ? -1 : 0) : (sw >> count));
+                }
+                else if (sub == 6) words[i] = (count >= 16) ? 0 : (words[i] << count);
+                else throw Unsupported{};
+            }
+            std::memcpy(dest, words, 16);
+        } else if (op2 == 0x72) {
+            std::uint32_t dwords[4];
+            std::memcpy(dwords, source, 16);
+            for (int i = 0; i < 4; ++i) {
+                if (sub == 2) dwords[i] = (count >= 32) ? 0 : (dwords[i] >> count);
+                else if (sub == 4) {
+                    std::int32_t sd = static_cast<std::int32_t>(dwords[i]);
+                    dwords[i] = static_cast<std::uint32_t>(count >= 32 ? (sd < 0 ? -1 : 0) : (sd >> count));
+                }
+                else if (sub == 6) dwords[i] = (count >= 32) ? 0 : (dwords[i] << count);
+                else throw Unsupported{};
+            }
+            std::memcpy(dest, dwords, 16);
+        } else if (op2 == 0x73) {
+            if (sub == 2) {
+                dest[0] = (count >= 64) ? 0 : (source[0] >> count);
+                dest[1] = (count >= 64) ? 0 : (source[1] >> count);
+            } else if (sub == 6) {
+                dest[0] = (count >= 64) ? 0 : (source[0] << count);
+                dest[1] = (count >= 64) ? 0 : (source[1] << count);
+            } else if (sub == 3) { // PSRLDQ
+                std::uint8_t b_in[16] = {}, b_out[16] = {};
+                std::memcpy(b_in, source, 16);
+                for (unsigned b = 0; b < 16; ++b) b_out[b] = (b + count < 16) ? b_in[b + count] : 0;
+                std::memcpy(dest, b_out, 16);
+            } else if (sub == 7) { // PSLLDQ
+                std::uint8_t b_in[16] = {}, b_out[16] = {};
+                std::memcpy(b_in, source, 16);
+                for (unsigned b = 0; b < 16; ++b) b_out[b] = (b >= count) ? b_in[b - count] : 0;
+                std::memcpy(dest, b_out, 16);
+            } else throw Unsupported{};
+        }
+        if (rm.reg) { s.xmm[rm.r][0] = dest[0]; s.xmm[rm.r][1] = dest[1]; }
+        else { wr_xmm_rm(rm, dest); }
+        return;
+    }
+    case 0xD1: case 0xD2: case 0xD3:
+    case 0xE1: case 0xE2:
+    case 0xF1: case 0xF2: case 0xF3: {
+        if (!pd) throw Unsupported{};
+        const Rm rm = decode_rm(rg, 0);
+        std::uint64_t count_src[2] = {};
+        if (rm.reg) { count_src[0] = s.xmm[rm.r][0]; count_src[1] = s.xmm[rm.r][1]; }
+        else { rd_xmm_rm(rm, count_src); }
+        const std::uint64_t count = count_src[0];
+        std::uint64_t source[2] = {s.xmm[rg][0], s.xmm[rg][1]}, dest[2] = {};
+
+        if (op2 == 0xD1 || op2 == 0xE1 || op2 == 0xF1) {
+            std::uint16_t words[8];
+            std::memcpy(words, source, 16);
+            for (int i = 0; i < 8; ++i) {
+                if (op2 == 0xD1) words[i] = (count >= 16) ? 0 : (words[i] >> count);
+                else if (op2 == 0xE1) {
+                    std::int16_t sw = static_cast<std::int16_t>(words[i]);
+                    words[i] = static_cast<std::uint16_t>(count >= 16 ? (sw < 0 ? -1 : 0) : (sw >> count));
+                } else words[i] = (count >= 16) ? 0 : (words[i] << count);
+            }
+            std::memcpy(dest, words, 16);
+        } else if (op2 == 0xD2 || op2 == 0xE2 || op2 == 0xF2) {
+            std::uint32_t dwords[4];
+            std::memcpy(dwords, source, 16);
+            for (int i = 0; i < 4; ++i) {
+                if (op2 == 0xD2) dwords[i] = (count >= 32) ? 0 : (dwords[i] >> count);
+                else if (op2 == 0xE2) {
+                    std::int32_t sd = static_cast<std::int32_t>(dwords[i]);
+                    dwords[i] = static_cast<std::uint32_t>(count >= 32 ? (sd < 0 ? -1 : 0) : (sd >> count));
+                } else dwords[i] = (count >= 32) ? 0 : (dwords[i] << count);
+            }
+            std::memcpy(dest, dwords, 16);
+        } else if (op2 == 0xD3 || op2 == 0xF3) {
+            if (op2 == 0xD3) {
+                dest[0] = (count >= 64) ? 0 : (source[0] >> count);
+                dest[1] = (count >= 64) ? 0 : (source[1] >> count);
+            } else {
+                dest[0] = (count >= 64) ? 0 : (source[0] << count);
+                dest[1] = (count >= 64) ? 0 : (source[1] << count);
+            }
+        }
+        s.xmm[rg][0] = dest[0]; s.xmm[rg][1] = dest[1];
         return;
     }
     default: throw Unsupported{};
@@ -1328,6 +2738,7 @@ void Exec::bmi1() {
 }
 
 void Exec::step() {
+    tsc += 2;
     // prefixes
     for (;;) {
         if (pos >= 15) throw UdEx{};
@@ -1354,7 +2765,7 @@ void Exec::step() {
     int rg = 0;
 
     if (op == 0xC5) { avx(false); s.rip = start + pos; return; }
-    if (op == 0xC4 && pos < n && (buf[pos] & 31) == 2) {
+    if (op == 0xC4 && pos + 1 < n && (buf[pos] & 31) == 2 && (buf[pos + 1] & 3) == 0) {
         bmi1();
         s.rip = start + pos;
         return;
@@ -1672,6 +3083,26 @@ void Exec::step() {
         wr_rm(rm, sz, incdec(rd_rm(rm, sz), sz, (rg & 7) == 1));
         break;
     }
+    case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+    case 0xDC: case 0xDD: case 0xDE: case 0xDF: {
+        const Rm rm = decode_rm(rg, 0);
+        const int sub = rg & 7;
+        if (op == 0xD9) {
+            if (sub == 7 && !rm.reg) {
+                // FNSTCW m2byte (Store FPU Control Word)
+                wr_rm(rm, 2, 0x037F);
+            } else if (sub == 5 && !rm.reg) {
+                // FLDCW m2byte (Load FPU Control Word)
+                (void)rd_rm(rm, 2);
+            }
+        } else if (op == 0xDD) {
+            if (sub == 7 && !rm.reg) {
+                // FNSTSW m2byte (Store FPU Status Word)
+                wr_rm(rm, 2, 0x0000);
+            }
+        }
+        break;
+    }
     default: throw Unsupported{};
     }
     s.rip = start + pos;
@@ -1722,7 +3153,7 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
         modrm = (op < 0x40 && (op & 7) < 4) || op == 0x63 || op == 0x69 || op == 0x6B ||
             (op >= 0x80 && op <= 0x8F) || op == 0x8D || (op >= 0xC0 && op <= 0xC1) ||
             (op >= 0xC6 && op <= 0xC7) || (op >= 0xD0 && op <= 0xD3) ||
-            (op >= 0xF6 && op <= 0xF7) || (op >= 0xFE);
+            (op >= 0xF6 && op <= 0xF7) || (op >= 0xFE) || (op >= 0xD8 && op <= 0xDF);
         if (op >= 0xB0 && op <= 0xBF) imm = op < 0xB8 ? 1 : w ? 8 : opsz16 ? 2 : 4;
         if (op < 0x40 && (op & 7) >= 4 && (op & 7) <= 5) imm = (op & 7) == 4 ? 1 : opsz16 ? 2 : 4;
         if (op == 0x68 || op == 0xA9) imm = opsz16 ? 2 : 4;
@@ -1737,7 +3168,8 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
             (op >= 0x70 && op <= 0x8D) || (op >= 0x90 && op <= 0x99) ||
             (op >= 0xA4 && op <= 0xAB) || (op >= 0xB0 && op <= 0xBF) ||
             (op >= 0xC0 && op <= 0xC3) || op == 0xC6 || op == 0xC7 || op == 0xC9 || op == 0xCC ||
-            op == 0xE8 || op == 0xE9 || op == 0xEB || op == 0xF4 || op == 0xF6 || op == 0xF7 || op == 0xFE || op == 0xFF || op == 0x63 || op == 0x68 || op == 0x69 || op == 0x6A;
+            op == 0xE8 || op == 0xE9 || op == 0xEB || op == 0xF4 || op == 0xF6 || op == 0xF7 || op == 0xFE || op == 0xFF || op == 0x63 || op == 0x68 || op == 0x69 || op == 0x6A ||
+            (op >= 0xD8 && op <= 0xDF);
     } else {
         modrm = !(vex && map == 1 && op == 0x77) &&
                 !(map == 1 && (op == 0x05 || op == 0x0B || op == 0x31 || op == 0xA2 || (op >= 0x80 && op <= 0x8F) || (op >= 0xC8 && op <= 0xCF)));
@@ -1746,20 +3178,25 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
         d.supported = !vex && map == 1 && ((op >= 0x80 && op <= 0x9F) ||
             (op >= 0x40 && op <= 0x4F) || (op >= 0xC8 && op <= 0xCF) ||
             op == 0x0B || op == 0x1F || op == 0x1E || op == 0x18 || op == 0x0D ||
+            op == 0x31 || op == 0xA2 || op == 0x05 || op == 0x01 ||
             op == 0xAF || op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF ||
             op == 0xB0 || op == 0xB1 || op == 0xC0 || op == 0xC1 || op == 0xBA ||
             op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB || op == 0xBC || op == 0xBD || op == 0xB8 ||
             op == 0x10 || op == 0x11 || op == 0x12 || op == 0x13 || op == 0x14 || op == 0x15 ||
-            op == 0x16 || op == 0x17 || op == 0x28 || op == 0x29 || op == 0x6F || op == 0x7F ||
-            op == 0x6E || op == 0x7E || op == 0xD6 || op == 0xEF || op == 0x57 ||
+            op == 0x16 || op == 0x17 || op == 0x28 || op == 0x29 || op == 0x2B || op == 0x6F || op == 0x7F || op == 0xE7 ||
+            op == 0x50 || op == 0x6E || op == 0x7E || op == 0xD6 || op == 0xEF || op == 0x57 ||
             (op >= 0x54 && op <= 0x5F) || (op >= 0x58 && op <= 0x62) ||
-            op == 0x68 || op == 0x69 || op == 0x6A || op == 0x6C || op == 0x6D || op == 0xDB || op == 0xDF || op == 0xEB ||
-            (op >= 0xF8 && op <= 0xFE) || (op >= 0x74 && op <= 0x76) || op == 0xD4 || op == 0xD5 || op == 0xD7 ||
-            op == 0x70 || op == 0xC6 || (op >= 0x2A && op <= 0x2F));
+            (op >= 0x60 && op <= 0x6D) || op == 0xDB || op == 0xDF || op == 0xEB ||
+            (op >= 0xF8 && op <= 0xFE) || (op >= 0x74 && op <= 0x76) || (op >= 0x64 && op <= 0x66) || op == 0xD4 || op == 0xD5 || op == 0xD7 ||
+            op == 0x70 || op == 0xC6 || op == 0xC2 || (op >= 0x2A && op <= 0x2F) || op == 0xAE ||
+            (((op >= 0x71 && op <= 0x73) || (op >= 0xD1 && op <= 0xD3) || (op >= 0xE1 && op <= 0xE2) || (op >= 0xF1 && op <= 0xF3)) && pp == 1));
         if (vex3 && map == 2 && pp == 0 && (op == 0xF2 || op == 0xF3 || op == 0xF7) &&
             !(b[p - 2] & 4) && !legacy_prefix && !rex_prefix) d.supported = true;
         if (vex && map == 1 && !legacy_prefix && !rex_prefix &&
             ((op == 0x77 && pp == 0 && !(b[p - 2] & 4)) ||
+             (op == 0x50 && pp <= 1) ||
+             (op == 0xAE && pp == 0 && !(b[p - 2] & 4)) ||
+             (op == 0xD7 && pp == 1) ||
              (op == 0x6E && pp == 1 && !(b[p - 2] & 4)) ||
              (op == 0x7E && (pp == 1 || pp == 2) && !(b[p - 2] & 4)) ||
              (op == 0xD6 && pp == 1 && !(b[p - 2] & 4)) ||
@@ -1769,21 +3206,39 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
              ((op == 0x12 || op == 0x13 || op == 0x16 || op == 0x17) && (pp >= 2 || !(b[p - 2] & 4))) ||
              ((op == 0x14 || op == 0x15) && pp <= 1) ||
              ((op == 0x2E || op == 0x2F) && pp <= 1 && !(b[p - 2] & 4)) ||
-             ((op == 0x28 || op == 0x29 || op == 0x57 || op == 0xEF || op == 0xDB || op == 0xEB) && pp <= 1) ||
-             (((op >= 0x51 && op <= 0x53) || op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E) && (pp <= 1 || !(b[p - 2] & 4))) ||
+             ((op == 0x28 || op == 0x29 || op == 0x57 || op == 0xEF || op == 0xDB || op == 0xEB || op == 0x2B || op == 0xE7) && pp <= 1) ||
+             (((op >= 0x51 && op <= 0x53) || op == 0x58 || op == 0x59 || op == 0x5A || op == 0x5B || op == 0x5C || op == 0x5E || op == 0xC2) && (pp <= 1 || !(b[p - 2] & 4))) ||
              ((op == 0x6F || op == 0x7F) && (pp == 1 || pp == 2)) ||
              ((op == 0x7C || op == 0x7D) && (pp == 1 || pp == 3)) ||
-             (((op >= 0x60 && op <= 0x62) || op == 0x6C || (op >= 0x68 && op <= 0x6A) || op == 0x6D) && pp == 1) ||
+             ((op >= 0x60 && op <= 0x6D) && pp == 1) ||
              ((op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4 ||
                op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB) && pp == 1) ||
              ((op == 0x54 || op == 0x55 || op == 0x56) && pp <= 1) ||
              (op == 0xDF && pp == 1) ||
              ((op == 0x5F || op == 0x5D) && pp <= 1) ||
-             (((op >= 0x51 && op <= 0x53) || op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E || op == 0x5F || op == 0x5D) && pp >= 2) ||
+             (((op >= 0x51 && op <= 0x53) || op == 0x58 || op == 0x59 || op == 0x5A || op == 0x5B || op == 0x5C || op == 0x5E || op == 0x5F || op == 0x5D || op == 0xC2) && pp >= 2) ||
              (op == 0x70 && pp == 1) ||
-             (op == 0xC6 && pp <= 1))) d.supported = true;
-        if (!vex && map == 2 && pp == 1 && (op == 0x00 || op == 0x40)) d.supported = true;
-        if (!vex && map == 3 && pp == 1 && op == 0x0F) d.supported = true;
+             (op == 0xC6 && pp <= 1) ||
+             (((op >= 0x71 && op <= 0x73) || (op >= 0xD1 && op <= 0xD3) ||
+               (op >= 0xE1 && op <= 0xE2) || (op >= 0xF1 && op <= 0xF3) ||
+               (op >= 0x74 && op <= 0x76) || (op >= 0x64 && op <= 0x66)) && pp == 1))) d.supported = true;
+        if (!vex && map == 2 && ((pp == 1 &&
+            (op == 0x00 || op == 0x01 || op == 0x02 || op == 0x03 || op == 0x40 || (op >= 0x38 && op <= 0x3F) || (op >= 0x1C && op <= 0x1E) ||
+             op == 0x28 || op == 0x29 || op == 0x2A || op == 0x2B || (op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x37))) ||
+            ((pp == 0 || pp == 1) && (op == 0xF0 || op == 0xF1)))) d.supported = true;
+        if (!vex && map == 3 && pp == 1 &&
+            (op == 0x08 || op == 0x09 || op == 0x0A || op == 0x0B ||
+             op == 0x40 || op == 0x41 ||
+             op == 0x0F || op == 0x14 || op == 0x15 || op == 0x16 || op == 0x17 || op == 0x20 || op == 0x22)) d.supported = true;
+        if (vex && map == 2 && pp == 1 && !legacy_prefix && !rex_prefix &&
+            (op == 0x00 || op == 0x01 || op == 0x02 || op == 0x03 || op == 0x18 || op == 0x19 || op == 0x1A || op == 0x40 || op == 0x58 || op == 0x59 || (op >= 0x38 && op <= 0x3F) || (op >= 0x1C && op <= 0x1E) ||
+             op == 0x28 || op == 0x29 || op == 0x2A || op == 0x2B || (op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x37))) d.supported = true;
+        if (vex && map == 3 && pp == 1 && !legacy_prefix && !rex_prefix &&
+            (op == 0x08 || op == 0x09 || op == 0x0A || op == 0x0B ||
+             op == 0x40 || op == 0x41 ||
+             op == 0x4A || op == 0x4B || op == 0x4C || op == 0x0C || op == 0x0D || op == 0x0E ||
+             op == 0x0F || op == 0x18 || op == 0x19 || op == 0x21 ||
+             op == 0x14 || op == 0x15 || op == 0x16 || op == 0x17 || op == 0x20 || op == 0x22)) d.supported = true;
     }
     if (modrm) {
         if (p >= n) return X86Decoded{};
@@ -1841,9 +3296,10 @@ bool X86Interpreter::in_trap(std::uint64_t rip) const {
 
 CpuRunResult X86Interpreter::run(std::uint64_t max_steps) {
     CpuRunResult out;
-    Exec e(state, mem_);
+    Exec e(state, mem_, tsc_);
     while (out.steps < max_steps) {
         out.rip = state.rip;
+        recent_traces_[recent_rips_count_++ % 1024] = { state.rip, state.gpr[5], state.gpr[4] };
         if (in_trap(state.rip)) { out.stop = CpuStop::trap; return out; }
         e.start = state.rip;
         e.pos = e.n = 0;

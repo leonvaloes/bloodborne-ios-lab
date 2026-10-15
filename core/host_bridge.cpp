@@ -57,6 +57,7 @@ bool HostBridge::init(const HostBridgeConfig& config) {
     boot_config.essential_asset_paths = config_.essential_asset_paths;
     boot_config.require_essential_assets = config_.require_essential_assets;
     boot_config.enable_hle = config_.enable_hle;
+    boot_config.use_scheduler = config_.use_scheduler;
 
     boot_coordinator_.attach_video_out(&video_out_);
     boot_coordinator_.attach_input_manager(&input_);

@@ -199,8 +199,8 @@ int main() {
     assert(call("pthread_key_delete", pkey) == 0);
     assert(call("sceKernelClockGettime",1,0x2060)==0);
     assert(call("sceKernelClockGettime",1,0)==0x80020016);
-    assert(call("sceSysmoduleLoadModule",1)==0x80020002);
-    assert(call("sceAppContentInitialize",0)==0x80020002);
+    assert(call("sceSysmoduleLoadModule",1)==0);
+    assert(call("sceAppContentInitialize",0,0)==0);
     assert(call("atexit",0)==0x80020016);
     assert(call("atexit",0x1234)==0);
     bool failed=false;

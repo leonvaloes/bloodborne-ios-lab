@@ -306,6 +306,10 @@ Ps4Image link(GuestMemory& memory, Module main, std::vector<std::pair<std::strin
                     else {
                         auto key=m.identity(s.name);
                         require(!key.nid.empty(),"import sem identidade");
+                        if (key.nid == "H2e8t5ScQGc" || key.nid == "ioKMruft1ek" || key.nid == "5bBacGLyLOs") {
+                            std::printf("[IMPORT IDENT] name=%s -> lib=%s mod=%s libver=%u modver=%u\n",
+                                        s.name.c_str(), key.lib.c_str(), key.mod.c_str(), key.libver, key.modver);
+                        }
                         auto found=imports.find(key);
                         std::size_t index;
                         if (found==imports.end()) {

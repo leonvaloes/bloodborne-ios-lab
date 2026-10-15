@@ -165,7 +165,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_compile_options(bb-ios-lab PRIVATE -fobjc-arc)
     target_link_libraries(bb-ios-lab PRIVATE bb_core
         "-framework UIKit" "-framework Metal" "-framework MetalKit"
-        "-framework Foundation" "-framework QuartzCore" "-framework AudioToolbox")
+        "-framework Foundation" "-framework QuartzCore" "-framework AudioToolbox" "-framework GameController")
     set_target_properties(bb-ios-lab PROPERTIES
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist"
         XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "org.bloodborne.lab.bridge-prototype"

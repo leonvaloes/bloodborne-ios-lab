@@ -25,7 +25,11 @@ public:
     // Caller maps disjoint stacks; create() places the return trap at the
     // SysV entry rsp (rsp % 16 == 8), with [rsp, rsp+8) inside the stack.
     Id create(std::uint64_t entry, std::uint64_t stack_bottom, std::uint64_t stack_top,
-              std::uint64_t return_trap, std::uint64_t argument = 0);
+              std::uint64_t return_trap, std::uint64_t argument = 0, std::uint64_t fs_base = 0);
+    // Adopts an existing thread CPU state (e.g. main thread set up by bootstrap) into the scheduler.
+    Id adopt(const CpuState& state, std::uint64_t stack_bottom, std::uint64_t stack_top);
+    bool has_thread(Id id) const { return threads_.find(id) != threads_.end(); }
+    std::size_t thread_count() const { return threads_.size(); }
     std::int32_t start(Id id);
     std::int32_t exit(Id id, std::uint64_t value);
     std::int32_t join(Id caller, Id target, std::uint64_t* value = nullptr,
@@ -38,6 +42,7 @@ public:
     Result run(std::uint64_t max_steps);
     void advance(std::uint64_t microseconds);
     std::uint64_t now() const { return now_; }
+    std::vector<X86Interpreter::TraceItem> recent_traces() const { return interpreter_.recent_traces(); }
     std::int32_t sleep(Id id, std::uint64_t microseconds);
     Id mutex_create(bool recursive = false);
     std::int32_t lock(Id thread, Id mutex, std::uint64_t timeout = 0);

@@ -14,7 +14,10 @@ namespace bb {
 constexpr std::size_t SCE_DIALOG_MAX_STRING_LENGTH = 256;
 
 // Código de sucesso canônico Orbis
+#ifndef SCE_OK_DEFINED
+#define SCE_OK_DEFINED
 constexpr std::int32_t SCE_OK = 0;
+#endif
 
 // Códigos de erro PS4 libSceCommonDialog
 constexpr std::int32_t SCE_COMMON_DIALOG_ERROR_NOT_INITIALIZED     = static_cast<std::int32_t>(0x80800001);

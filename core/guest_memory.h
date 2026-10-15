@@ -20,6 +20,9 @@ public:
     MemoryError load(std::uint64_t address, void* destination, std::size_t size) const;
     MemoryError store(std::uint64_t address, const void* source, std::size_t size);
     std::size_t used() const;
+    std::size_t budget() const { return budget_; }
+    bool query_region(std::uint64_t address, std::uint64_t& base, std::size_t& size, unsigned& perm) const;
+
 
     // F5: Atomic memory operations (equivalent to x86 LOCK prefix)
     MemoryError atomic_fetch_add_u64(std::uint64_t address, std::uint64_t delta, std::uint64_t& old_val);

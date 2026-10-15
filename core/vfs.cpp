@@ -351,7 +351,7 @@ VfsError VirtualFileSystem::read_file(const std::string &virtual_path, std::vect
     VfsError err = resolve(virtual_path, host_path, ro);
     if (err != VfsError::ok) return err;
 
-    std::ifstream file(host_path, std::ios::binary | std::ios::ate);
+    std::ifstream file(std::filesystem::u8path(host_path), std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return VfsError::not_found;
     }

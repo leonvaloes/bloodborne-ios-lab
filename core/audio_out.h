@@ -39,7 +39,10 @@ enum SceAudioOutVolumeFlag : std::int32_t {
 };
 
 // Códigos de erro PS4 SCE
-constexpr std::int32_t SCE_OK                                 = 0;
+#ifndef SCE_OK_DEFINED
+#define SCE_OK_DEFINED
+constexpr std::int32_t SCE_OK = 0;
+#endif
 constexpr std::int32_t SCE_AUDIO_OUT_ERROR_NOT_OPENED         = static_cast<std::int32_t>(0x80260001);
 constexpr std::int32_t SCE_AUDIO_OUT_ERROR_BUSY               = static_cast<std::int32_t>(0x80260002);
 constexpr std::int32_t SCE_AUDIO_OUT_ERROR_INVALID_PORT       = static_cast<std::int32_t>(0x80260003);

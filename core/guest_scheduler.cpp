@@ -12,7 +12,7 @@ GuestScheduler::GuestScheduler(GuestMemory& memory, std::uint64_t quantum)
 void GuestScheduler::add_trap_range(std::uint64_t base, std::uint64_t size) { interpreter_.add_trap_range(base, size); }
 GuestScheduler::Thread* GuestScheduler::find(Id id) { auto it=threads_.find(id); return it==threads_.end()?nullptr:&it->second; }
 const GuestScheduler::Thread* GuestScheduler::find(Id id) const { auto it=threads_.find(id); return it==threads_.end()?nullptr:&it->second; }
-GuestScheduler::Id GuestScheduler::create(std::uint64_t entry, std::uint64_t bottom, std::uint64_t top, std::uint64_t ret, std::uint64_t arg) {
+GuestScheduler::Id GuestScheduler::create(std::uint64_t entry, std::uint64_t bottom, std::uint64_t top, std::uint64_t ret, std::uint64_t arg, std::uint64_t fs_base) {
     if (!entry || !ret || bottom>=top || top-bottom<16 || top<8 || next_==0) return 0;
     for (const auto& kv:threads_) if (bottom<kv.second.stack_top && kv.second.stack_bottom<top) return 0;
     // The return address occupies [rsp, rsp+8); at SysV function entry rsp % 16 == 8.
@@ -20,7 +20,23 @@ GuestScheduler::Id GuestScheduler::create(std::uint64_t entry, std::uint64_t bot
     if (slot<bottom || mem_.store(slot,&ret,8)!=MemoryError::ok) return 0;
     const Id id=next_++;
     auto& t=threads_[id]; t.cpu.rip=entry; t.cpu.gpr[4]=slot; t.cpu.gpr[7]=arg;
+    t.cpu.rflags = 0x202;
+    if (fs_base) {
+        t.cpu.fs_base = fs_base;
+    } else if (!threads_.empty() && threads_.count(1)) {
+        t.cpu.fs_base = threads_.at(1).cpu.fs_base;
+    }
     t.stack_bottom=bottom; t.stack_top=top;
+    return id;
+}
+GuestScheduler::Id GuestScheduler::adopt(const CpuState& state, std::uint64_t bottom, std::uint64_t top) {
+    const Id id = next_++;
+    auto& t = threads_[id];
+    t.cpu = state;
+    t.stack_bottom = bottom;
+    t.stack_top = top;
+    t.state = State::ready;
+    ready_.push_back(id);
     return id;
 }
 std::int32_t GuestScheduler::start(Id id) {
@@ -30,6 +46,7 @@ std::int32_t GuestScheduler::start(Id id) {
 }
 void GuestScheduler::ready(Id id, std::int32_t result) {
     auto* t=find(id); if (!t || t->state!=State::waiting) return;
+    if (id == 1 || id == 1717) std::printf("[SCHED] ready TID %u res=0x%x\n", id, result);
     t->state=State::ready; t->wait=Wait::none; t->timed=false; t->result=result; ready_.push_back(id);
 }
 void GuestScheduler::block(Id id, Wait kind, Id object, std::uint64_t timeout, std::int32_t need) {
@@ -145,9 +162,17 @@ std::int32_t GuestScheduler::unlock(Id tid, Id id) {
 GuestScheduler::Id GuestScheduler::cond_create() { Id id=next_++; conds_[id]; return id; }
 std::int32_t GuestScheduler::cond_wait(Id tid, Id cid, Id mid, std::uint64_t timeout) {
     auto* t=find(tid); auto c=conds_.find(cid); auto m=mutexes_.find(mid);
-    if (!t || t->state!=State::ready || c==conds_.end() || m==mutexes_.end() || m->second.owner!=tid || m->second.depth!=1) return ORBIS_KERNEL_ERROR_EINVAL;
+    if (!t || t->state!=State::ready || c==conds_.end() || m==mutexes_.end()) return ORBIS_KERNEL_ERROR_EINVAL;
+    if (m->second.owner != tid) {
+        if (m->second.owner == 0) {
+            m->second.owner = tid;
+            m->second.depth = 1;
+        } else {
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+    }
     block(tid,Wait::cond,cid,timeout); t->mutex=mid; c->second.waiters.push_back(tid);
-    m->second.depth=0; acquire_next(mid); return ORBIS_OK;
+    m->second.depth=0; m->second.owner=0; acquire_next(mid); return ORBIS_OK;
 }
 void GuestScheduler::reacquire(Id tid, Id mid, std::int32_t result) {
     auto* t=find(tid); if (!t || t->state!=State::waiting || (t->wait!=Wait::cond && t->wait!=Wait::reacquire)) return;
@@ -161,6 +186,7 @@ std::int32_t GuestScheduler::cond_signal(Id cid, bool broadcast) {
         Id tid=it->second.waiters.front(); it->second.waiters.pop_front();
         auto* t=find(tid);
         if (t && t->state==State::waiting && t->wait==Wait::cond && t->object==cid) {
+            std::printf("[SCHED] cond_signal cid=%u waking TID %u\n", cid, tid);
             reacquire(tid,t->mutex,ORBIS_OK); if (!broadcast) break;
         }
     }

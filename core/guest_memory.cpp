@@ -84,6 +84,18 @@ std::size_t GuestMemory::used() const {
     return used_;
 }
 
+bool GuestMemory::query_region(std::uint64_t address, std::uint64_t& base, std::size_t& size, unsigned& perm) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = regions_.upper_bound(address);
+    if (it == regions_.begin()) return false;
+    --it;
+    if (address < it->first || address >= it->first + it->second.bytes.size()) return false;
+    base = it->first;
+    size = it->second.bytes.size();
+    perm = it->second.permissions;
+    return true;
+}
+
 MemoryError GuestMemory::atomic_fetch_add_u64(std::uint64_t address, std::uint64_t delta, std::uint64_t& old_val) {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!valid_span(address, sizeof(std::uint64_t))) return MemoryError::invalid;

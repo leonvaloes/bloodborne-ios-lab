@@ -10,6 +10,7 @@
 #include "orbis_runtime.h"
 #include "x86_interp.h"
 #include "guest_memory.h"
+#include "guest_scheduler.h"
 #include "input.h"
 
 #include <cstdint>
@@ -71,6 +72,9 @@ struct BootConfig {
 
     // Habilita resolução HLE de imports durante execução
     bool enable_hle{true};
+
+    // Habilita escalonador multithread cooperativo para o guest
+    bool use_scheduler{true};
 };
 
 struct BootDiagnostics {
@@ -174,6 +178,9 @@ public:
     OrbisRuntime* runtime();
     const OrbisRuntime* runtime() const;
 
+    GuestScheduler* scheduler() { return scheduler_.get(); }
+    const GuestScheduler* scheduler() const { return scheduler_.get(); }
+
     const Ps4Image& image() const;
     const BootConfig& config() const;
     const PackageInspectionReport& package_report() const;
@@ -194,6 +201,7 @@ private:
     Ps4Image image_;
     std::unique_ptr<X86Interpreter> cpu_;
     std::unique_ptr<OrbisRuntime> runtime_;
+    std::unique_ptr<GuestScheduler> scheduler_;
     VideoOutManager* video_out_{nullptr};
     InputManager* input_manager_{nullptr};
     std::uint64_t tcb_address_{0};
