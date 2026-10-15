@@ -104,7 +104,7 @@ int main() {
             CHECK((m.cpu.state.rflags & FLAG_CF) != 0);
         }
         {   // Shift com count mascarado para zero lê memória, mas não escreve em página readonly.
-            for (const std::uint8_t count : {0, 32}) {
+            for (const std::uint8_t count : {std::uint8_t{0}, std::uint8_t{32}}) {
                 Machine m{0xC1, 0x27, count, 0xC3}; // shl dword ptr [rdi], imm8
                 m.cpu.state.gpr[7] = DATA;
                 m.cpu.state.rflags = 2 | FLAG_CF | FLAG_OF | FLAG_ZF;
