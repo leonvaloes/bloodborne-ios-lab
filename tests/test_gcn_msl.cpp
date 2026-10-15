@@ -111,6 +111,13 @@ int main() { return run([] {
     CHECK(msl_vert.text.find("as_type<float>(a) * as_type<float>(b)") != std::string::npos);
     CHECK(msl_vert.text.find("result.position = float4") != std::string::npos);
 
+    // 2b. Trivial pixel/fragment shader
+    auto msl_pixel = translate_msl(ir, bb::ShaderStage::Pixel);
+    CHECK(msl_pixel.error.empty());
+    CHECK(msl_pixel.text.find("fragment GcnFragmentOut gcn_fragment") != std::string::npos);
+    CHECK(msl_pixel.text.find("struct GcnFragmentOut { float4 color [[color(0)]]; };") != std::string::npos);
+    CHECK(msl_pixel.text.find("result.color = float4") != std::string::npos);
+
     // Snapshot exact text check
     const std::string expected_snapshot =
         "#include <metal_stdlib>\n"

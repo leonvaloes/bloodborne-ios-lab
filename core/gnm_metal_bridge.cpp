@@ -91,8 +91,7 @@ bb::gcn::Program GcnDecoder::decode(const std::uint32_t* words, std::size_t word
 }
 
 bb::gcn::MslResult GcnMslTranslator::translate(const bb::gcn::ProgramIR& ir, ShaderStage stage) {
-    bool vertex = (stage == ShaderStage::Vertex);
-    return bb::gcn::translate_msl(ir, vertex);
+    return bb::gcn::translate_msl(ir, stage);
 }
 
 // =============================================================================

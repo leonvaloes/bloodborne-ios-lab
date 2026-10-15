@@ -36,7 +36,7 @@ const char* reason(const Node& n) {
 }
 } // namespace
 
-MslResult translate_msl(const ProgramIR& ir, bool vertex) {
+MslResult translate_msl(const ProgramIR& ir, ShaderStage stage) {
     if (!ir.complete) return {"", "IR has diagnostics: " +
         (ir.diagnostics.empty() ? std::string("incomplete") : ir.diagnostics.front())};
     if (ir.blocks.size() != 1 || ir.blocks[0].nodes.empty() ||
@@ -78,15 +78,31 @@ MslResult translate_msl(const ProgramIR& ir, bool vertex) {
     std::ostringstream out;
     out << "#include <metal_stdlib>\nusing namespace metal;\n"
         << "struct GcnRegisters { uint s[104]; uint v[256]; };\n";
-    if (vertex) out << "struct GcnVertexOut { float4 position [[position]]; };\n"
-                    << "vertex GcnVertexOut gcn_vertex(const device GcnRegisters* input [[buffer(0)]], uint id [[vertex_id]]) {\n"
-                    << "    GcnRegisters r = input[id];\n";
-    else out << "kernel void gcn_compute(device GcnRegisters* files [[buffer(0)]], uint id [[thread_position_in_grid]]) {\n"
-             << "    GcnRegisters r = files[id];\n";
+    if (stage == ShaderStage::Vertex) {
+        out << "struct GcnVertexOut { float4 position [[position]]; };\n"
+            << "vertex GcnVertexOut gcn_vertex(const device GcnRegisters* input [[buffer(0)]], uint id [[vertex_id]]) {\n"
+            << "    GcnRegisters r = input[id];\n";
+    } else if (stage == ShaderStage::Pixel) {
+        out << "struct GcnFragmentOut { float4 color [[color(0)]]; };\n"
+            << "fragment GcnFragmentOut gcn_fragment(const device GcnRegisters* input [[buffer(0)]], uint id [[primitive_id]]) {\n"
+            << "    GcnRegisters r = input ? input[0] : GcnRegisters{};\n";
+    } else {
+        out << "kernel void gcn_compute(device GcnRegisters* files [[buffer(0)]], uint id [[thread_position_in_grid]]) {\n"
+            << "    GcnRegisters r = files[id];\n";
+    }
     out << "    uint scc = 0u;\n" << body.str() << "    (void)scc;\n";
-    if (vertex) out << "    GcnVertexOut result;\n    result.position = float4(as_type<float>(r.v[0]), as_type<float>(r.v[1]), as_type<float>(r.v[2]), as_type<float>(r.v[3]));\n    return result;\n";
-    else out << "    files[id] = r;\n";
+    if (stage == ShaderStage::Vertex) {
+        out << "    GcnVertexOut result;\n    result.position = float4(as_type<float>(r.v[0]), as_type<float>(r.v[1]), as_type<float>(r.v[2]), as_type<float>(r.v[3]));\n    return result;\n";
+    } else if (stage == ShaderStage::Pixel) {
+        out << "    GcnFragmentOut result;\n    result.color = float4(as_type<float>(r.v[0]), as_type<float>(r.v[1]), as_type<float>(r.v[2]), as_type<float>(r.v[3]));\n    return result;\n";
+    } else {
+        out << "    files[id] = r;\n";
+    }
     out << "}\n";
     return {out.str(), ""};
+}
+
+MslResult translate_msl(const ProgramIR& ir, bool vertex) {
+    return translate_msl(ir, vertex ? ShaderStage::Vertex : ShaderStage::Compute);
 }
 } // namespace bb::gcn

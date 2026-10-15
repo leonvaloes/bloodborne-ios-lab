@@ -7,6 +7,7 @@
 #include "save_data.h"
 #include "audio_out.h"
 #include "video_out.h"
+#include "gnm_rasterizer.h"
 #include "ps4_loader.h"
 #include <cstdio>
 #include <cstdint>
@@ -47,6 +48,10 @@ public:
     const VideoOutManager* video_out() const { return video_out_; }
     GnmContext* gnm_context() { return gnm_context_.get(); }
     const GnmContext* gnm_context() const { return gnm_context_.get(); }
+    GnmRasterizer& rasterizer() { return rasterizer_; }
+    const GnmRasterizer& rasterizer() const { return rasterizer_; }
+    std::uint64_t submit_count() const { return submit_count_; }
+    const RasterizerStats& rasterizer_stats() const { return rasterizer_stats_; }
     void set_procparam(std::uint64_t address) { procparam_ = address; }
     std::uint64_t procparam() const { return procparam_; }
     void set_tls_template(const Ps4Tls& t) { tls_template_ = t; }
@@ -112,6 +117,9 @@ private:
     AudioOutManager audio_mgr_;
     VideoOutManager* video_out_ = nullptr;
     std::unique_ptr<GnmContext> gnm_context_;
+    GnmRasterizer rasterizer_;
+    std::uint64_t submit_count_ = 0;
+    RasterizerStats rasterizer_stats_{};
     std::filesystem::path app0_dir_;
     struct KernelFileEntry {
         FILE* fp = nullptr;

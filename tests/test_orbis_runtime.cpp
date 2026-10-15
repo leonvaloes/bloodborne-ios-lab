@@ -512,6 +512,23 @@ int main() {
         std::uint64_t flip_seq = 0;
         assert(m.load(status_addr, &flip_seq, 8) == MemoryError::ok && flip_seq == 1);
 
+        // Submissão PM4 com flip via sceGnmSubmitAndFlipCommandBuffers
+        std::uint32_t pm4_cmds[] = {
+            0xC0001000, 0x00000000 // NOP
+        };
+        constexpr std::uint64_t dcb_addr = 0x6500;
+        constexpr std::uint64_t dcb_ptr_table = 0x6600;
+        constexpr std::uint64_t dcb_size_table = 0x6650;
+        assert(m.store(dcb_addr, pm4_cmds, sizeof(pm4_cmds)) == MemoryError::ok);
+        assert(m.store(dcb_ptr_table, &dcb_addr, 8) == MemoryError::ok);
+        std::uint32_t dcb_size_bytes = sizeof(pm4_cmds);
+        assert(m.store(dcb_size_table, &dcb_size_bytes, 4) == MemoryError::ok);
+
+        assert(call("sceGnmSubmitAndFlipCommandBuffers", 1, dcb_ptr_table, dcb_size_table, 0, 0, 0, 99, 42) == 0);
+        assert(rt.submit_count() == 1);
+        assert(vom.has_new_frame());
+        assert(vom.flip_count() == 2);
+
         assert(call("sceVideoOutClose", vh) == 0);
     }
 

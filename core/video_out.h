@@ -3,9 +3,11 @@
 #include "guest_memory.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <limits>
 #include <vector>
 
@@ -94,13 +96,21 @@ public:
 
     // Anexa guest memory e sink para habilitar validação completa via VideoOut
     void attach_guest_memory(const GuestMemory* memory, VideoOutSink* sink) {
-        detach_guest_memory();
+        std::lock_guard<std::mutex> lock(mutex_);
+        video_out_.reset();
+        memory_ = nullptr;
+        internal_last_flip_ = {};
+        internal_sequence_ = 0;
+        internal_has_new_frame_ = false;
+        std::fill(internal_occupied_.begin(), internal_occupied_.end(), false);
+        std::fill(internal_buffers_.begin(), internal_buffers_.end(), VideoBuffer{});
         if (memory && sink) {
             memory_ = memory;
             video_out_ = std::make_unique<VideoOut>(*memory, *sink);
         }
     }
     void detach_guest_memory() {
+        std::lock_guard<std::mutex> lock(mutex_);
         video_out_.reset();
         memory_ = nullptr;
         internal_last_flip_ = {};
@@ -118,6 +128,7 @@ public:
         if (status != VideoStatus::ok) return status;
         if (buffer.address > std::numeric_limits<std::uint64_t>::max() - bytes)
             return VideoStatus::overflow;
+        std::lock_guard<std::mutex> lock(mutex_);
         if (video_out_) {
             return video_out_->register_buffer(index, buffer);
         }
@@ -129,6 +140,7 @@ public:
 
     VideoStatus unregister_buffer(std::uint32_t index) {
         if (index >= max_buffers_) return VideoStatus::missing;
+        std::lock_guard<std::mutex> lock(mutex_);
         if (video_out_) {
             return video_out_->unregister_buffer(index);
         }
@@ -141,6 +153,7 @@ public:
     // Submete flip (guest pode chamar via HLE)
     VideoStatus submit_flip(std::uint32_t index, std::uint64_t argument) {
         if (index >= max_buffers_) return VideoStatus::missing;
+        std::lock_guard<std::mutex> lock(mutex_);
         if (video_out_) {
             auto status = video_out_->submit_flip(index, argument);
             if (status == VideoStatus::ok) {
@@ -159,6 +172,7 @@ public:
     // Consulta buffer
     const VideoBuffer* buffer(std::uint32_t index) const {
         if (index >= max_buffers_) return nullptr;
+        std::lock_guard<std::mutex> lock(mutex_);
         if (video_out_) {
             return video_out_->buffer(index);
         }
@@ -174,6 +188,7 @@ public:
 
     bool read_current_frame_pixels(HostFrameBuffer& out_frame) const {
         out_frame = {};
+        std::lock_guard<std::mutex> lock(mutex_);
         if (!video_out_ || !memory_ || !internal_last_flip_.sequence) return false;
         const auto index = internal_last_flip_.buffer_index;
         const VideoBuffer* buf = video_out_->buffer(index);
@@ -199,16 +214,16 @@ public:
     }
 
     std::uint64_t flip_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return video_out_ ? video_out_->flip_count() : internal_sequence_;
     }
     FlipEvent last_flip() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return video_out_ ? video_out_->last_flip() : internal_last_flip_;
     }
-    bool has_new_frame() const { return internal_has_new_frame_; }
+    bool has_new_frame() const { return internal_has_new_frame_.load(std::memory_order_acquire); }
     bool consume_new_frame() {
-        const bool has = internal_has_new_frame_;
-        internal_has_new_frame_ = false;
-        return has;
+        return internal_has_new_frame_.exchange(false, std::memory_order_acq_rel);
     }
 
     // Acesso ao VideoOut interno (para leitura de pixels do guest memory)
@@ -226,6 +241,7 @@ private:
         bytes = static_cast<std::size_t>(row * buf.height);
         return VideoStatus::ok;
     }
+    mutable std::mutex mutex_;
     std::uint32_t max_buffers_;
     const GuestMemory* memory_ = nullptr;
     std::unique_ptr<VideoOut> video_out_;
@@ -233,6 +249,6 @@ private:
     std::vector<bool> internal_occupied_;
     std::uint64_t internal_sequence_ = 0;
     FlipEvent internal_last_flip_{};
-    mutable bool internal_has_new_frame_ = false;
+    mutable std::atomic<bool> internal_has_new_frame_{false};
 };
 } // namespace bb

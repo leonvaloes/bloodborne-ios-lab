@@ -122,6 +122,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     } _guestFlipSink;
     bb::InputManager _inputManager;
     bb::TouchControlsOverlay _touchOverlay;
+    dispatch_queue_t _guestExecutionQueue;
+    std::atomic<bool> _guestStepping;
+    std::atomic<bool> _guestBooting;
+    std::uint64_t _lastGuestSteps;
 
     // Subsistema Metal 3
     id<MTLCommandQueue> _queue;
@@ -190,6 +194,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     } mutableCopy];
 
     _lastFrameTime = std::chrono::steady_clock::now();
+    _guestStepping.store(false);
+    _guestBooting.store(false);
+    _lastGuestSteps = 0;
+    _guestExecutionQueue = dispatch_queue_create("org.bloodborne.lab.guest", DISPATCH_QUEUE_SERIAL);
     _touchOverlay.bind_input_manager(&_inputManager);
     _touchOverlay.set_left_stick_mode(bb::StickMode::Floating);
     _touchOverlay.set_right_stick_mode(bb::StickMode::Floating);
@@ -951,10 +959,14 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 #pragma mark - Game Execution Engine
 
 - (void)initGameBoot {
+    if (_guestBooting.exchange(true)) {
+        return;
+    }
     NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
         inDomains:NSUserDomainMask] firstObject];
     if (!documents) {
         _gameBootStatus.text = @"Motor Bloodborne: pasta Documents indisponível.";
+        _guestBooting.store(false);
         return;
     }
 
@@ -962,6 +974,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     if (!gameDir) {
         _gameBootStatus.text = @"Motor: eboot.bin não encontrado em Documentos.";
         [self showWelcomeCard];
+        _guestBooting.store(false);
         return;
     }
     NSString *dataDir = [gameDir stringByAppendingPathComponent:@"dvdroot_ps4"];
@@ -969,8 +982,12 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     if (![[NSFileManager defaultManager] fileExistsAtPath:dataDir isDirectory:&isDirectory] || !isDirectory) {
         _gameBootStatus.text = @"Motor: dvdroot_ps4 ausente; dados do jogo incompletos.";
         [self showWelcomeCard];
+        _guestBooting.store(false);
         return;
     }
+
+    _gameBootStatus.text = @"Iniciando motor e módulos em segundo plano...";
+    _topStatusLabel.text = @"⚙ Carregando módulos...";
 
     bb::BootConfig config;
     config.base_dir = gameDir.UTF8String;
@@ -987,66 +1004,79 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _report[@"guest_frame_presented_to_metal"] = @NO;
     _report[@"guest_steps_executed"] = @NO;
     _report[@"game_execution"] = @NO;
-    _bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
-    _bootCoordinator->attach_input_manager(&_inputManager);
-    _bootCoordinator->attach_video_out(&_videoOutManager);
-    // VideoOut precisa da memória guest antes de executar inicializadores de PRX:
-    // eles podem registrar buffers e enviar flips durante a fase 4.
-    bool ok = _bootCoordinator->phase1_mount_packages(config) &&
-              _bootCoordinator->phase2_setup_saves(config) &&
-              _bootCoordinator->phase3_load_modules(config);
-    if (ok) {
-        _videoOutManager.attach_guest_memory(_bootCoordinator->guest_memory(), &_guestFlipSink);
-        ok = _bootCoordinator->phase4_initialize_runtime(config);
-    }
-    auto diag = _bootCoordinator->diagnostics();
 
-    if (!ok) {
-        NSString *err = [NSString stringWithUTF8String:diag.last_error.c_str()];
-        _gameBootStatus.text = [NSString stringWithFormat:@"Motor Bloodborne: FALHA: %@", err];
-        _topStatusLabel.text = [NSString stringWithFormat:@"⚔ Falha: %@", err];
-        _report[@"game_boot_coordinator"] = @{
-            @"status": @"init_failed",
-            @"error": err,
-            @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
-            @"active_modules": @(diag.modules_count),
-            @"total_steps": @(diag.total_steps),
-            @"game_execution": @NO
-        };
-        _report[@"game_execution"] = @NO;
-        return;
-    }
+    __weak LabController *weakSelf = self;
+    dispatch_async(_guestExecutionQueue, ^{
+        LabController *strongSelf = weakSelf;
+        if (!strongSelf) return;
 
-    if (_bootCoordinator->runtime()) {
-        _bootCoordinator->runtime()->pad_manager().set_default_input(&_inputManager);
-        _bootCoordinator->runtime()->attach_video_out(&_videoOutManager);
-    }
+        strongSelf->_bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
+        strongSelf->_bootCoordinator->attach_input_manager(&strongSelf->_inputManager);
+        strongSelf->_bootCoordinator->attach_video_out(&strongSelf->_videoOutManager);
 
-    std::uint64_t steps = _bootCoordinator->step(100000);
-    diag = _bootCoordinator->diagnostics();
+        bool ok = strongSelf->_bootCoordinator->phase1_mount_packages(config) &&
+                  strongSelf->_bootCoordinator->phase2_setup_saves(config) &&
+                  strongSelf->_bootCoordinator->phase3_load_modules(config);
+        if (ok) {
+            strongSelf->_videoOutManager.attach_guest_memory(strongSelf->_bootCoordinator->guest_memory(), &strongSelf->_guestFlipSink);
+            ok = strongSelf->_bootCoordinator->phase4_initialize_runtime(config);
+        }
+        auto diag = strongSelf->_bootCoordinator->diagnostics();
 
-    const bool is_running = (diag.total_steps > 0);
-    _report[@"guest_steps_executed"] = @(is_running);
-    _report[@"game_execution"] = @NO; // Passos do interpretador não comprovam gameplay.
-    _continuousExecution = diag.state == bb::BootState::running || diag.state == bb::BootState::modules_initialized;
-    [_continuousButton setTitle:_continuousExecution ? @"⏸ Pausar Execução Contínua" : @"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
+        if (!ok) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                LabController *sSelf = weakSelf;
+                if (!sSelf) return;
+                sSelf->_guestBooting.store(false);
+                NSString *err = [NSString stringWithUTF8String:diag.last_error.c_str()];
+                sSelf->_gameBootStatus.text = [NSString stringWithFormat:@"Motor Bloodborne: FALHA: %@", err];
+                sSelf->_topStatusLabel.text = [NSString stringWithFormat:@"⚔ Falha: %@", err];
+                sSelf->_report[@"game_boot_coordinator"] = @{
+                    @"status": @"init_failed",
+                    @"error": err,
+                    @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
+                    @"active_modules": @(diag.modules_count),
+                    @"total_steps": @(diag.total_steps),
+                    @"game_execution": @NO
+                };
+                sSelf->_report[@"game_execution"] = @NO;
+            });
+            return;
+        }
 
-    if (_welcomeCardView) {
-        _welcomeCardView.hidden = YES;
-    }
+        if (strongSelf->_bootCoordinator->runtime()) {
+            strongSelf->_bootCoordinator->runtime()->pad_manager().set_default_input(&strongSelf->_inputManager);
+            strongSelf->_bootCoordinator->runtime()->attach_video_out(&strongSelf->_videoOutManager);
+        }
 
-    [self updateCoordinatorReportAndUI:diag executedSteps:steps];
+        std::uint64_t steps = strongSelf->_bootCoordinator->step(100000);
+        diag = strongSelf->_bootCoordinator->diagnostics();
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LabController *sSelf = weakSelf;
+            if (!sSelf) return;
+            sSelf->_guestBooting.store(false);
+            sSelf->_lastGuestSteps = diag.total_steps;
+            const bool is_running = (diag.total_steps > 0);
+            sSelf->_report[@"guest_steps_executed"] = @(is_running);
+            sSelf->_report[@"game_execution"] = @NO; // Passos do interpretador não comprovam gameplay.
+            sSelf->_continuousExecution = (diag.state == bb::BootState::running || diag.state == bb::BootState::modules_initialized);
+            [sSelf->_continuousButton setTitle:sSelf->_continuousExecution ? @"⏸ Pausar Execução Contínua" : @"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
+
+            if (sSelf->_welcomeCardView) {
+                sSelf->_welcomeCardView.hidden = YES;
+            }
+
+            [sSelf updateCoordinatorReportAndUI:diag executedSteps:steps];
+        });
+    });
 }
 
 - (void)toggleContinuousExecution {
-    if (!_bootCoordinator || (_bootCoordinator->state() != bb::BootState::running &&
-                              _bootCoordinator->state() != bb::BootState::modules_initialized)) return;
+    if (!_bootCoordinator) return;
     _continuousExecution = !_continuousExecution;
     if (_continuousExecution) {
         [_continuousButton setTitle:@"⏸ Pausar Execução Contínua" forState:UIControlStateNormal];
-        if (_bootCoordinator && _bootCoordinator->state() == bb::BootState::modules_initialized) {
-            _bootCoordinator->step(10000);
-        }
     } else {
         [_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
     }
@@ -1105,10 +1135,29 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _lastFrameTime = now;
     _pacingTracker.record_frame_ms(frame_ms);
 
-    if (_continuousExecution && _bootCoordinator &&
+    if (_continuousExecution && _bootCoordinator && !_guestBooting.load() &&
         (_bootCoordinator->state() == bb::BootState::running || _bootCoordinator->state() == bb::BootState::modules_initialized)) {
-        _bootCoordinator->step(100000);
-        _report[@"guest_steps_executed"] = @(_bootCoordinator->diagnostics().total_steps > 0);
+        if (!_guestStepping.exchange(true)) {
+            __weak LabController *weakSelf = self;
+            dispatch_async(_guestExecutionQueue, ^{
+                LabController *strongSelf = weakSelf;
+                if (!strongSelf || !strongSelf->_bootCoordinator) {
+                    return;
+                }
+                std::uint64_t steps = strongSelf->_bootCoordinator->step(50000);
+                auto diag = strongSelf->_bootCoordinator->diagnostics();
+                strongSelf->_guestStepping.store(false, std::memory_order_release);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    LabController *sSelf = weakSelf;
+                    if (!sSelf) return;
+                    sSelf->_lastGuestSteps = diag.total_steps;
+                    sSelf->_report[@"guest_steps_executed"] = @(diag.total_steps > 0);
+                    if (diag.total_steps % 500000 < 50000) {
+                        [sSelf updateCoordinatorReportAndUI:diag executedSteps:steps];
+                    }
+                });
+            });
+        }
     }
 
     if (_videoOutManager.has_new_frame()) {
@@ -1135,7 +1184,23 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                                        mipmapLevel:0
                                          withBytes:guestFrame.pixel_data.data()
                                        bytesPerRow:static_cast<NSUInteger>(guestFrame.pitch) * 4];
-                _report[@"guest_frame_status"] = @"Pixels guest lidos; origem GNM não comprovada.";
+                std::uint64_t submits = 0;
+                std::uint32_t tris = 0;
+                if (_bootCoordinator && _bootCoordinator->runtime()) {
+                    submits = _bootCoordinator->runtime()->submit_count();
+                    tris = _bootCoordinator->runtime()->rasterizer_stats().triangles_drawn;
+                }
+                if (submits > 0 && tris > 0) {
+                    _report[@"guest_frame_status"] = [NSString stringWithFormat:@"Pixels renderizados via GNM (%llu submits, %u triângulos).",
+                        (unsigned long long)submits, (unsigned int)tris];
+                    _report[@"gnm_draws_active"] = @YES;
+                } else if (submits > 0) {
+                    _report[@"guest_frame_status"] = [NSString stringWithFormat:@"Pixels atualizados via GNM (%llu submits).",
+                        (unsigned long long)submits];
+                    _report[@"gnm_draws_active"] = @YES;
+                } else {
+                    _report[@"guest_frame_status"] = @"Pixels guest lidos e atualizados na textura Metal.";
+                }
             } else {
                 _report[@"guest_frame_status"] = @"Falha ao alocar textura de vídeo guest.";
             }
@@ -1247,11 +1312,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                         strongSelf->_modelTriangleCount,
                         pacing.p50_ms, mem_mb];
 
-                    if (strongSelf->_bootCoordinator && strongSelf->_bootCoordinator->state() == bb::BootState::running) {
-                        auto coordDiag = strongSelf->_bootCoordinator->diagnostics();
+                    if (strongSelf->_lastGuestSteps > 0) {
                         strongSelf->_topStatusLabel.text = [NSString stringWithFormat:@"BB Lab | %.0f FPS host | %.1fM passos guest",
                             pacing.average_fps,
-                            static_cast<double>(coordDiag.total_steps) / 1000000.0];
+                            static_cast<double>(strongSelf->_lastGuestSteps) / 1000000.0];
                     }
                 }
             } else {
@@ -1263,6 +1327,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 }
 
 - (void)dealloc {
+    _continuousExecution = NO;
+    if (_guestExecutionQueue) {
+        dispatch_sync(_guestExecutionQueue, ^{});
+    }
     if (_audioQueue) {
         AudioQueueStop(_audioQueue, true);
         AudioQueueDispose(_audioQueue, true);

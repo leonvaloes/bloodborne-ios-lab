@@ -120,6 +120,7 @@ int main() {
         CHECK(!cmd1.pipeline_config.vs_msl.empty());
         CHECK(cmd1.pipeline_config.ps_hash != 0);
         CHECK(!cmd1.pipeline_config.ps_msl.empty());
+        CHECK(cmd1.pipeline_config.ps_msl.find("fragment GcnFragmentOut gcn_fragment") != std::string::npos);
         CHECK(cmd1.pipeline_config.active_color_attachments == 1);
         CHECK(cmd1.pipeline_config.color_attachments[0].pixel_format == MetalPixelFormat::BGRA8Unorm);
         CHECK(cmd1.pipeline_config.depth_stencil.depth_pixel_format == MetalPixelFormat::Depth32Float);

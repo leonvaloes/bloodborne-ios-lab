@@ -1485,6 +1485,10 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
                 return static_cast<std::uint64_t>(-1);
             }
         }
+        submit_count_ += count;
+        if (!gnm_context_->draw_calls().empty()) {
+            rasterizer_.execute_draw_calls(mem_, gnm_context_->draw_calls(), &rasterizer_stats_);
+        }
         if (n == "sceGnmSubmitAndFlipCommandBuffers") {
             auto h = static_cast<std::uint32_t>(a(5));
             auto buf_idx = static_cast<std::uint32_t>(a(6));
