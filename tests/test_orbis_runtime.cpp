@@ -8,6 +8,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #define assert(condition) do { if (!(condition)) throw std::runtime_error("falha: " #condition); } while (false)
 
 using namespace bb;
