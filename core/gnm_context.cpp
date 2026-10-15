@@ -11,12 +11,6 @@ inline float uint_as_float(std::uint32_t val) {
     std::memcpy(&f, &val, sizeof(float));
     return f;
 }
-
-inline std::uint32_t float_as_uint(float val) {
-    std::uint32_t u = 0;
-    std::memcpy(&u, &val, sizeof(std::uint32_t));
-    return u;
-}
 } // namespace
 
 GnmContext::GnmContext(const GuestMemory& memory)
