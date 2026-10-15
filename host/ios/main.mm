@@ -126,6 +126,9 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     std::atomic<bool> _guestStepping;
     std::atomic<bool> _guestBooting;
     std::uint64_t _lastGuestSteps;
+    std::atomic<bool> _guestCanStep;
+    std::atomic<std::uint64_t> _guestSubmits;
+    std::atomic<std::uint32_t> _guestTriangles;
 
     // Subsistema Metal 3
     id<MTLCommandQueue> _queue;
@@ -197,6 +200,9 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _guestStepping.store(false);
     _guestBooting.store(false);
     _lastGuestSteps = 0;
+    _guestCanStep.store(false);
+    _guestSubmits.store(0);
+    _guestTriangles.store(0);
     _guestExecutionQueue = dispatch_queue_create("org.bloodborne.lab.guest", DISPATCH_QUEUE_SERIAL);
     _touchOverlay.bind_input_manager(&_inputManager);
     _touchOverlay.set_left_stick_mode(bb::StickMode::Floating);
@@ -997,19 +1003,22 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     config.enable_hle = true;
     config.use_scheduler = true;
 
-    // A VideoOut anterior referencia GuestMemory do coordenador antigo.
-    _videoOutManager.detach_guest_memory();
+    // Desanexar na fila guest, após qualquer slice pendente, antes de destruir memória.
     _guestScreenTexture = nil;
     _report[@"guest_frame_flipped"] = @NO;
     _report[@"guest_frame_presented_to_metal"] = @NO;
     _report[@"guest_steps_executed"] = @NO;
     _report[@"game_execution"] = @NO;
+    _guestCanStep.store(false);
+    _guestSubmits.store(0);
+    _guestTriangles.store(0);
 
     __weak LabController *weakSelf = self;
     dispatch_async(_guestExecutionQueue, ^{
         LabController *strongSelf = weakSelf;
         if (!strongSelf) return;
 
+        strongSelf->_videoOutManager.detach_guest_memory();
         strongSelf->_bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
         strongSelf->_bootCoordinator->attach_input_manager(&strongSelf->_inputManager);
         strongSelf->_bootCoordinator->attach_video_out(&strongSelf->_videoOutManager);
@@ -1051,6 +1060,12 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 
         std::uint64_t steps = strongSelf->_bootCoordinator->step(100000);
         diag = strongSelf->_bootCoordinator->diagnostics();
+        if (auto *runtime = strongSelf->_bootCoordinator->runtime()) {
+            strongSelf->_guestSubmits.store(runtime->submit_count());
+            strongSelf->_guestTriangles.store(runtime->rasterizer_stats().triangles_drawn);
+        }
+        strongSelf->_guestCanStep.store(diag.state == bb::BootState::running ||
+                                        diag.state == bb::BootState::modules_initialized);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             LabController *sSelf = weakSelf;
@@ -1073,7 +1088,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 }
 
 - (void)toggleContinuousExecution {
-    if (!_bootCoordinator) return;
+    if (!_guestCanStep.load()) return;
     _continuousExecution = !_continuousExecution;
     if (_continuousExecution) {
         [_continuousButton setTitle:@"⏸ Pausar Execução Contínua" forState:UIControlStateNormal];
@@ -1135,17 +1150,24 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _lastFrameTime = now;
     _pacingTracker.record_frame_ms(frame_ms);
 
-    if (_continuousExecution && _bootCoordinator && !_guestBooting.load() &&
-        (_bootCoordinator->state() == bb::BootState::running || _bootCoordinator->state() == bb::BootState::modules_initialized)) {
+    if (_continuousExecution && _guestCanStep.load() && !_guestBooting.load()) {
         if (!_guestStepping.exchange(true)) {
             __weak LabController *weakSelf = self;
             dispatch_async(_guestExecutionQueue, ^{
                 LabController *strongSelf = weakSelf;
-                if (!strongSelf || !strongSelf->_bootCoordinator) {
+                if (!strongSelf) return;
+                if (!strongSelf->_bootCoordinator) {
+                    strongSelf->_guestStepping.store(false);
                     return;
                 }
                 std::uint64_t steps = strongSelf->_bootCoordinator->step(50000);
                 auto diag = strongSelf->_bootCoordinator->diagnostics();
+                if (auto *runtime = strongSelf->_bootCoordinator->runtime()) {
+                    strongSelf->_guestSubmits.store(runtime->submit_count());
+                    strongSelf->_guestTriangles.store(runtime->rasterizer_stats().triangles_drawn);
+                }
+                strongSelf->_guestCanStep.store(diag.state == bb::BootState::running ||
+                                                diag.state == bb::BootState::modules_initialized);
                 strongSelf->_guestStepping.store(false, std::memory_order_release);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     LabController *sSelf = weakSelf;
@@ -1184,12 +1206,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                                        mipmapLevel:0
                                          withBytes:guestFrame.pixel_data.data()
                                        bytesPerRow:static_cast<NSUInteger>(guestFrame.pitch) * 4];
-                std::uint64_t submits = 0;
-                std::uint32_t tris = 0;
-                if (_bootCoordinator && _bootCoordinator->runtime()) {
-                    submits = _bootCoordinator->runtime()->submit_count();
-                    tris = _bootCoordinator->runtime()->rasterizer_stats().triangles_drawn;
-                }
+                const std::uint64_t submits = _guestSubmits.load();
+                const std::uint32_t tris = _guestTriangles.load();
                 if (submits > 0 && tris > 0) {
                     _report[@"guest_frame_status"] = [NSString stringWithFormat:@"Pixels renderizados via GNM (%llu submits, %u triângulos).",
                         (unsigned long long)submits, (unsigned int)tris];
@@ -1655,11 +1673,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     [self checkGameAsset];
     [self checkDcx];
     [self checkBootEntry];
-    if (_bootCoordinator) {
-        auto diag = _bootCoordinator->diagnostics();
-        _report[@"guest_steps_executed"] = @(diag.total_steps > 0);
-        _report[@"game_execution"] = @NO;
-    }
+    _report[@"guest_steps_executed"] = @(_lastGuestSteps > 0);
+    _report[@"game_execution"] = @NO;
     _report[@"timestamp"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     auto pacing = _pacingTracker.get_stats();
     _report[@"frame_pacing_p50_ms"] = @(pacing.p50_ms);
