@@ -428,9 +428,9 @@ bool GameBootCoordinator::phase4_initialize_runtime(const BootConfig& config) {
         scheduler_->add_trap_range(0x7e000000, 4096 * (image_.imports.size() + 1));
         scheduler_->add_trap_range(Ps4Bootstrap::exit_trap, 64);
         runtime_->attach_scheduler(*scheduler_);
-        const std::uint64_t return_trap = Ps4Bootstrap::exit_trap + 32;
+        static constexpr std::uint64_t return_trap = Ps4Bootstrap::exit_trap + 32;
 
-        scheduler_->set_trap([this, return_trap](GuestScheduler& s, GuestScheduler::Id tid, CpuState& st) -> bool {
+        scheduler_->set_trap([this](GuestScheduler& s, GuestScheduler::Id tid, CpuState& st) -> bool {
             if (st.rip == return_trap) {
                 if (runtime_->has_pending_callback(tid)) {
                     runtime_->complete_callback(st, tid);
