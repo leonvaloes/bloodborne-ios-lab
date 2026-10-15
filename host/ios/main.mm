@@ -1007,6 +1007,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _guestScreenTexture = nil;
     _report[@"guest_frame_flipped"] = @NO;
     _report[@"guest_frame_presented_to_metal"] = @NO;
+    _report[@"gnm_draws_executed_offscreen"] = @NO;
     _report[@"guest_steps_executed"] = @NO;
     _report[@"game_execution"] = @NO;
     _guestCanStep.store(false);
@@ -1208,17 +1209,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                                        bytesPerRow:static_cast<NSUInteger>(guestFrame.pitch) * 4];
                 const std::uint64_t submits = _guestSubmits.load();
                 const std::uint32_t tris = _guestTriangles.load();
-                if (submits > 0 && tris > 0) {
-                    _report[@"guest_frame_status"] = [NSString stringWithFormat:@"Pixels renderizados via GNM (%llu submits, %u triângulos).",
-                        (unsigned long long)submits, (unsigned int)tris];
-                    _report[@"gnm_draws_active"] = @YES;
-                } else if (submits > 0) {
-                    _report[@"guest_frame_status"] = [NSString stringWithFormat:@"Pixels atualizados via GNM (%llu submits).",
-                        (unsigned long long)submits];
-                    _report[@"gnm_draws_active"] = @YES;
-                } else {
-                    _report[@"guest_frame_status"] = @"Pixels guest lidos e atualizados na textura Metal.";
-                }
+                _report[@"gnm_submit_count"] = @(submits);
+                _report[@"gnm_cpu_triangles"] = @(tris);
+                _report[@"gnm_draws_executed_offscreen"] = @NO;
+                _report[@"guest_frame_status"] = @"Pixels lineares guest enviados à textura Metal; origem e sincronização com PM4 não comprovadas.";
             } else {
                 _report[@"guest_frame_status"] = @"Falha ao alocar textura de vídeo guest.";
             }
