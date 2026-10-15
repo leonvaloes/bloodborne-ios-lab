@@ -986,7 +986,15 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
     _bootCoordinator->attach_input_manager(&_inputManager);
     _bootCoordinator->attach_video_out(&_videoOutManager);
-    bool ok = _bootCoordinator->initialize(config);
+    // VideoOut precisa da memória guest antes de executar inicializadores de PRX:
+    // eles podem registrar buffers e enviar flips durante a fase 4.
+    bool ok = _bootCoordinator->phase1_mount_packages(config) &&
+              _bootCoordinator->phase2_setup_saves(config) &&
+              _bootCoordinator->phase3_load_modules(config);
+    if (ok) {
+        _videoOutManager.attach_guest_memory(_bootCoordinator->guest_memory(), &_guestFlipSink);
+        ok = _bootCoordinator->phase4_initialize_runtime(config);
+    }
     auto diag = _bootCoordinator->diagnostics();
 
     if (!ok) {
@@ -1005,7 +1013,6 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         return;
     }
 
-    _videoOutManager.attach_guest_memory(_bootCoordinator->guest_memory(), &_guestFlipSink);
     if (_bootCoordinator->runtime()) {
         _bootCoordinator->runtime()->pad_manager().set_default_input(&_inputManager);
         _bootCoordinator->runtime()->attach_video_out(&_videoOutManager);
