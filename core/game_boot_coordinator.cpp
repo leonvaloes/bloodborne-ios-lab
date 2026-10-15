@@ -177,6 +177,8 @@ bool GameBootCoordinator::phase1_mount_packages(const BootConfig& config) {
 
     if (package_mgr_.package_count() > 0) {
         package_mgr_.mount_all(*vfs_, config_.package_mount_points);
+    } else if (std::filesystem::exists(dvdroot_path, ec) && std::filesystem::is_directory(dvdroot_path, ec)) {
+        vfs_->mount("/dvdroot", dvdroot_path.string(), true);
     }
 
     package_report_ = package_mgr_.verify_essential_assets(config_.essential_asset_paths);
@@ -258,8 +260,11 @@ bool GameBootCoordinator::phase3_load_modules(const BootConfig& config) {
     std::filesystem::path eboot_path = base_path / "eboot.bin";
     std::error_code ec;
     if (!std::filesystem::exists(eboot_path, ec) || !std::filesystem::is_regular_file(eboot_path, ec)) {
+        eboot_path = base_path / "eboot.elf";
+    }
+    if (!std::filesystem::exists(eboot_path, ec) || !std::filesystem::is_regular_file(eboot_path, ec)) {
         state_ = BootState::error;
-        error_message_ = "eboot.bin not found at " + eboot_path.string();
+        error_message_ = "Neither eboot.bin nor eboot.elf found in " + base_path.string();
         return false;
     }
 
@@ -268,25 +273,34 @@ bool GameBootCoordinator::phase3_load_modules(const BootConfig& config) {
         eboot_data = read_file_data(eboot_path);
     } catch (const std::exception& e) {
         state_ = BootState::error;
-        error_message_ = "Failed to read eboot.bin: " + std::string(e.what());
+        error_message_ = "Failed to read eboot (" + eboot_path.filename().string() + "): " + std::string(e.what());
         return false;
     }
 
     std::map<std::string, std::vector<std::uint8_t>> modules;
-    std::filesystem::path module_dir = base_path / "sce_module";
-    if (std::filesystem::exists(module_dir, ec) && std::filesystem::is_directory(module_dir, ec)) {
-        for (const auto& item : std::filesystem::directory_iterator(module_dir, ec)) {
-            if (!item.is_regular_file(ec) || item.path().extension() != ".prx") continue;
-            try {
-                auto prx = read_file_data(item.path());
-                modules.emplace(item.path().filename().string(), std::move(prx));
-            } catch (const std::exception& e) {
-                state_ = BootState::error;
-                error_message_ = "Failed to read module " + item.path().filename().string() + ": " + e.what();
-                return false;
+    auto scan_prx_dir = [&](const std::filesystem::path& dir) {
+        if (std::filesystem::exists(dir, ec) && std::filesystem::is_directory(dir, ec)) {
+            for (const auto& item : std::filesystem::directory_iterator(dir, ec)) {
+                if (!item.is_regular_file(ec) || item.path().extension() != ".prx") continue;
+                std::string fname = item.path().filename().string();
+                if (modules.find(fname) == modules.end()) {
+                    try {
+                        auto prx = read_file_data(item.path());
+                        modules.emplace(std::move(fname), std::move(prx));
+                    } catch (const std::exception& e) {
+                        state_ = BootState::error;
+                        error_message_ = "Failed to read module " + item.path().filename().string() + ": " + e.what();
+                        return false;
+                    }
+                }
             }
         }
-    }
+        return true;
+    };
+
+    std::filesystem::path module_dir = base_path / "sce_module";
+    if (!scan_prx_dir(module_dir)) return false;
+    if (!scan_prx_dir(base_path)) return false;
 
     try {
         guest_memory_ = std::make_unique<GuestMemory>(config_.guest_memory_size);

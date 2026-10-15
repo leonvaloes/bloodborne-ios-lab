@@ -62,8 +62,8 @@ struct BootConfig {
     // Lista de caminhos de ativos essenciais (se vazia, usa default_essential_paths())
     std::vector<std::string> essential_asset_paths;
 
-    // Se true, falha em Fase 1 se faltarem ativos essenciais
-    bool require_essential_assets{true};
+    // Se true, falha em Fase 1 se faltarem ativos essenciais (padrão: false para permitir loose files)
+    bool require_essential_assets{false};
 
     // Pontos de montagem no VFS para os pacotes BHD5/BDT
     std::vector<std::string> package_mount_points{"/dvdroot", "/app0/dvdroot_ps4"};

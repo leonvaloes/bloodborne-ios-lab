@@ -10,6 +10,7 @@
 #include "flver_parser.h"
 #include "game_asset_probe.h"
 #include "boot_probe.h"
+#include "game_boot_coordinator.h"
 #include "vfs.h"
 #include <exception>
 #include <sys/utsname.h>
@@ -29,6 +30,10 @@
     UILabel *_assetStatus;
     UILabel *_dcxStatus;
     UILabel *_bootStatus;
+    UILabel *_gameBootStatus;
+    UIButton *_gameBootButton;
+    UIButton *_gameStepButton;
+    std::unique_ptr<bb::GameBootCoordinator> _bootCoordinator;
     MTKView *_metal;
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
@@ -114,6 +119,17 @@
     [bootButton setTitle:@"Testar entrada x86-64 (2 instrucoes)" forState:UIControlStateNormal];
     [bootButton addTarget:self action:@selector(checkBootEntry) forControlEvents:UIControlEventTouchUpInside];
 
+    _gameBootStatus = [UILabel new];
+    _gameBootStatus.numberOfLines = 0;
+    _gameBootStatus.text = @"Motor Bloodborne: toque em 'Iniciar Motor do Jogo' para carregar eboot + módulos.";
+    _gameBootButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_gameBootButton setTitle:@"Iniciar Motor do Jogo (GameBootCoordinator)" forState:UIControlStateNormal];
+    [_gameBootButton addTarget:self action:@selector(initGameBoot) forControlEvents:UIControlEventTouchUpInside];
+
+    _gameStepButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_gameStepButton setTitle:@"Avançar Motor (+100.000 passos)" forState:UIControlStateNormal];
+    [_gameStepButton addTarget:self action:@selector(stepGameBoot) forControlEvents:UIControlEventTouchUpInside];
+
     UIButton *run = [UIButton buttonWithType:UIButtonTypeSystem];
     [run setTitle:@"Executar testes completos (CPU, VFS, Áudio, Entrada)" forState:UIControlStateNormal];
     [run addTarget:self action:@selector(runTests) forControlEvents:UIControlEventTouchUpInside];
@@ -155,7 +171,9 @@
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
         title, scope, _status, run, _metal, _gpuStatus, _subsystemStatus,
-        documentButton, _documentStatus, assetButton, _assetStatus, dcxButton, _dcxStatus, bootButton, _bootStatus, dpadRow, actionsRow, exportButton]];
+        documentButton, _documentStatus, assetButton, _assetStatus, dcxButton, _dcxStatus,
+        bootButton, _bootStatus, _gameBootButton, _gameStepButton, _gameBootStatus,
+        dpadRow, actionsRow, exportButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -560,6 +578,100 @@
         status, probe.instructions_executed, probe.stop_rip];
 }
 
+- (void)initGameBoot {
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    if (!documents) {
+        _gameBootStatus.text = @"Motor Bloodborne: pasta Documents indisponível.";
+        return;
+    }
+
+    bb::BootConfig config;
+    config.base_dir = documents.path.UTF8String;
+    config.save_dir = [documents.path stringByAppendingPathComponent:@"savedata"].UTF8String;
+    config.guest_memory_size = 768u << 20;
+    config.require_essential_assets = false;
+    config.enable_hle = true;
+
+    _bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
+    bool ok = _bootCoordinator->initialize(config);
+    auto diag = _bootCoordinator->diagnostics();
+
+    if (!ok) {
+        NSString *err = [NSString stringWithUTF8String:diag.last_error.c_str()];
+        _gameBootStatus.text = [NSString stringWithFormat:@"Motor Bloodborne: FALHA: %@", err];
+        _report[@"game_boot_coordinator"] = @{
+            @"status": @"init_failed",
+            @"error": err,
+            @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
+            @"active_modules": @(diag.modules_count),
+            @"total_steps": @(diag.total_steps),
+            @"game_execution": @NO
+        };
+        _report[@"game_execution"] = @NO;
+        return;
+    }
+
+    std::uint64_t steps = _bootCoordinator->step(100000);
+    diag = _bootCoordinator->diagnostics();
+
+    const bool is_running = (diag.total_steps > 0);
+    _report[@"game_execution"] = @(is_running);
+
+    [self updateCoordinatorReportAndUI:diag executedSteps:steps];
+}
+
+- (void)stepGameBoot {
+    if (!_bootCoordinator || (_bootCoordinator->state() != bb::BootState::running && _bootCoordinator->state() != bb::BootState::modules_initialized)) {
+        _gameBootStatus.text = @"Motor Bloodborne não inicializado. Toque em 'Iniciar Motor do Jogo' primeiro.";
+        return;
+    }
+
+    std::uint64_t steps = _bootCoordinator->step(250000);
+    auto diag = _bootCoordinator->diagnostics();
+
+    const bool is_running = (diag.total_steps > 0);
+    _report[@"game_execution"] = @(is_running);
+
+    [self updateCoordinatorReportAndUI:diag executedSteps:steps];
+}
+
+- (void)updateCoordinatorReportAndUI:(const bb::BootDiagnostics&)diag executedSteps:(std::uint64_t)steps {
+    NSMutableDictionary *importCounts = [NSMutableDictionary dictionary];
+    for (const auto& [name, count] : diag.import_call_counts) {
+        importCounts[[NSString stringWithUTF8String:name.c_str()]] = @(count);
+    }
+    NSMutableArray *modules = [NSMutableArray array];
+    for (const auto& m : diag.active_modules) {
+        [modules addObject:[NSString stringWithUTF8String:m.c_str()]];
+    }
+
+    const bool is_running = (diag.total_steps > 0);
+    _report[@"game_boot_coordinator"] = @{
+        @"status": (diag.state == bb::BootState::halted ? @"halted" : (diag.state == bb::BootState::error ? @"error" : @"running")),
+        @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
+        @"total_steps": @(diag.total_steps),
+        @"total_import_calls": @(diag.total_import_calls),
+        @"last_import_called": [NSString stringWithUTF8String:diag.last_import_called.c_str()],
+        @"import_call_counts": importCounts,
+        @"active_modules": modules,
+        @"modules_count": @(diag.modules_count),
+        @"entry_point": @(diag.entry_point),
+        @"current_rip": @(diag.current_rip),
+        @"last_stop_reason": [NSString stringWithUTF8String:diag.last_stop_reason.c_str()],
+        @"game_execution": @(is_running),
+        @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]
+    };
+
+    _gameBootStatus.text = [NSString stringWithFormat:
+        @"Motor Bloodborne (+%llu): Total %llu passos | %llu imports | RIP: 0x%llx | Stop: %s",
+        (unsigned long long)steps,
+        (unsigned long long)diag.total_steps,
+        (unsigned long long)diag.total_import_calls,
+        (unsigned long long)diag.current_rip,
+        diag.last_stop_reason.c_str()];
+}
+
 - (void)drawInMTKView:(MTKView *)view {
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
     id<CAMetalDrawable> drawable = view.currentDrawable;
@@ -569,6 +681,11 @@
     double frame_ms = std::chrono::duration<double, std::milli>(now - _lastFrameTime).count();
     _lastFrameTime = now;
     _pacingTracker.record_frame_ms(frame_ms);
+
+    if (_bootCoordinator && _bootCoordinator->state() == bb::BootState::running) {
+        _bootCoordinator->step(2000);
+        _report[@"game_execution"] = @YES;
+    }
 
     _angle += 0.02f;
     float aspect = (view.bounds.size.height > 0) ? (float)view.bounds.size.width / (float)view.bounds.size.height : 1.777f;
@@ -639,6 +756,15 @@
                         strongSelf->_modelVertexCount,
                         strongSelf->_modelTriangleCount,
                         pacing.p50_ms, mem_mb];
+                    if (strongSelf->_bootCoordinator && strongSelf->_bootCoordinator->state() == bb::BootState::running) {
+                        auto coordDiag = strongSelf->_bootCoordinator->diagnostics();
+                        strongSelf->_gameBootStatus.text = [NSString stringWithFormat:
+                            @"Motor Bloodborne (Frame %lu): Total %llu passos | %llu imports | RIP: 0x%llx",
+                            (unsigned long)strongSelf->_completedFrames,
+                            (unsigned long long)coordDiag.total_steps,
+                            (unsigned long long)coordDiag.total_import_calls,
+                            (unsigned long long)coordDiag.current_rip];
+                    }
                 }
             } else {
                 [strongSelf gpuError:finished.error ? finished.error.localizedDescription : @"Erro no command buffer"];
@@ -668,7 +794,7 @@
     const bool mounted = documents && vfs.mount("/app0", documents.path.UTF8String, true);
     inventory[@"vfs_mounted"] = @(mounted);
     NSMutableDictionary *files = [NSMutableDictionary dictionary];
-    for (NSString *name in @[@"teste-bblab.txt", @"param.sfo", @"m29_00_00_00_408010.flver.dcx", @"eboot.elf"]) {
+    for (NSString *name in @[@"teste-bblab.txt", @"param.sfo", @"m29_00_00_00_408010.flver.dcx", @"eboot.elf", @"libc.prx", @"libSceFios2.prx"]) {
         NSError *error = nil;
         NSDictionary *attributes = documents ? [manager attributesOfItemAtPath:
             [documents.path stringByAppendingPathComponent:name] error:&error] : nil;
@@ -703,6 +829,34 @@
     [self checkGameAsset];
     [self checkDcx];
     [self checkBootEntry];
+    if (_bootCoordinator) {
+        auto diag = _bootCoordinator->diagnostics();
+        const bool is_running = (diag.total_steps > 0);
+        _report[@"game_execution"] = @(is_running);
+        NSMutableDictionary *importCounts = [NSMutableDictionary dictionary];
+        for (const auto& [name, count] : diag.import_call_counts) {
+            importCounts[[NSString stringWithUTF8String:name.c_str()]] = @(count);
+        }
+        NSMutableArray *modules = [NSMutableArray array];
+        for (const auto& m : diag.active_modules) {
+            [modules addObject:[NSString stringWithUTF8String:m.c_str()]];
+        }
+        _report[@"game_boot_coordinator"] = @{
+            @"status": (diag.state == bb::BootState::halted ? @"halted" : (diag.state == bb::BootState::error ? @"error" : @"running")),
+            @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
+            @"total_steps": @(diag.total_steps),
+            @"total_import_calls": @(diag.total_import_calls),
+            @"last_import_called": [NSString stringWithUTF8String:diag.last_import_called.c_str()],
+            @"import_call_counts": importCounts,
+            @"active_modules": modules,
+            @"modules_count": @(diag.modules_count),
+            @"entry_point": @(diag.entry_point),
+            @"current_rip": @(diag.current_rip),
+            @"last_stop_reason": [NSString stringWithUTF8String:diag.last_stop_reason.c_str()],
+            @"game_execution": @(is_running),
+            @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]
+        };
+    }
     _report[@"timestamp"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     auto pacing = _pacingTracker.get_stats();
     _report[@"frame_pacing_p50_ms"] = @(pacing.p50_ms);

@@ -488,6 +488,41 @@ int main() { return run([] {
         CHECK(coordinator.state() == BootState::modules_initialized);
     }
 
+    // ========================================================================
+    // 7. Boot com eboot.elf e modulos PRX soltos no base_path (sem subpasta)
+    // ========================================================================
+    {
+        std::cout << "[test_game_boot_coordinator] 7. Testando eboot.elf e PRX solto no base_path...\n";
+        std::filesystem::path test_dir = sandbox / "loose_files_boot";
+        std::filesystem::create_directories(test_dir, ec);
+
+        // Modulo PRX solto diretamente em test_dir (Documents no iOS)
+        auto prx_bytes = synthesize_elf(true, false);
+        std::ofstream prx_out(test_dir / "libtest.prx", std::ios::binary);
+        prx_out.write(reinterpret_cast<const char*>(prx_bytes.data()), prx_bytes.size());
+        prx_out.close();
+
+        // eboot.elf (em vez de eboot.bin) diretamente em test_dir
+        auto elf_bytes = synthesize_elf(false, true, "libtest.prx");
+        std::ofstream elf_out(test_dir / "eboot.elf", std::ios::binary);
+        elf_out.write(reinterpret_cast<const char*>(elf_bytes.data()), elf_bytes.size());
+        elf_out.close();
+
+        GameBootCoordinator coordinator;
+        BootConfig config;
+        config.base_dir = test_dir.string();
+
+        CHECK(coordinator.initialize(config));
+        CHECK(coordinator.state() == BootState::modules_initialized);
+        CHECK(coordinator.image().modules.size() == 1);
+        CHECK(coordinator.image().modules[0].name == "libtest.prx");
+
+        std::uint64_t executed = coordinator.step(50);
+        CHECK(executed > 0);
+        CHECK(coordinator.state() == BootState::halted);
+        CHECK(coordinator.cpu()->state.gpr[0] == 42);
+    }
+
     std::filesystem::remove_all(sandbox, ec);
     std::cout << "[test_game_boot_coordinator] Todos os testes passaram com sucesso!\n";
 }); }
