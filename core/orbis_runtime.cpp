@@ -288,6 +288,11 @@ std::string OrbisRuntime::resolve_guest_path(const std::string& guest_path) cons
         std::string sub = (norm.rfind("/savedata/", 0) == 0) ? norm.substr(10) : norm.substr(11);
         return (save_base / sub).lexically_normal().string();
     } else if (norm[0] == '/') {
+        std::error_code ec;
+        std::filesystem::path p(norm);
+        if (app0_dir_.empty() || std::filesystem::exists(p, ec) || std::filesystem::exists(p.parent_path(), ec)) {
+            return p.lexically_normal().string();
+        }
         rel = norm.substr(1);
     } else {
         rel = norm;
