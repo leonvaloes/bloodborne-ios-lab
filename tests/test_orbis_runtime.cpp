@@ -481,7 +481,15 @@ int main() {
         constexpr std::uint64_t buf0_addr = 0x7000;
         assert(m.store(addrs_ptr, &buf0_addr, 8) == MemoryError::ok);
         assert(call("sceVideoOutRegisterBuffers", vh, 0, addrs_ptr, 1, attr_addr) == 0);
+        assert(call("sceVideoOutRegisterBuffers", vh, 1, addrs_ptr, 1, attr_addr) == 0);
+        assert(call("sceVideoOutRegisterBuffers", vh, 1, addrs_ptr, 1, attr_addr) == UINT64_MAX);
+        assert(call("sceVideoOutRegisterBuffers", vh, 16, addrs_ptr, 1, attr_addr) == UINT64_MAX);
+        assert(call("sceVideoOutRegisterBuffers", vh, 2, 0, 1, attr_addr) == UINT64_MAX);
 
+        // Um flip rejeitado não avança a sequência nem cria imagem falsa.
+        assert(call("sceVideoOutSubmitFlip", vh, 2, 0, 42) == UINT64_MAX);
+        assert(!vom.has_new_frame() && vom.flip_count() == 0);
+        assert(call("sceGnmSubmitCommandBuffers", 1, 0, 0) == UINT64_MAX);
         assert(call("sceVideoOutSubmitFlip", vh, 0, 0, 42) == 0);
         assert(vom.has_new_frame());
         assert(vom.flip_count() == 1);

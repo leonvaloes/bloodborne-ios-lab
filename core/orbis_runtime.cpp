@@ -1309,22 +1309,26 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         int buf_count = static_cast<int>(a(3));
         std::uint64_t attr_ptr = a(4);
 
-        if (video_out_ && addrs_ptr && buf_count > 0 && buf_count <= 16 && attr_ptr) {
-            std::uint32_t attr_fields[6] = {};
-            if (mem_.load(attr_ptr, attr_fields, sizeof(attr_fields)) == MemoryError::ok) {
-                std::uint32_t width = attr_fields[3];
-                std::uint32_t height = attr_fields[4];
-                std::uint32_t pitch = attr_fields[5];
-                if (!pitch) pitch = width;
-                std::uint32_t bpp = 4;
-
-                for (int i = 0; i < buf_count; ++i) {
-                    std::uint64_t buf_addr = 0;
-                    if (mem_.load(addrs_ptr + i * 8, &buf_addr, 8) == MemoryError::ok) {
-                        VideoBuffer vb{buf_addr, width, height, pitch, bpp};
-                        video_out_->register_buffer(static_cast<std::uint32_t>(start_idx + i), vb);
-                    }
-                }
+        if (!video_out_ || !addrs_ptr || !attr_ptr || start_idx < 0 ||
+            buf_count <= 0 || buf_count > 16 || start_idx > 16 - buf_count) {
+            return static_cast<std::uint64_t>(-1);
+        }
+        std::uint32_t attr_fields[6] = {};
+        if (mem_.load(attr_ptr, attr_fields, sizeof(attr_fields)) != MemoryError::ok) {
+            return static_cast<std::uint64_t>(-1);
+        }
+        std::uint32_t width = attr_fields[3];
+        std::uint32_t height = attr_fields[4];
+        std::uint32_t pitch = attr_fields[5] ? attr_fields[5] : width;
+        std::uint32_t bpp = 4;
+        for (int i = 0; i < buf_count; ++i) {
+            std::uint64_t buf_addr = 0;
+            if (mem_.load(addrs_ptr + static_cast<std::uint64_t>(i) * 8, &buf_addr, 8) != MemoryError::ok) {
+                return static_cast<std::uint64_t>(-1);
+            }
+            VideoBuffer vb{buf_addr, width, height, pitch, bpp};
+            if (video_out_->register_buffer(static_cast<std::uint32_t>(start_idx + i), vb) != VideoStatus::ok) {
+                return static_cast<std::uint64_t>(-1);
             }
         }
         return 0;
@@ -1332,15 +1336,15 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     if (n == "sceVideoOutSubmitFlip") {
         int buf_idx = static_cast<int>(a(1));
         std::uint64_t flip_arg = a(3);
+        if (!video_out_ || buf_idx < 0 ||
+            video_out_->submit_flip(static_cast<std::uint32_t>(buf_idx), flip_arg) != VideoStatus::ok) {
+            return static_cast<std::uint64_t>(-1);
+        }
         for (auto& pair : equeues_) {
             if (pair.second.has_flip_event) {
                 EqueueEvent ev{0x6, -13, 0, 0, 1, pair.second.flip_udata};
                 pair.second.pending_events.push_back(ev);
             }
-        }
-        if (video_out_) {
-            auto status = video_out_->submit_flip(static_cast<std::uint32_t>(buf_idx), flip_arg);
-            return status == VideoStatus::ok ? 0 : static_cast<std::uint64_t>(-1);
         }
         return 0;
     }
@@ -1384,12 +1388,6 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             if (!it->second.pending_events.empty()) {
                 auto ev = it->second.pending_events.front();
                 it->second.pending_events.erase(it->second.pending_events.begin());
-                mem_.store(ev_ptr, &ev, sizeof(EqueueEvent));
-                if (out_ptr) put<std::int32_t>(mem_, out_ptr, 1);
-                return 0;
-            }
-            if (it->second.has_flip_event) {
-                EqueueEvent ev{0x6, -13, 0, 0, 1, it->second.flip_udata};
                 mem_.store(ev_ptr, &ev, sizeof(EqueueEvent));
                 if (out_ptr) put<std::int32_t>(mem_, out_ptr, 1);
                 return 0;
@@ -1463,29 +1461,31 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         uint32_t count = static_cast<uint32_t>(a(0));
         uint64_t dcb_addrs_ptr = a(1);
         uint64_t dcb_sizes_ptr = a(2);
-        if (gnm_context_ && dcb_addrs_ptr && dcb_sizes_ptr && count > 0 && count < 64) {
-            for (uint32_t i = 0; i < count; ++i) {
-                uint64_t dcb_addr = 0;
-                uint32_t dcb_size = 0;
-                if (mem_.load(dcb_addrs_ptr + i * 8, &dcb_addr, 8) == MemoryError::ok &&
-                    mem_.load(dcb_sizes_ptr + i * 4, &dcb_size, 4) == MemoryError::ok) {
-                    if (dcb_addr != 0 && dcb_size >= 4) {
-                        gnm_context_->submit(dcb_addr, dcb_size / 4);
-                    }
-                }
+        if (!gnm_context_ || !dcb_addrs_ptr || !dcb_sizes_ptr || count == 0 || count >= 64) {
+            return static_cast<std::uint64_t>(-1);
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            uint64_t dcb_addr = 0;
+            uint32_t dcb_size = 0;
+            if (mem_.load(dcb_addrs_ptr + i * 8, &dcb_addr, 8) != MemoryError::ok ||
+                mem_.load(dcb_sizes_ptr + i * 4, &dcb_size, 4) != MemoryError::ok ||
+                dcb_addr == 0 || dcb_size < 4 || dcb_size % 4 != 0 ||
+                gnm_context_->submit(dcb_addr, dcb_size / 4) != Pm4Status::ok) {
+                return static_cast<std::uint64_t>(-1);
             }
         }
         if (n == "sceGnmSubmitAndFlipCommandBuffers") {
             auto h = static_cast<std::uint32_t>(a(5));
             auto buf_idx = static_cast<std::uint32_t>(a(6));
             auto flip_arg = a(8);
-            if (video_out_) {
-                if (buf_idx < 16) {
-                    video_out_->submit_flip(buf_idx, flip_arg);
-                } else if (h < 16) {
-                    video_out_->submit_flip(h, a(7));
-                }
+            if (!video_out_) return static_cast<std::uint64_t>(-1);
+            VideoStatus flip_status = VideoStatus::invalid;
+            if (buf_idx < 16) {
+                flip_status = video_out_->submit_flip(buf_idx, flip_arg);
+            } else if (h < 16) {
+                flip_status = video_out_->submit_flip(h, a(7));
             }
+            if (flip_status != VideoStatus::ok) return static_cast<std::uint64_t>(-1);
             for (auto& pair : equeues_) {
                 if (pair.second.has_flip_event) {
                     EqueueEvent ev{0x6, -13, 0, 0, 1, pair.second.flip_udata};
