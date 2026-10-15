@@ -875,7 +875,7 @@ std::int32_t Ngs2Manager::render_rack(SceNgs2RackHandle rack_handle,
                             v.atrac9_byte_offset += at9_sf_size;
                         }
                         // Produz frame de silêncio
-                        std::fill(temp_pcm.begin(), temp_pcm.end(), 0);
+                        std::fill(temp_pcm.begin(), temp_pcm.end(), static_cast<std::int16_t>(0));
                         bytes_used = static_cast<int>(at9_sf_size);
                     } else {
                         v.atrac9_byte_offset += static_cast<std::size_t>(bytes_used);

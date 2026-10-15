@@ -472,9 +472,9 @@ void Exec::avx(bool three) {
                     s.xmm[rg][0] = lo; s.xmm[rg][1] = lo;
                     s.ymm_hi[rg][0] = hi; s.ymm_hi[rg][1] = hi;
                 } else {
-                    const std::uint64_t v0 = rd_mem(rm.addr, 8), v1 = rd_mem(rm.addr + 16, 8);
-                    s.xmm[rg][0] = v0; s.xmm[rg][1] = v0;
-                    s.ymm_hi[rg][0] = v1; s.ymm_hi[rg][1] = v1;
+                    const std::uint64_t mem_v0 = rd_mem(rm.addr, 8), mem_v1 = rd_mem(rm.addr + 16, 8);
+                    s.xmm[rg][0] = mem_v0; s.xmm[rg][1] = mem_v0;
+                    s.ymm_hi[rg][0] = mem_v1; s.ymm_hi[rg][1] = mem_v1;
                 }
             }
             return;

@@ -2104,8 +2104,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return static_cast<int>(s.size()) + 1;
     }
     if (n=="putchar") {
-        int c = static_cast<int>(a(0));
-        return std::fputc(c, stdout);
+        int ch = static_cast<int>(a(0));
+        return std::fputc(ch, stdout);
     }
     if (n=="getchar") {
         return std::getchar();
@@ -2128,9 +2128,9 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return dst;
     }
     if (n=="fputc") {
-        int c = static_cast<int>(a(0));
+        int ch = static_cast<int>(a(0));
         FILE* fp = get_file(a(1));
-        return fp ? std::fputc(c, fp) : EOF;
+        return fp ? std::fputc(ch, fp) : EOF;
     }
     if (n=="fputs") {
         std::string s = read_guest_string(a(0));
@@ -2376,16 +2376,15 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     if (n=="fgetpos") {
         FILE* fp = get_file(a(0));
         if (!fp) return static_cast<std::uint64_t>(-1);
-        std::fpos_t pos;
-        int res = std::fgetpos(fp, &pos);
-        if (res == 0 && a(1)) put<std::uint64_t>(mem_, a(1), static_cast<std::uint64_t>(pos));
-        return res;
+        long pos = std::ftell(fp);
+        if (pos >= 0 && a(1)) put<std::int64_t>(mem_, a(1), static_cast<std::int64_t>(pos));
+        return pos >= 0 ? 0 : static_cast<std::uint64_t>(-1);
     }
     if (n=="fsetpos") {
         FILE* fp = get_file(a(0));
         if (!fp) return static_cast<std::uint64_t>(-1);
-        std::fpos_t pos = static_cast<std::fpos_t>(a(1));
-        return std::fsetpos(fp, &pos);
+        std::int64_t pos = a(1) ? get<std::int64_t>(mem_, a(1)) : 0;
+        return std::fseek(fp, static_cast<long>(pos), SEEK_SET);
     }
     if (n=="setvbuf") {
         // Stub: return success
