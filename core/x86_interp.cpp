@@ -84,6 +84,26 @@ bool cond_true(unsigned cc, std::uint64_t f) {
     return (cc & 1) ? !r : r;
 }
 
+static inline std::uint32_t bswap32(std::uint32_t v) {
+#if defined(_MSC_VER)
+    return _byteswap_ulong(v);
+#elif defined(__GNUC__) || defined(__clang__)
+    return __builtin_bswap32(v);
+#else
+    return ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF);
+#endif
+}
+
+static inline std::uint64_t bswap64(std::uint64_t v) {
+#if defined(_MSC_VER)
+    return _byteswap_uint64(v);
+#elif defined(__GNUC__) || defined(__clang__)
+    return __builtin_bswap64(v);
+#else
+    return (static_cast<std::uint64_t>(bswap32(static_cast<std::uint32_t>(v))) << 32) | bswap32(static_cast<std::uint32_t>(v >> 32));
+#endif
+}
+
 struct Rm { bool reg; int r; std::uint64_t addr; };
 
 struct Exec {
@@ -433,12 +453,12 @@ void Exec::avx(bool three) {
             for (int i = 0; i < len; ++i) mask[i] = i < 2 ? s.xmm[mask_reg][i] : s.ymm_hi[mask_reg][i - 2];
             const int elem_width = (op == 0x4B) ? 8 : (op == 0x4A) ? 4 : 1;
             const int total_bytes = len * 8;
-            std::uint8_t a[32], b[32], m[32], out[32];
+            std::uint8_t a[32], b[32], mask_bytes[32], out[32];
             std::memcpy(a, s1, total_bytes);
             std::memcpy(b, s2, total_bytes);
-            std::memcpy(m, mask, total_bytes);
+            std::memcpy(mask_bytes, mask, total_bytes);
             for (int i = 0; i < total_bytes; i += elem_width) {
-                const bool select_b = (m[i + elem_width - 1] & 0x80) != 0;
+                const bool select_b = (mask_bytes[i + elem_width - 1] & 0x80) != 0;
                 std::memcpy(out + i, select_b ? (b + i) : (a + i), elem_width);
             }
             std::memcpy(dst, out, total_bytes);
@@ -1661,15 +1681,15 @@ void Exec::two_byte(int opsz) {
                 std::uint64_t val = rd_mem(rm.addr, sz);
                 std::uint64_t swapped = 0;
                 if (sz == 2) swapped = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF);
-                else if (sz == 4) swapped = __builtin_bswap32(static_cast<std::uint32_t>(val));
-                else swapped = __builtin_bswap64(val);
+                else if (sz == 4) swapped = bswap32(static_cast<std::uint32_t>(val));
+                else swapped = bswap64(val);
                 wr_reg(rg, sz, swapped);
             } else { // MOVBE m, r (store)
                 std::uint64_t val = rd_reg(rg, sz);
                 std::uint64_t swapped = 0;
                 if (sz == 2) swapped = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF);
-                else if (sz == 4) swapped = __builtin_bswap32(static_cast<std::uint32_t>(val));
-                else swapped = __builtin_bswap64(val);
+                else if (sz == 4) swapped = bswap32(static_cast<std::uint32_t>(val));
+                else swapped = bswap64(val);
                 wr_mem(rm.addr, sz, swapped);
             }
             return;

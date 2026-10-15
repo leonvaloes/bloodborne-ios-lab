@@ -3312,7 +3312,9 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
 #else
         int posix_fd = fileno(it->second.fp);
         if (posix_fd >= 0) {
-            ftruncate(posix_fd, length);
+            if (ftruncate(posix_fd, length) != 0) {
+                // Truncate failed
+            }
         }
 #endif
         return 0;
