@@ -2726,8 +2726,12 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         std::size_t count = static_cast<std::size_t>(a(2));
         if (count > 1024*1024) count = 1024*1024;
         std::vector<char> data(count);
+#if defined(_WIN32)
         int res = ::read(fd, data.data(), static_cast<unsigned int>(count));
-        if (res > 0 && mem_.store(buf, data.data(), res) != MemoryError::ok) return static_cast<std::uint64_t>(-1);
+#else
+        ssize_t res = ::read(fd, data.data(), count);
+#endif
+        if (res > 0 && mem_.store(buf, data.data(), static_cast<std::size_t>(res)) != MemoryError::ok) return static_cast<std::uint64_t>(-1);
         return static_cast<std::uint64_t>(res);
     }
     if (n=="_open" || n=="open") {
@@ -2743,7 +2747,11 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n=="_lseek" || n=="lseek") {
         int fd = static_cast<int>(a(0));
+#if defined(_WIN32)
         long offset = static_cast<long>(a(1));
+#else
+        off_t offset = static_cast<off_t>(a(1));
+#endif
         int whence = static_cast<int>(a(2));
         return static_cast<std::uint64_t>(::lseek(fd, offset, whence));
     }

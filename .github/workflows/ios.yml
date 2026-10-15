@@ -36,6 +36,7 @@ jobs:
             -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_GCC_WARN_64_TO_32_BIT_CONVERSION=NO \
             -DCMAKE_XCODE_ATTRIBUTE_CLANG_WARN_SHORTEN_64_TO_32=NO \
             -DBB_BUILD_ID=${{ github.sha }} -DBB_GENERATED_DIR="$PWD/build-host/generated"
           cmake --build build-ios --config Release --target BBHost -- \
