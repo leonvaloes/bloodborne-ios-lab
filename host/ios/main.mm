@@ -43,24 +43,25 @@
         if ([phase isEqualToString:@"ended"] || [phase isEqualToString:@"cancelled"]) {
             [self.controller setLeftStickX:0.0f y:0.0f];
         } else {
-            float cx = size.width * 0.25f;
-            float cy = size.height * 0.5f;
-            float maxR = std::min(cx, cy) * 0.8f;
+            float cx = (float)(size.width * 0.25);
+            float cy = (float)(size.height * 0.5);
+            float maxR = std::min<float>(cx, cy) * 0.8f;
             if (maxR < 10.0f) maxR = 50.0f;
-            float nx = std::clamp((float)(loc.x - cx) / maxR, -1.0f, 1.0f);
-            float ny = std::clamp((float)(cy - loc.y) / maxR, -1.0f, 1.0f);
+            float nx = std::clamp<float>((float)(loc.x - cx) / maxR, -1.0f, 1.0f);
+            float ny = std::clamp<float>((float)(cy - loc.y) / maxR, -1.0f, 1.0f);
             [self.controller setLeftStickX:nx y:ny];
         }
     } else {
         if ([phase isEqualToString:@"ended"] || [phase isEqualToString:@"cancelled"]) {
             [self.controller setRightStickX:0.0f y:0.0f];
         } else {
-            float cx = size.width * 0.75f;
-            float cy = size.height * 0.5f;
-            float maxR = std::min(size.width * 0.25f, cy) * 0.8f;
+            float cx = (float)(size.width * 0.75);
+            float cy = (float)(size.height * 0.5);
+            float halfW = (float)(size.width * 0.25);
+            float maxR = std::min<float>(halfW, cy) * 0.8f;
             if (maxR < 10.0f) maxR = 50.0f;
-            float nx = std::clamp((float)(loc.x - cx) / maxR, -1.0f, 1.0f);
-            float ny = std::clamp((float)(cy - loc.y) / maxR, -1.0f, 1.0f);
+            float nx = std::clamp<float>((float)(loc.x - cx) / maxR, -1.0f, 1.0f);
+            float ny = std::clamp<float>((float)(cy - loc.y) / maxR, -1.0f, 1.0f);
             [self.controller setRightStickX:nx y:ny];
         }
     }
