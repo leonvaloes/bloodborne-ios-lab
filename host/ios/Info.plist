@@ -4,12 +4,14 @@
 <key>CFBundleExecutable</key><string>BBHost</string>
 <key>CFBundleIdentifier</key><string>org.bloodborne.lab.BBHost</string>
 <key>CFBundleName</key><string>BBHost</string>
-<key>CFBundleDisplayName</key><string>BB Lab</string>
+<key>CFBundleDisplayName</key><string>Bloodborne</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleShortVersionString</key><string>1.0.0</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>LSRequiresIPhoneOS</key><true/>
 <key>MinimumOSVersion</key><string>17.0</string>
+<key>UIStatusBarHidden</key><true/>
+<key>UIViewControllerBasedStatusBarAppearance</key><true/>
 <key>UILaunchScreen</key><dict/>
 <key>UIApplicationSceneManifest</key><dict>
 <key>UIApplicationSupportsMultipleScenes</key><false/>
@@ -17,7 +19,7 @@
 <key>UISceneConfigurationName</key><string>Default Configuration</string>
 <key>UISceneDelegateClassName</key><string>LabSceneDelegate</string>
 </dict></array></dict></dict>
-<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string><string>UIInterfaceOrientationPortrait</string></array>
 <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string><string>metal</string></array>
 <key>GCSupportedGameControllers</key><array><dict><key>ProfileName</key><string>ExtendedGamepad</string></dict></array>
 <key>GCSupportsControllerUserInteraction</key><true/>

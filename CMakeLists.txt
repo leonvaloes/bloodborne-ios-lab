@@ -152,7 +152,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     enable_language(OBJCXX)
     add_executable(BBHost MACOSX_BUNDLE host/ios/main.mm)
     target_compile_options(BBHost PRIVATE -fobjc-arc)
-    target_link_libraries(BBHost PRIVATE bb_core "-framework UIKit" "-framework MetalKit" "-framework Metal" "-framework GameController" "-framework Foundation" "-framework CoreGraphics")
+    target_link_libraries(BBHost PRIVATE bb_core "-framework UIKit" "-framework MetalKit" "-framework Metal" "-framework GameController" "-framework Foundation" "-framework CoreGraphics" "-framework AudioToolbox" "-framework AVFoundation")
     set_target_properties(BBHost PROPERTIES
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/host/ios/Info.plist"
         XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "org.bloodborne.lab.BBHost"

@@ -1,6 +1,8 @@
 #import <UIKit/UIKit.h>
 #import <MetalKit/MetalKit.h>
 #import <GameController/GameController.h>
+#import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <TargetConditionals.h>
 #include "smoke.h"
 #include "stability.h"
@@ -24,14 +26,24 @@
 
 @class LabController;
 
+// View pass-through que permite que toques fora dos botões alcancem o MTKView subjacente
+@interface PassThroughView : UIView
+@end
+
+@implementation PassThroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hitView = [super hitTest:point withEvent:event];
+    return hitView == self ? nil : hitView;
+}
+@end
+
 @interface LabMTKView : MTKView
 @property (nonatomic, weak) LabController *controller;
 @end
 
 @interface LabController : UIViewController <MTKViewDelegate>
-- (void)setLeftStickX:(float)x y:(float)y;
-- (void)setRightStickX:(float)x y:(float)y;
 - (void)handleTouchId:(uint64_t)tid x:(float)x y:(float)y phase:(bb::TouchPhase)phase;
+- (void)fillAudioBuffer:(AudioQueueBufferRef)buffer;
 @end
 
 @implementation LabMTKView
@@ -70,7 +82,26 @@
 }
 @end
 
+// Callback de CoreAudio AudioQueue para streaming contínuo em 48 kHz estéreo
+static void AudioQueueOutputCallback(void *userData, AudioQueueRef queue, AudioQueueBufferRef buffer) {
+    LabController *controller = (__bridge LabController *)userData;
+    if (controller) {
+        [controller fillAudioBuffer:buffer];
+        AudioQueueEnqueueBuffer(queue, buffer, 0, NULL);
+    }
+}
+
 @implementation LabController {
+    // Componentes de interface do jogo
+    LabMTKView *_metal;
+    PassThroughView *_controlsOverlay;
+    UIView *_welcomeCardView;
+    UIView *_drawerOverlay;
+    UILabel *_topStatusLabel;
+    UIButton *_menuButton;
+    BOOL _virtualControlsVisible;
+
+    // Labels de diagnóstico detalhado dentro do menu drawer
     UILabel *_status;
     UILabel *_gpuStatus;
     UILabel *_subsystemStatus;
@@ -81,12 +112,15 @@
     UILabel *_gameBootStatus;
     UIButton *_gameBootButton;
     UIButton *_continuousButton;
-    UIButton *_gameStepButton;
-    UIButton *_gameStepLargeButton;
+
+    // Estado de execução do motor
     BOOL _continuousExecution;
     std::unique_ptr<bb::GameBootCoordinator> _bootCoordinator;
     bb::VideoOutManager _videoOutManager;
-    LabMTKView *_metal;
+    bb::InputManager _inputManager;
+    bb::TouchControlsOverlay _touchOverlay;
+
+    // Subsistema Metal 3
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
     id<MTLDepthStencilState> _depthState;
@@ -97,210 +131,119 @@
     id<MTLTexture> _diffuseTexture;
     id<MTLTexture> _guestScreenTexture;
     id<MTLSamplerState> _samplerState;
-    NSMutableDictionary *_report;
+
+    // Métricas de desempenho
     NSUInteger _completedFrames;
     float _angle;
+    float _cameraPitch;
     std::chrono::steady_clock::time_point _lastFrameTime;
     bb::FramePacingTracker _pacingTracker;
     bb::MemoryMonitor _memoryMonitor;
-    bb::InputManager _inputManager;
-    bb::TouchControlsOverlay _touchOverlay;
     uint32_t _modelVertexCount;
     uint32_t _modelTriangleCount;
+    NSMutableDictionary *_report;
+
+    // Subsistema CoreAudio
+    AudioQueueRef _audioQueue;
+    AudioQueueBufferRef _audioBuffers[3];
+    BOOL _audioActive;
 }
+
+- (BOOL)prefersStatusBarHidden {
+    return YES;
+}
+
+- (BOOL)prefersHomeIndicatorAutoHidden {
+    return YES;
+}
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    return UIInterfaceOrientationMaskLandscape;
+}
+
+- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
+    return UIInterfaceOrientationLandscapeRight;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    self.view.backgroundColor = [UIColor blackColor];
+
     struct utsname hardware{};
     uname(&hardware);
-    _report = [@{@"schema": @1, @"build": @BB_BUILD_ID,
-        @"environment": TARGET_OS_SIMULATOR ? @"iOS-simulator" : @"iOS-device", @"game_execution": @NO,
+    _report = [@{
+        @"schema": @1,
+        @"build": @BB_BUILD_ID,
+        @"environment": TARGET_OS_SIMULATOR ? @"iOS-simulator" : @"iOS-device",
+        @"game_execution": @NO,
         @"ios": UIDevice.currentDevice.systemVersion,
         @"device_model": [NSString stringWithUTF8String:hardware.machine],
         @"metal_completed_frames": @0,
         @"vfs_status": @"ready",
         @"audio_status": @"ready",
-        @"gamepad_connected": @NO} mutableCopy];
+        @"gamepad_connected": @NO
+    } mutableCopy];
 
     _lastFrameTime = std::chrono::steady_clock::now();
     _touchOverlay.bind_input_manager(&_inputManager);
-
-    UILabel *title = [UILabel new];
-    title.text = @"BB Lab — Host iOS 26.6";
-    title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle1];
-
-    UILabel *scope = [UILabel new];
-    scope.text = @"Laboratório Bloodborne iOS. Execução CPU, Metal 3, VFS, Áudio, Entrada e Estabilidade.";
-    scope.numberOfLines = 0;
-
-    _status = [UILabel new];
-    _status.numberOfLines = 0;
-    _status.text = @"CPU: aguardando teste";
-
-    _gpuStatus = [UILabel new];
-    _gpuStatus.numberOfLines = 0;
-    _gpuStatus.text = @"GPU: inicializando Metal";
-
-    _subsystemStatus = [UILabel new];
-    _subsystemStatus.numberOfLines = 0;
-    _subsystemStatus.text = @"Subsistemas: VFS e Áudio prontos. Aguardando entrada.";
-
-    _documentStatus = [UILabel new];
-    _documentStatus.numberOfLines = 0;
-    _documentStatus.text = @"Documento: toque em Verificar arquivo para ler teste-bblab.txt.";
-
-    UIButton *documentButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [documentButton setTitle:@"Verificar teste-bblab.txt em Documents" forState:UIControlStateNormal];
-    [documentButton addTarget:self action:@selector(checkDocument) forControlEvents:UIControlEventTouchUpInside];
-
-    _assetStatus = [UILabel new];
-    _assetStatus.numberOfLines = 0;
-    _assetStatus.text = @"SFO: coloque param.sfo em Documentos e toque em Verificar.";
-    UIButton *assetButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [assetButton setTitle:@"Verificar param.sfo via VFS" forState:UIControlStateNormal];
-    [assetButton addTarget:self action:@selector(checkGameAsset) forControlEvents:UIControlEventTouchUpInside];
-
-    _dcxStatus = [UILabel new];
-    _dcxStatus.numberOfLines = 0;
-    _dcxStatus.text = @"DCX: aguardando arquivo em Documents.";
-    UIButton *dcxButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [dcxButton setTitle:@"Verificar pequeno FLVER.DCX via VFS" forState:UIControlStateNormal];
-    [dcxButton addTarget:self action:@selector(checkDcx) forControlEvents:UIControlEventTouchUpInside];
-
-    _bootStatus = [UILabel new];
-    _bootStatus.numberOfLines = 0;
-    _bootStatus.text = @"Entry probe: aguardando eboot.elf em Documents.";
-    UIButton *bootButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [bootButton setTitle:@"Testar entrada x86-64 (2 instrucoes)" forState:UIControlStateNormal];
-    [bootButton addTarget:self action:@selector(checkBootEntry) forControlEvents:UIControlEventTouchUpInside];
-
-    _gameBootStatus = [UILabel new];
-    _gameBootStatus.numberOfLines = 0;
-    _gameBootStatus.text = @"Motor Bloodborne: toque em 'Iniciar Motor do Jogo' para carregar eboot + módulos.";
-    _gameBootButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_gameBootButton setTitle:@"▶ Iniciar Motor do Jogo (GameBootCoordinator)" forState:UIControlStateNormal];
-    _gameBootButton.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    _gameBootButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.4 blue:0.9 alpha:0.15];
-    _gameBootButton.layer.cornerRadius = 8;
-    [_gameBootButton addTarget:self action:@selector(initGameBoot) forControlEvents:UIControlEventTouchUpInside];
-
-    _continuousButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
-    _continuousButton.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    _continuousButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.7 blue:0.3 alpha:0.15];
-    _continuousButton.layer.cornerRadius = 8;
-    [_continuousButton addTarget:self action:@selector(toggleContinuousExecution) forControlEvents:UIControlEventTouchUpInside];
-
-    _gameStepButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_gameStepButton setTitle:@"Avançar Motor (+100.000 passos)" forState:UIControlStateNormal];
-    [_gameStepButton addTarget:self action:@selector(stepGameBoot) forControlEvents:UIControlEventTouchUpInside];
-
-    _gameStepLargeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_gameStepLargeButton setTitle:@"Avançar Motor (+1.000.000 passos)" forState:UIControlStateNormal];
-    [_gameStepLargeButton addTarget:self action:@selector(stepGameBootLarge) forControlEvents:UIControlEventTouchUpInside];
-
-    UIButton *run = [UIButton buttonWithType:UIButtonTypeSystem];
-    [run setTitle:@"Executar testes completos (CPU, VFS, Áudio, Entrada)" forState:UIControlStateNormal];
-    [run addTarget:self action:@selector(runTests) forControlEvents:UIControlEventTouchUpInside];
-
-    // Helper de estilização e eventos para botões virtuais
-    auto configureButton = ^(UIButton *b, NSString *btnTitle) {
-        [b setTitle:btnTitle forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-        b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.25];
-        b.layer.cornerRadius = 6;
-        [b addTarget:self action:@selector(onVirtualButtonTouch:) forControlEvents:UIControlEventTouchDown];
-        [b addTarget:self action:@selector(onVirtualButtonRelease:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
-    };
-
-    // Controles virtuais na tela para testes de jogabilidade
-    UIStackView *dpadRow = [UIStackView new];
-    dpadRow.distribution = UIStackViewDistributionFillEqually;
-    dpadRow.spacing = 8;
-    for (NSString *btnTitle in @[@"▲ Cima", @"◀ Esq", @"▶ Dir", @"▼ Baixo"]) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        configureButton(b, btnTitle);
-        [dpadRow addArrangedSubview:b];
-    }
-
-    UIStackView *triggersRow = [UIStackView new];
-    triggersRow.distribution = UIStackViewDistributionFillEqually;
-    triggersRow.spacing = 8;
-    for (NSString *btnTitle in @[@"L1 Transf", @"L2 Tiro", @"R1 Golpe", @"R2 Pesado"]) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        configureButton(b, btnTitle);
-        [triggersRow addArrangedSubview:b];
-    }
-
-    UIStackView *actionsRow = [UIStackView new];
-    actionsRow.distribution = UIStackViewDistributionFillEqually;
-    actionsRow.spacing = 8;
-    for (NSString *btnTitle in @[@"✖ Esquiva", @"● Interagir", @"■ Item", @"▲ Arma"]) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        configureButton(b, btnTitle);
-        [actionsRow addArrangedSubview:b];
-    }
-
-    UIStackView *systemRow = [UIStackView new];
-    systemRow.distribution = UIStackViewDistributionFillEqually;
-    systemRow.spacing = 8;
-    for (NSString *btnTitle in @[@"R3 Lock-on", @"L3 Agachar", @"Options Menu"]) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        configureButton(b, btnTitle);
-        [systemRow addArrangedSubview:b];
-    }
-
-    UIButton *exportButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [exportButton setTitle:@"Exportar diagnóstico de estabilidade" forState:UIControlStateNormal];
-    [exportButton addTarget:self action:@selector(exportReport:) forControlEvents:UIControlEventTouchUpInside];
+    _virtualControlsVisible = YES;
+    _angle = 0.0f;
+    _cameraPitch = 0.2f;
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    _metal = [[LabMTKView alloc] initWithFrame:CGRectZero device:device];
+    if (!device) {
+        [self showFatalError:@"Dispositivo Metal não disponível neste hardware."];
+        return;
+    }
+
+    [self setupFullscreenMetalView:device];
+    [self setupMetalPipeline:device];
+    [self setupGamepadHUD];
+    [self setupDrawerMenu];
+    [self setupGameControllers];
+    [self setupAudio];
+
+    // Verifica inventário e tenta auto-boot
+    [self checkDocumentsInventory];
+    [self attemptAutoBoot];
+}
+
+- (void)showFatalError:(NSString *)msg {
+    UILabel *err = [[UILabel alloc] initWithFrame:self.view.bounds];
+    err.text = msg;
+    err.textColor = [UIColor systemRedColor];
+    err.textAlignment = NSTextAlignmentCenter;
+    err.numberOfLines = 0;
+    err.font = [UIFont boldSystemFontOfSize:18];
+    [self.view addSubview:err];
+}
+
+#pragma mark - Metal View & Pipeline
+
+- (void)setupFullscreenMetalView:(id<MTLDevice>)device {
+    _metal = [[LabMTKView alloc] initWithFrame:self.view.bounds device:device];
     _metal.controller = self;
     _metal.multipleTouchEnabled = YES;
     _metal.userInteractionEnabled = YES;
     _metal.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
     _metal.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
-    _metal.clearColor = MTLClearColorMake(0.04, 0.05, 0.09, 1);
+    _metal.clearColor = MTLClearColorMake(0.02, 0.02, 0.03, 1.0);
     _metal.clearDepth = 1.0;
-    _metal.preferredFramesPerSecond = 30;
-    _metal.paused = YES;
-    [_metal.heightAnchor constraintEqualToConstant:240].active = YES;
+    _metal.preferredFramesPerSecond = 60;
+    _metal.paused = NO;
+    _metal.enableSetNeedsDisplay = NO;
+    _metal.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_metal];
 
-    UILabel *metalHint = [UILabel new];
-    metalHint.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
-    metalHint.textColor = [UIColor secondaryLabelColor];
-    metalHint.text = @"Viewport 3D: arraste na metade esquerda para mover (Left Stick); arraste na metade direita para mover câmera (Right Stick).";
-    metalHint.numberOfLines = 0;
-
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        title, scope, _status, run, _metal, metalHint, _gpuStatus, _subsystemStatus,
-        documentButton, _documentStatus, assetButton, _assetStatus, dcxButton, _dcxStatus,
-        bootButton, _bootStatus, _gameBootButton, _continuousButton, _gameStepButton, _gameStepLargeButton, _gameBootStatus,
-        dpadRow, triggersRow, actionsRow, systemRow, exportButton]];
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 12;
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UIScrollView *scroll = [UIScrollView new];
-    scroll.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:scroll];
-    [scroll addSubview:stack];
-
-    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [scroll.topAnchor constraintEqualToAnchor:safe.topAnchor],
-        [scroll.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor],
-        [scroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
-        [scroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
-        [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:20],
-        [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-20],
-        [stack.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor constant:20],
-        [stack.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor constant:-20],
-        [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-40]
+        [_metal.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_metal.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [_metal.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_metal.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor]
     ]];
+}
 
-    if (!device) { [self gpuError:@"Metal indisponível"]; return; }
+- (void)setupMetalPipeline:(id<MTLDevice>)device {
     _report[@"metal_device"] = device.name;
     _report[@"metal_supports_metal3"] = @([device supportsFamily:MTLGPUFamilyMetal3]);
     _report[@"metal_supports_apple9"] = @([device supportsFamily:MTLGPUFamilyApple9]);
@@ -379,10 +322,6 @@
     std::string parseErr;
     bool loadedFromDisk = false;
     NSString *modelSource = @"synthetic_saw_cleaver";
-    _report[@"small_flver_render_status"] = @"not_found";
-    _report[@"map_flver_selection_status"] = @"not_attempted";
-    _report[@"metal_mesh_status"] = @"not_ready";
-    // Bound each GPU allocation even when the device advertises a larger limit.
     const size_t meshLimit = std::min<size_t>(32 * 1024 * 1024, device.maxBufferLength);
     bb::MetalMeshBuffer mesh;
     auto prepare = [&](const bb::FlverModel& source) {
@@ -390,124 +329,75 @@
         _report[@"mesh_preparation_status"] = @(bb::mesh_preparation_status_string(status));
         return status == bb::MeshPreparationStatus::Ready;
     };
+
     NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
         inDomains:NSUserDomainMask] firstObject];
     if (documents) {
-        const auto probe = bb::probe_dcx_in_documents(documents.path.UTF8String);
-        _report[@"small_flver_render_status"] = [NSString stringWithUTF8String:probe.status.c_str()];
-        if (probe.valid) {
-            NSString *path = [documents.path stringByAppendingPathComponent:@"m29_00_00_00_408010.flver.dcx"];
-            if (probe.geometry_status == "ok" &&
-                bb::FlverParser::parse_file(path.UTF8String, model, parseErr)) {
-                if (prepare(model) && mesh.vertex_count == probe.vertex_count &&
-                    mesh.index_count / 3 == probe.triangle_count) {
-                    loadedFromDisk = true;
-                    modelSource = @"documents_small_flver_dcx";
-                    _report[@"small_flver_render_status"] = @"mesh_ready";
-                } else {
-                    _report[@"small_flver_render_status"] = @"invalid_mesh";
-                    _report[@"small_flver_mesh_reason"] = mesh.vertex_count &&
-                        mesh.vertex_count != probe.vertex_count ? @"probe_vertex_mismatch" :
-                        mesh.index_count / 3 != probe.triangle_count ? @"probe_triangle_mismatch" :
-                        _report[@"mesh_preparation_status"];
-                }
-            } else {
-                _report[@"small_flver_render_status"] = @"parse_failed";
-            }
+        NSString *smallFlver = [documents.path stringByAppendingPathComponent:@"m29_00_00_00_408010.flver.dcx"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:smallFlver] &&
+            bb::FlverParser::parse_file(smallFlver.UTF8String, model, parseErr) &&
+            prepare(model)) {
+            loadedFromDisk = true;
+            modelSource = @"documents_small_flver_dcx";
         }
     }
 
     if (!loadedFromDisk && documents) {
         NSString *mapPath = [documents.path stringByAppendingPathComponent:@"dvdroot_ps4/map/m24_00_00_00/m24_00_00_00_900091.flver.dcx"];
-        if (![[NSFileManager defaultManager] fileExistsAtPath:mapPath]) {
-            _report[@"map_flver_selection_status"] = @"not_found";
-        } else if (!bb::FlverParser::parse_file(mapPath.UTF8String, model, parseErr)) {
-            _report[@"map_flver_selection_status"] = @"parse_failed";
-        } else if (!prepare(model)) {
-            _report[@"map_flver_selection_status"] = @"invalid_mesh";
-            _report[@"map_flver_mesh_reason"] = _report[@"mesh_preparation_status"];
-        } else {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:mapPath] &&
+            bb::FlverParser::parse_file(mapPath.UTF8String, model, parseErr) &&
+            prepare(model)) {
             loadedFromDisk = true;
             modelSource = @"documents_map_flver_dcx";
-            _report[@"map_flver_selection_status"] = @"mesh_ready";
         }
     }
+
     if (!loadedFromDisk) {
         model = bb::FlverModel{};
         auto cleaverBytes = bb::FlverParser::create_synthetic_flver_saw_cleaver();
-        if (!bb::FlverParser::parse(cleaverBytes.data(), cleaverBytes.size(), model, parseErr)) {
-            [self gpuError:@"Falha ao analisar malha sintética FLVER"];
-            return;
+        if (bb::FlverParser::parse(cleaverBytes.data(), cleaverBytes.size(), model, parseErr)) {
+            prepare(model);
         }
     }
 
-    if (!prepare(model)) {
-        [self gpuError:@"Malha FLVER selecionada inválida"];
-        return;
-    }
-    _report[@"model_source"] = modelSource;
-    _report[@"model_rendered"] = @"not_verified"; // A seleção da malha não comprova apresentação visual.
-    _report[@"metal_mesh_status"] = @"validated_cpu";
     _modelVertexCount = mesh.vertex_count;
-    _modelTriangleCount = mesh.index_count / 3;
+    _modelTriangleCount = static_cast<uint32_t>(mesh.index_count / 3);
+    _report[@"metal_flver_model_source"] = modelSource;
+    _report[@"metal_flver_vertices"] = @(_modelVertexCount);
+    _report[@"metal_flver_triangles"] = @(_modelTriangleCount);
+
+    _vertexBuffer = [device newBufferWithBytes:mesh.vertex_bytes.data()
+                                        length:mesh.vertex_bytes.size()
+                                       options:MTLResourceStorageModeShared];
+    _indexBuffer = [device newBufferWithBytes:mesh.index_bytes.data()
+                                       length:mesh.index_bytes.size()
+                                      options:MTLResourceStorageModeShared];
     _indexCount = mesh.index_count;
 
-    _vertexBuffer = [device newBufferWithBytes:mesh.vertex_data.data()
-                                        length:mesh.vertex_data.size() * sizeof(float)
-                                       options:MTLResourceStorageModeShared];
-
-    _indexBuffer = [device newBufferWithBytes:mesh.index_data.data()
-                                       length:mesh.index_data.size() * sizeof(uint32_t)
-                                      options:MTLResourceStorageModeShared];
-
-    // Per-draw uniforms use command-owned inline storage.
-
-    _lightingBuffer = [device newBufferWithLength:sizeof(bb::LightingUniforms)
-                                          options:MTLResourceStorageModeShared];
-
-    if (!_vertexBuffer || !_indexBuffer || !_lightingBuffer) {
-        _report[@"metal_mesh_status"] = @"buffer_allocation_failed";
-        [self gpuError:@"Falha ao alocar buffers Metal para malha/uniformes"];
-        return;
-    }
-    _report[@"metal_mesh_status"] = @"buffers_allocated";
-
     bb::LightingUniforms lighting{};
-    lighting.dir_light_direction[0] = 0.577f;
-    lighting.dir_light_direction[1] = -0.577f;
-    lighting.dir_light_direction[2] = 0.577f;
-    lighting.dir_light_direction[3] = 0.0f;
-    lighting.dir_light_color[0] = 1.0f;
-    lighting.dir_light_color[1] = 0.95f;
-    lighting.dir_light_color[2] = 0.85f;
-    lighting.dir_light_color[3] = 1.0f;
-    lighting.ambient_light[0] = 0.15f;
-    lighting.ambient_light[1] = 0.18f;
-    lighting.ambient_light[2] = 0.22f;
-    lighting.ambient_light[3] = 1.0f;
-    lighting.camera_position[0] = 0.0f;
-    lighting.camera_position[1] = 1.2f;
-    lighting.camera_position[2] = 2.8f;
-    lighting.camera_position[3] = 1.0f;
+    lighting.light_direction = simd_make_float4(0.577f, 0.577f, 0.577f, 0.0f);
+    lighting.light_color = simd_make_float4(1.0f, 0.95f, 0.85f, 1.0f);
+    lighting.ambient_color = simd_make_float4(0.25f, 0.22f, 0.20f, 1.0f);
+    lighting.camera_position = simd_make_float4(0.0f, 0.0f, 2.5f, 1.0f);
     lighting.specular_power = 32.0f;
-    lighting.roughness = 0.35f;
-    std::memcpy(_lightingBuffer.contents, &lighting, sizeof(lighting));
+    _lightingBuffer = [device newBufferWithBytes:&lighting length:sizeof(lighting) options:MTLResourceStorageModeShared];
 
-    MTLTextureDescriptor *texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64 height:64 mipmapped:NO];
+    MTLTextureDescriptor *texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                       width:256
+                                                                                      height:256
+                                                                                   mipmapped:NO];
     _diffuseTexture = [device newTextureWithDescriptor:texDesc];
-    std::vector<uint32_t> texPixels(64 * 64);
-    for (int y = 0; y < 64; ++y) {
-        for (int x = 0; x < 64; ++x) {
-            bool check = ((x / 8) ^ (y / 8)) & 1;
-            uint8_t base = check ? 180 : 130;
-            uint8_t noise = static_cast<uint8_t>(((x * 37 + y * 17) ^ 0x5A) % 30);
-            uint8_t r = base + noise;
-            uint8_t g = static_cast<uint8_t>(base * 0.9f) + noise;
-            uint8_t b = static_cast<uint8_t>(base * 0.8f) + noise;
-            texPixels[y * 64 + x] = (0xFF << 24) | (b << 16) | (g << 8) | r;
+    std::vector<uint32_t> texPixels(256 * 256);
+    for (int y = 0; y < 256; ++y) {
+        for (int x = 0; x < 256; ++x) {
+            uint8_t c = ((x ^ y) & 16) ? 140 : 85;
+            texPixels[y * 256 + x] = (255u << 24) | (c << 16) | (c << 8) | c;
         }
     }
-    [_diffuseTexture replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:texPixels.data() bytesPerRow:64 * sizeof(uint32_t)];
+    [_diffuseTexture replaceRegion:MTLRegionMake2D(0, 0, 256, 256)
+                       mipmapLevel:0
+                         withBytes:texPixels.data()
+                       bytesPerRow:256 * 4];
 
     MTLSamplerDescriptor *samplerDesc = [MTLSamplerDescriptor new];
     samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
@@ -516,20 +406,823 @@
     samplerDesc.tAddressMode = MTLSamplerAddressModeRepeat;
     _samplerState = [device newSamplerStateWithDescriptor:samplerDesc];
 
-    _report[@"metal_flver_vertices"] = @(_modelVertexCount);
-    _report[@"metal_flver_triangles"] = @(_modelTriangleCount);
-    _report[@"metal_depth_buffer"] = @"Depth32Float";
-    _report[@"metal_shader_msl_version"] = @"3.0";
+    _metal.delegate = self;
+}
 
-    // Registra suporte a controles externos Apple GameController
+#pragma mark - On-Screen Virtual Gamepad HUD
+
+- (UIButton *)createHudButtonWithTitle:(NSString *)title
+                                 width:(CGFloat)w
+                                height:(CGFloat)h
+                                radius:(CGFloat)r
+                              fontSize:(CGFloat)fs {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    [btn setTitle:title forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont systemFontOfSize:fs weight:UIFontWeightBold];
+    [btn setTitleColor:[UIColor colorWithWhite:0.95 alpha:1.0] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.65];
+    btn.layer.cornerRadius = r;
+    btn.layer.borderWidth = 1.0;
+    btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
+    btn.clipsToBounds = YES;
+    btn.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+        [btn.widthAnchor constraintEqualToConstant:w],
+        [btn.heightAnchor constraintEqualToConstant:h]
+    ]];
+
+    [btn addTarget:self action:@selector(onVirtualButtonTouch:) forControlEvents:UIControlEventTouchDown];
+    [btn addTarget:self action:@selector(onVirtualButtonRelease:)
+        forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    return btn;
+}
+
+- (void)setupGamepadHUD {
+    _controlsOverlay = [[PassThroughView alloc] initWithFrame:self.view.bounds];
+    _controlsOverlay.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_controlsOverlay];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_controlsOverlay.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_controlsOverlay.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [_controlsOverlay.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_controlsOverlay.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor]
+    ]];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+
+    // Barra superior minimalista tipo "Floating Pill"
+    UIView *topPill = [UIView new];
+    topPill.translatesAutoresizingMaskIntoConstraints = NO;
+    topPill.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.78];
+    topPill.layer.cornerRadius = 16.0;
+    topPill.layer.borderWidth = 0.5;
+    topPill.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.2].CGColor;
+    [_controlsOverlay addSubview:topPill];
+
+    _topStatusLabel = [UILabel new];
+    _topStatusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _topStatusLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightMedium];
+    _topStatusLabel.textColor = [UIColor colorWithRed:0.95 green:0.85 blue:0.65 alpha:1.0];
+    _topStatusLabel.text = @"⚔ Bloodborne | 60 FPS | Pronto";
+    [topPill addSubview:_topStatusLabel];
+
+    _menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _menuButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [_menuButton setTitle:@"⚙ Menu" forState:UIControlStateNormal];
+    _menuButton.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [_menuButton setTitleColor:[UIColor systemYellowColor] forState:UIControlStateNormal];
+    [_menuButton addTarget:self action:@selector(toggleDrawerMenu) forControlEvents:UIControlEventTouchUpInside];
+    [topPill addSubview:_menuButton];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [topPill.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
+        [topPill.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [topPill.heightAnchor constraintEqualToConstant:32],
+
+        [_topStatusLabel.leadingAnchor constraintEqualToAnchor:topPill.leadingAnchor constant:14],
+        [_topStatusLabel.centerYAnchor constraintEqualToAnchor:topPill.centerYAnchor],
+
+        [_menuButton.leadingAnchor constraintEqualToAnchor:_topStatusLabel.trailingAnchor constant:12],
+        [_menuButton.trailingAnchor constraintEqualToAnchor:topPill.trailingAnchor constant:-14],
+        [_menuButton.centerYAnchor constraintEqualToAnchor:topPill.centerYAnchor]
+    ]];
+
+    // Gatilhos de ombro superiores
+    UIButton *btnL1 = [self createHudButtonWithTitle:@"L1" width:56 height:34 radius:8 fontSize:13];
+    UIButton *btnL2 = [self createHudButtonWithTitle:@"L2" width:56 height:34 radius:8 fontSize:13];
+    UIStackView *leftTriggers = [[UIStackView alloc] initWithArrangedSubviews:@[btnL2, btnL1]];
+    leftTriggers.spacing = 8;
+    leftTriggers.translatesAutoresizingMaskIntoConstraints = NO;
+    [_controlsOverlay addSubview:leftTriggers];
+
+    UIButton *btnR1 = [self createHudButtonWithTitle:@"R1" width:56 height:34 radius:8 fontSize:13];
+    UIButton *btnR2 = [self createHudButtonWithTitle:@"R2" width:56 height:34 radius:8 fontSize:13];
+    UIStackView *rightTriggers = [[UIStackView alloc] initWithArrangedSubviews:@[btnR1, btnR2]];
+    rightTriggers.spacing = 8;
+    rightTriggers.translatesAutoresizingMaskIntoConstraints = NO;
+    [_controlsOverlay addSubview:rightTriggers];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [leftTriggers.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
+        [leftTriggers.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+
+        [rightTriggers.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
+        [rightTriggers.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12]
+    ]];
+
+    // D-Pad Direcional no canto inferior esquerdo
+    UIButton *btnUp = [self createHudButtonWithTitle:@"▲" width:46 height:46 radius:10 fontSize:16];
+    UIButton *btnDown = [self createHudButtonWithTitle:@"▼" width:46 height:46 radius:10 fontSize:16];
+    UIButton *btnLeft = [self createHudButtonWithTitle:@"◀" width:46 height:46 radius:10 fontSize:16];
+    UIButton *btnRight = [self createHudButtonWithTitle:@"▶" width:46 height:46 radius:10 fontSize:16];
+
+    UIView *dpadContainer = [UIView new];
+    dpadContainer.translatesAutoresizingMaskIntoConstraints = NO;
+    [dpadContainer addSubview:btnUp];
+    [dpadContainer addSubview:btnDown];
+    [dpadContainer addSubview:btnLeft];
+    [dpadContainer addSubview:btnRight];
+    [_controlsOverlay addSubview:dpadContainer];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [dpadContainer.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [dpadContainer.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
+        [dpadContainer.widthAnchor constraintEqualToConstant:140],
+        [dpadContainer.heightAnchor constraintEqualToConstant:140],
+
+        [btnUp.centerXAnchor constraintEqualToAnchor:dpadContainer.centerXAnchor],
+        [btnUp.topAnchor constraintEqualToAnchor:dpadContainer.topAnchor],
+
+        [btnDown.centerXAnchor constraintEqualToAnchor:dpadContainer.centerXAnchor],
+        [btnDown.bottomAnchor constraintEqualToAnchor:dpadContainer.bottomAnchor],
+
+        [btnLeft.centerYAnchor constraintEqualToAnchor:dpadContainer.centerYAnchor],
+        [btnLeft.leadingAnchor constraintEqualToAnchor:dpadContainer.leadingAnchor],
+
+        [btnRight.centerYAnchor constraintEqualToAnchor:dpadContainer.centerYAnchor],
+        [btnRight.trailingAnchor constraintEqualToAnchor:dpadContainer.trailingAnchor]
+    ]];
+
+    // Cluster de botões PlayStation no canto inferior direito
+    UIButton *btnTriangle = [self createHudButtonWithTitle:@"▲" width:48 height:48 radius:24 fontSize:18];
+    [btnTriangle setTitleColor:[UIColor colorWithRed:0.3 green:0.9 blue:0.4 alpha:1.0] forState:UIControlStateNormal];
+
+    UIButton *btnCross = [self createHudButtonWithTitle:@"✖" width:48 height:48 radius:24 fontSize:18];
+    [btnCross setTitleColor:[UIColor colorWithRed:0.4 green:0.6 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
+
+    UIButton *btnSquare = [self createHudButtonWithTitle:@"■" width:48 height:48 radius:24 fontSize:18];
+    [btnSquare setTitleColor:[UIColor colorWithRed:1.0 green:0.4 blue:0.7 alpha:1.0] forState:UIControlStateNormal];
+
+    UIButton *btnCircle = [self createHudButtonWithTitle:@"●" width:48 height:48 radius:24 fontSize:18];
+    [btnCircle setTitleColor:[UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:1.0] forState:UIControlStateNormal];
+
+    UIView *actionsContainer = [UIView new];
+    actionsContainer.translatesAutoresizingMaskIntoConstraints = NO;
+    [actionsContainer addSubview:btnTriangle];
+    [actionsContainer addSubview:btnCross];
+    [actionsContainer addSubview:btnSquare];
+    [actionsContainer addSubview:btnCircle];
+    [_controlsOverlay addSubview:actionsContainer];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [actionsContainer.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [actionsContainer.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
+        [actionsContainer.widthAnchor constraintEqualToConstant:148],
+        [actionsContainer.heightAnchor constraintEqualToConstant:148],
+
+        [btnTriangle.centerXAnchor constraintEqualToAnchor:actionsContainer.centerXAnchor],
+        [btnTriangle.topAnchor constraintEqualToAnchor:actionsContainer.topAnchor],
+
+        [btnCross.centerXAnchor constraintEqualToAnchor:actionsContainer.centerXAnchor],
+        [btnCross.bottomAnchor constraintEqualToAnchor:actionsContainer.bottomAnchor],
+
+        [btnSquare.centerYAnchor constraintEqualToAnchor:actionsContainer.centerYAnchor],
+        [btnSquare.leadingAnchor constraintEqualToAnchor:actionsContainer.leadingAnchor],
+
+        [btnCircle.centerYAnchor constraintEqualToAnchor:actionsContainer.centerYAnchor],
+        [btnCircle.trailingAnchor constraintEqualToAnchor:actionsContainer.trailingAnchor]
+    ]];
+
+    // Botões utilitários centrais (L3, R3, Options)
+    UIButton *btnL3 = [self createHudButtonWithTitle:@"L3" width:40 height:32 radius:8 fontSize:12];
+    UIButton *btnR3 = [self createHudButtonWithTitle:@"R3" width:40 height:32 radius:8 fontSize:12];
+    UIButton *btnOpt = [self createHudButtonWithTitle:@"OPT" width:46 height:32 radius:8 fontSize:12];
+
+    UIStackView *middleRow = [[UIStackView alloc] initWithArrangedSubviews:@[btnL3, btnOpt, btnR3]];
+    middleRow.spacing = 14;
+    middleRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [_controlsOverlay addSubview:middleRow];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [middleRow.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [middleRow.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12]
+    ]];
+}
+
+#pragma mark - Slide-Over Menu & Diagnostics Drawer
+
+- (void)setupDrawerMenu {
+    _drawerOverlay = [UIView new];
+    _drawerOverlay.translatesAutoresizingMaskIntoConstraints = NO;
+    _drawerOverlay.backgroundColor = [UIColor colorWithRed:0.04 green:0.05 blue:0.08 alpha:0.94];
+    _drawerOverlay.layer.cornerRadius = 16.0;
+    _drawerOverlay.layer.borderWidth = 1.0;
+    _drawerOverlay.layer.borderColor = [UIColor colorWithRed:0.85 green:0.75 blue:0.55 alpha:0.35].CGColor;
+    _drawerOverlay.clipsToBounds = YES;
+    _drawerOverlay.hidden = YES;
+    _drawerOverlay.alpha = 0.0;
+    [self.view addSubview:_drawerOverlay];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [_drawerOverlay.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
+        [_drawerOverlay.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
+        [_drawerOverlay.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [_drawerOverlay.widthAnchor constraintLessThanOrEqualToConstant:620],
+        [_drawerOverlay.leadingAnchor constraintGreaterThanOrEqualToAnchor:safe.leadingAnchor constant:20],
+        [_drawerOverlay.trailingAnchor constraintLessThanOrEqualToAnchor:safe.trailingAnchor constant:-20]
+    ]];
+
+    UIScrollView *drawerScroll = [UIScrollView new];
+    drawerScroll.translatesAutoresizingMaskIntoConstraints = NO;
+    [_drawerOverlay addSubview:drawerScroll];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [drawerScroll.topAnchor constraintEqualToAnchor:_drawerOverlay.topAnchor constant:14],
+        [drawerScroll.bottomAnchor constraintEqualToAnchor:_drawerOverlay.bottomAnchor constant:-14],
+        [drawerScroll.leadingAnchor constraintEqualToAnchor:_drawerOverlay.leadingAnchor constant:18],
+        [drawerScroll.trailingAnchor constraintEqualToAnchor:_drawerOverlay.trailingAnchor constant:-18]
+    ]];
+
+    UILabel *drawerTitle = [UILabel new];
+    drawerTitle.font = [UIFont boldSystemFontOfSize:18];
+    drawerTitle.textColor = [UIColor colorWithRed:0.95 green:0.85 blue:0.65 alpha:1.0];
+    drawerTitle.text = @"⚔ Painel Bloodborne iOS — Controle e Diagnóstico";
+    drawerTitle.textAlignment = NSTextAlignmentCenter;
+
+    _gameBootButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_gameBootButton setTitle:@"▶ Iniciar / Reiniciar Motor Bloodborne (Auto)" forState:UIControlStateNormal];
+    _gameBootButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    _gameBootButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.4 blue:0.9 alpha:0.25];
+    _gameBootButton.layer.cornerRadius = 8;
+    [_gameBootButton addTarget:self action:@selector(initGameBoot) forControlEvents:UIControlEventTouchUpInside];
+
+    _continuousButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
+    _continuousButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    _continuousButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.7 blue:0.3 alpha:0.25];
+    _continuousButton.layer.cornerRadius = 8;
+    [_continuousButton addTarget:self action:@selector(toggleContinuousExecution) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *toggleControlsBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [toggleControlsBtn setTitle:@"🎮 Ocultar / Mostrar Controles na Tela" forState:UIControlStateNormal];
+    toggleControlsBtn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    toggleControlsBtn.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.4];
+    toggleControlsBtn.layer.cornerRadius = 8;
+    [toggleControlsBtn addTarget:self action:@selector(toggleControlsVisibility) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *verifyDocsBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [verifyDocsBtn setTitle:@"📂 Verificar Arquivos em Documentos" forState:UIControlStateNormal];
+    verifyDocsBtn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    verifyDocsBtn.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.4];
+    verifyDocsBtn.layer.cornerRadius = 8;
+    [verifyDocsBtn addTarget:self action:@selector(checkDocumentsInventory) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *runTestsBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [runTestsBtn setTitle:@"⚡ Executar Testes de Validação Internos" forState:UIControlStateNormal];
+    runTestsBtn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    runTestsBtn.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.4];
+    runTestsBtn.layer.cornerRadius = 8;
+    [runTestsBtn addTarget:self action:@selector(runTests) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *exportBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [exportBtn setTitle:@"📤 Exportar Relatório de Desempenho (JSON)" forState:UIControlStateNormal];
+    exportBtn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    exportBtn.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.4];
+    exportBtn.layer.cornerRadius = 8;
+    [exportBtn addTarget:self action:@selector(exportReport:) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [closeBtn setTitle:@"✖ Fechar Menu" forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    closeBtn.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:0.3];
+    closeBtn.layer.cornerRadius = 8;
+    [closeBtn addTarget:self action:@selector(toggleDrawerMenu) forControlEvents:UIControlEventTouchUpInside];
+
+    _gameBootStatus = [UILabel new];
+    _gameBootStatus.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    _gameBootStatus.textColor = [UIColor whiteColor];
+    _gameBootStatus.numberOfLines = 0;
+    _gameBootStatus.text = @"Motor: aguardando inicialização.";
+
+    _status = [UILabel new];
+    _status.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    _status.textColor = [UIColor secondaryLabelColor];
+    _status.numberOfLines = 0;
+    _status.text = @"CPU: pronto";
+
+    _gpuStatus = [UILabel new];
+    _gpuStatus.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    _gpuStatus.textColor = [UIColor secondaryLabelColor];
+    _gpuStatus.numberOfLines = 0;
+    _gpuStatus.text = @"GPU Metal 3: inicializado";
+
+    _subsystemStatus = [UILabel new];
+    _subsystemStatus.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    _subsystemStatus.textColor = [UIColor secondaryLabelColor];
+    _subsystemStatus.numberOfLines = 0;
+    _subsystemStatus.text = @"Subsistemas: CoreAudio e GameController prontos";
+
+    _documentStatus = [UILabel new]; _documentStatus.numberOfLines = 0;
+    _assetStatus = [UILabel new]; _assetStatus.numberOfLines = 0;
+    _dcxStatus = [UILabel new]; _dcxStatus.numberOfLines = 0;
+    _bootStatus = [UILabel new]; _bootStatus.numberOfLines = 0;
+
+    UIStackView *drawerStack = [[UIStackView alloc] initWithArrangedSubviews:@[
+        drawerTitle, _gameBootButton, _continuousButton, toggleControlsBtn,
+        verifyDocsBtn, runTestsBtn, exportBtn, closeBtn,
+        _gameBootStatus, _status, _gpuStatus, _subsystemStatus
+    ]];
+    drawerStack.axis = UILayoutConstraintAxisVertical;
+    drawerStack.spacing = 10;
+    drawerStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [drawerScroll addSubview:drawerStack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [drawerStack.topAnchor constraintEqualToAnchor:drawerScroll.contentLayoutGuide.topAnchor],
+        [drawerStack.bottomAnchor constraintEqualToAnchor:drawerScroll.contentLayoutGuide.bottomAnchor],
+        [drawerStack.leadingAnchor constraintEqualToAnchor:drawerScroll.contentLayoutGuide.leadingAnchor],
+        [drawerStack.trailingAnchor constraintEqualToAnchor:drawerScroll.contentLayoutGuide.trailingAnchor],
+        [drawerStack.widthAnchor constraintEqualToAnchor:drawerScroll.frameLayoutGuide.widthAnchor]
+    ]];
+}
+
+- (void)toggleDrawerMenu {
+    BOOL show = _drawerOverlay.hidden;
+    if (show) {
+        _drawerOverlay.hidden = NO;
+        [UIView animateWithDuration:0.25 animations:^{
+            self->_drawerOverlay.alpha = 1.0;
+        }];
+    } else {
+        [UIView animateWithDuration:0.20 animations:^{
+            self->_drawerOverlay.alpha = 0.0;
+        } completion:^(BOOL finished) {
+            if (finished) self->_drawerOverlay.hidden = YES;
+        }];
+    }
+}
+
+- (void)toggleControlsVisibility {
+    _virtualControlsVisible = !_virtualControlsVisible;
+    _controlsOverlay.hidden = !_virtualControlsVisible;
+}
+
+#pragma mark - Auto-Boot and Search
+
+- (NSString *)findGameDirectoryIn:(NSString *)baseDir {
+    if (!baseDir || baseDir.length == 0) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:[baseDir stringByAppendingPathComponent:@"eboot.bin"]] ||
+        [fm fileExistsAtPath:[baseDir stringByAppendingPathComponent:@"eboot.elf"]]) {
+        return baseDir;
+    }
+
+    NSArray<NSString *> *candidates = @[
+        @"Image0",
+        @"Bloodborne™/Image0",
+        @"Bloodborne/Image0",
+        @"blodboorn 3171/Bloodborne™/Image0",
+        @"app0",
+        @"game",
+        @"CUSA03173",
+        @"CUSA00207"
+    ];
+    for (NSString *sub in candidates) {
+        NSString *candidatePath = [baseDir stringByAppendingPathComponent:sub];
+        if ([fm fileExistsAtPath:[candidatePath stringByAppendingPathComponent:@"eboot.bin"]] ||
+            [fm fileExistsAtPath:[candidatePath stringByAppendingPathComponent:@"eboot.elf"]]) {
+            return candidatePath;
+        }
+    }
+
+    NSArray<NSString *> *contents = [fm contentsOfDirectoryAtPath:baseDir error:nil];
+    for (NSString *item in contents) {
+        NSString *subPath = [baseDir stringByAppendingPathComponent:item];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:subPath isDirectory:&isDir] && isDir) {
+            if ([fm fileExistsAtPath:[subPath stringByAppendingPathComponent:@"eboot.bin"]] ||
+                [fm fileExistsAtPath:[subPath stringByAppendingPathComponent:@"eboot.elf"]]) {
+                return subPath;
+            }
+            NSArray<NSString *> *subContents = [fm contentsOfDirectoryAtPath:subPath error:nil];
+            for (NSString *subItem in subContents) {
+                NSString *deepPath = [subPath stringByAppendingPathComponent:subItem];
+                if ([fm fileExistsAtPath:deepPath isDirectory:&isDir] && isDir) {
+                    if ([fm fileExistsAtPath:[deepPath stringByAppendingPathComponent:@"eboot.bin"]] ||
+                        [fm fileExistsAtPath:[deepPath stringByAppendingPathComponent:@"eboot.elf"]]) {
+                        return deepPath;
+                    }
+                }
+            }
+        }
+    }
+    return nil;
+}
+
+- (void)attemptAutoBoot {
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    if (!documents) return;
+
+    NSString *gameDir = [self findGameDirectoryIn:documents.path];
+    if (gameDir) {
+        [self initGameBoot];
+    } else {
+        [self showWelcomeCard];
+    }
+}
+
+- (void)showWelcomeCard {
+    if (_welcomeCardView) {
+        _welcomeCardView.hidden = NO;
+        return;
+    }
+
+    _welcomeCardView = [UIView new];
+    _welcomeCardView.translatesAutoresizingMaskIntoConstraints = NO;
+    _welcomeCardView.backgroundColor = [UIColor colorWithRed:0.04 green:0.05 blue:0.08 alpha:0.92];
+    _welcomeCardView.layer.cornerRadius = 16.0;
+    _welcomeCardView.layer.borderWidth = 1.0;
+    _welcomeCardView.layer.borderColor = [UIColor colorWithRed:0.85 green:0.75 blue:0.55 alpha:0.35].CGColor;
+    _welcomeCardView.clipsToBounds = YES;
+    [self.view addSubview:_welcomeCardView];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [_welcomeCardView.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [_welcomeCardView.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
+        [_welcomeCardView.widthAnchor constraintLessThanOrEqualToConstant:540],
+        [_welcomeCardView.leadingAnchor constraintGreaterThanOrEqualToAnchor:safe.leadingAnchor constant:24],
+        [_welcomeCardView.trailingAnchor constraintLessThanOrEqualToAnchor:safe.trailingAnchor constant:-24]
+    ]];
+
+    UILabel *title = [UILabel new];
+    title.font = [UIFont boldSystemFontOfSize:22];
+    title.textColor = [UIColor colorWithRed:0.95 green:0.85 blue:0.65 alpha:1.0];
+    title.text = @"⚔ BLOODBORNE MOBILE";
+    title.textAlignment = NSTextAlignmentCenter;
+
+    UILabel *sub = [UILabel new];
+    sub.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    sub.textColor = [UIColor colorWithWhite:0.78 alpha:1.0];
+    sub.text = @"Laboratório Nativo iOS 17 (Apple A17 Pro / Metal 3)";
+    sub.textAlignment = NSTextAlignmentCenter;
+
+    UILabel *desc = [UILabel new];
+    desc.font = [UIFont systemFontOfSize:12];
+    desc.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    desc.numberOfLines = 0;
+    desc.textAlignment = NSTextAlignmentCenter;
+    desc.text = @"O motor gráfico Metal e o escalonador estão ativos.\n"
+                @"Aguardando arquivos do jogo (eboot.bin, dvdroot_ps4) na pasta Documentos do BBHost.\n"
+                @"Transfira a pasta pelo iTunes, Apple Devices ou aplicativo Arquivos.";
+
+    UIButton *exploreBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [exploreBtn setTitle:@"▶ Entrar no Modo Demonstração 3D" forState:UIControlStateNormal];
+    exploreBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    exploreBtn.backgroundColor = [UIColor colorWithRed:0.1 green:0.5 blue:0.9 alpha:0.3];
+    exploreBtn.layer.cornerRadius = 8;
+    [exploreBtn addTarget:self action:@selector(dismissWelcomeCard) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *rescanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [rescanBtn setTitle:@"🔄 Atualizar e Procurar Arquivos" forState:UIControlStateNormal];
+    rescanBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    rescanBtn.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.4];
+    rescanBtn.layer.cornerRadius = 8;
+    [rescanBtn addTarget:self action:@selector(attemptAutoBoot) forControlEvents:UIControlEventTouchUpInside];
+
+    UIStackView *cardStack = [[UIStackView alloc] initWithArrangedSubviews:@[title, sub, desc, exploreBtn, rescanBtn]];
+    cardStack.axis = UILayoutConstraintAxisVertical;
+    cardStack.spacing = 12;
+    cardStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [_welcomeCardView addSubview:cardStack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [cardStack.topAnchor constraintEqualToAnchor:_welcomeCardView.topAnchor constant:20],
+        [cardStack.bottomAnchor constraintEqualToAnchor:_welcomeCardView.bottomAnchor constant:-20],
+        [cardStack.leadingAnchor constraintEqualToAnchor:_welcomeCardView.leadingAnchor constant:20],
+        [cardStack.trailingAnchor constraintEqualToAnchor:_welcomeCardView.trailingAnchor constant:-20]
+    ]];
+}
+
+- (void)dismissWelcomeCard {
+    if (_welcomeCardView) {
+        [UIView animateWithDuration:0.25 animations:^{
+            self->_welcomeCardView.alpha = 0.0;
+        } completion:^(BOOL finished) {
+            if (finished) self->_welcomeCardView.hidden = YES;
+        }];
+    }
+}
+
+#pragma mark - Game Execution Engine
+
+- (void)initGameBoot {
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    if (!documents) {
+        _gameBootStatus.text = @"Motor Bloodborne: pasta Documents indisponível.";
+        return;
+    }
+
+    NSString *gameDir = [self findGameDirectoryIn:documents.path];
+    if (!gameDir) {
+        gameDir = documents.path;
+    }
+
+    bb::BootConfig config;
+    config.base_dir = gameDir.UTF8String;
+    config.save_dir = [documents.path stringByAppendingPathComponent:@"savedata"].UTF8String;
+    config.guest_memory_size = 768u << 20;
+    config.require_essential_assets = false;
+    config.enable_hle = true;
+    config.use_scheduler = true;
+
+    _bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
+    _bootCoordinator->attach_input_manager(&_inputManager);
+    _bootCoordinator->attach_video_out(&_videoOutManager);
+    bool ok = _bootCoordinator->initialize(config);
+    auto diag = _bootCoordinator->diagnostics();
+
+    if (!ok) {
+        NSString *err = [NSString stringWithUTF8String:diag.last_error.c_str()];
+        _gameBootStatus.text = [NSString stringWithFormat:@"Motor Bloodborne: FALHA: %@", err];
+        _topStatusLabel.text = [NSString stringWithFormat:@"⚔ Falha: %@", err];
+        _report[@"game_boot_coordinator"] = @{
+            @"status": @"init_failed",
+            @"error": err,
+            @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
+            @"active_modules": @(diag.modules_count),
+            @"total_steps": @(diag.total_steps),
+            @"game_execution": @NO
+        };
+        _report[@"game_execution"] = @NO;
+        return;
+    }
+
+    if (_bootCoordinator->runtime()) {
+        _bootCoordinator->runtime()->pad_manager().set_default_input(&_inputManager);
+        _bootCoordinator->runtime()->attach_video_out(&_videoOutManager);
+    }
+
+    std::uint64_t steps = _bootCoordinator->step(100000);
+    diag = _bootCoordinator->diagnostics();
+
+    const bool is_running = (diag.total_steps > 0);
+    _report[@"game_execution"] = @(is_running);
+    _continuousExecution = YES;
+    [_continuousButton setTitle:@"⏸ Pausar Execução Contínua" forState:UIControlStateNormal];
+
+    if (_welcomeCardView) {
+        _welcomeCardView.hidden = YES;
+    }
+
+    [self updateCoordinatorReportAndUI:diag executedSteps:steps];
+}
+
+- (void)toggleContinuousExecution {
+    _continuousExecution = !_continuousExecution;
+    if (_continuousExecution) {
+        [_continuousButton setTitle:@"⏸ Pausar Execução Contínua" forState:UIControlStateNormal];
+        if (_bootCoordinator && _bootCoordinator->state() == bb::BootState::modules_initialized) {
+            _bootCoordinator->step(10000);
+        }
+    } else {
+        [_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
+    }
+}
+
+- (void)updateCoordinatorReportAndUI:(const bb::BootDiagnostics&)diag executedSteps:(std::uint64_t)steps {
+    NSMutableDictionary *importCounts = [NSMutableDictionary dictionary];
+    for (const auto& [name, count] : diag.import_call_counts) {
+        importCounts[[NSString stringWithUTF8String:name.c_str()]] = @(count);
+    }
+    NSMutableArray *modules = [NSMutableArray array];
+    for (const auto& m : diag.active_modules) {
+        [modules addObject:[NSString stringWithUTF8String:m.c_str()]];
+    }
+
+    const bool is_running = (diag.total_steps > 0);
+    _report[@"game_boot_coordinator"] = @{
+        @"status": (diag.state == bb::BootState::halted ? @"halted" : (diag.state == bb::BootState::error ? @"error" : @"running")),
+        @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
+        @"total_steps": @(diag.total_steps),
+        @"total_import_calls": @(diag.total_import_calls),
+        @"last_import_called": [NSString stringWithUTF8String:diag.last_import_called.c_str()],
+        @"import_call_counts": importCounts,
+        @"active_modules": modules,
+        @"modules_count": @(diag.modules_count),
+        @"entry_point": @(diag.entry_point),
+        @"current_rip": @(diag.current_rip),
+        @"last_stop_reason": [NSString stringWithUTF8String:diag.last_stop_reason.c_str()],
+        @"game_execution": @(is_running),
+        @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]
+    };
+
+    _gameBootStatus.text = [NSString stringWithFormat:
+        @"Motor Bloodborne (+%llu): Total %llu passos | %llu imports | RIP: 0x%llx | Stop: %s",
+        (unsigned long long)steps,
+        (unsigned long long)diag.total_steps,
+        (unsigned long long)diag.total_import_calls,
+        (unsigned long long)diag.current_rip,
+        diag.last_stop_reason.c_str()];
+
+    _topStatusLabel.text = [NSString stringWithFormat:@"⚔ Bloodborne | 60 FPS | %.1fM | ● %s",
+        static_cast<double>(diag.total_steps) / 1000000.0,
+        diag.state_name.c_str()];
+}
+
+#pragma mark - MTKViewDelegate (Render & Engine Loop)
+
+- (void)drawInMTKView:(MTKView *)view {
+    MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
+    id<CAMetalDrawable> drawable = view.currentDrawable;
+    if (!pass || !drawable || !_pipeline || !_vertexBuffer || !_indexBuffer) return;
+
+    auto now = std::chrono::steady_clock::now();
+    double frame_ms = std::chrono::duration<double, std::milli>(now - _lastFrameTime).count();
+    _lastFrameTime = now;
+    _pacingTracker.record_frame_ms(frame_ms);
+
+    if (_bootCoordinator && (_bootCoordinator->state() == bb::BootState::running || _bootCoordinator->state() == bb::BootState::modules_initialized)) {
+        uint64_t stepBudget = _continuousExecution ? 100000 : 2000;
+        _bootCoordinator->step(stepBudget);
+        _report[@"game_execution"] = @YES;
+    }
+
+    if (_videoOutManager.has_new_frame()) {
+        bb::HostFrameBuffer guestFrame;
+        if (_videoOutManager.read_current_frame_pixels(guestFrame) && guestFrame.valid) {
+            _report[@"guest_frame_flipped"] = @YES;
+            _report[@"guest_frame_seq"] = @(guestFrame.flip_sequence);
+            _report[@"guest_frame_w"] = @(guestFrame.width);
+            _report[@"guest_frame_h"] = @(guestFrame.height);
+
+            if (!_guestScreenTexture || _guestScreenTexture.width != guestFrame.width || _guestScreenTexture.height != guestFrame.height) {
+                MTLTextureDescriptor *screenDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                                     width:guestFrame.width
+                                                                                                    height:guestFrame.height
+                                                                                                 mipmapped:NO];
+                screenDesc.usage = MTLTextureUsageShaderRead;
+                _guestScreenTexture = [view.device newTextureWithDescriptor:screenDesc];
+            }
+            if (_guestScreenTexture && !guestFrame.pixel_data.empty()) {
+                [_guestScreenTexture replaceRegion:MTLRegionMake2D(0, 0, guestFrame.width, guestFrame.height)
+                                       mipmapLevel:0
+                                         withBytes:guestFrame.pixel_data.data()
+                                       bytesPerRow:guestFrame.pitch > 0 ? guestFrame.pitch : guestFrame.width * 4];
+            }
+        }
+    }
+
+    // Atualização de rotação suave da câmera no modo demonstração 3D
+    _angle += 0.015f + (_inputManager.right_stick_x() * 0.04f);
+    _cameraPitch += (_inputManager.right_stick_y() * 0.03f);
+    _cameraPitch = std::max(-1.1f, std::min(1.1f, _cameraPitch));
+
+    float aspect = (view.bounds.size.height > 0) ? (float)view.bounds.size.width / (float)view.bounds.size.height : 1.777f;
+    bb::Matrix4x4 proj = bb::Matrix4x4::perspective(55.0f * 3.14159265f / 180.0f, aspect, 0.1f, 100.0f);
+    float eye[3] = {0.0f, 1.0f, 2.8f};
+    float target[3] = {0.0f, 0.3f, 0.0f};
+    float up[3] = {0.0f, 1.0f, 0.0f};
+    bb::Matrix4x4 viewMat = bb::Matrix4x4::look_at(eye, target, up);
+    bb::Matrix4x4 modelRot = bb::Matrix4x4::rotation_y(_angle);
+    bb::Matrix4x4 modelPitch = bb::Matrix4x4::rotation_x(_cameraPitch);
+    bb::Matrix4x4 model = bb::Matrix4x4::multiply(modelRot, modelPitch);
+
+    bb::ModelViewProjectionUniforms mvpUniforms{};
+    mvpUniforms.model = model;
+    mvpUniforms.view = viewMat;
+    mvpUniforms.projection = proj;
+    bb::Matrix4x4 modelView = bb::Matrix4x4::multiply(viewMat, model);
+    mvpUniforms.mvp = bb::Matrix4x4::multiply(proj, modelView);
+    mvpUniforms.normal_matrix = bb::Matrix4x4::normal_matrix(modelView);
+
+    id<MTLCommandBuffer> command = [_queue commandBuffer];
+    if (!command) { [self gpuError:@"Falha ao criar command buffer"]; return; }
+    id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) { [self gpuError:@"Falha ao criar render encoder"]; return; }
+
+    [encoder setRenderPipelineState:_pipeline];
+    if (_depthState) {
+        [encoder setDepthStencilState:_depthState];
+    }
+    [encoder setCullMode:MTLCullModeNone];
+
+    [encoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
+    [encoder setVertexBytes:&mvpUniforms length:sizeof(mvpUniforms) atIndex:1];
+    [encoder setFragmentBuffer:_lightingBuffer offset:0 atIndex:1];
+
+    if (_guestScreenTexture) {
+        [encoder setFragmentTexture:_guestScreenTexture atIndex:0];
+    } else if (_diffuseTexture) {
+        [encoder setFragmentTexture:_diffuseTexture atIndex:0];
+    }
+    if (_samplerState) {
+        [encoder setFragmentSamplerState:_samplerState atIndex:0];
+    }
+
+    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:_indexCount
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:_indexBuffer
+                 indexBufferOffset:0];
+
+    [encoder endEncoding];
+    [command presentDrawable:drawable];
+
+    __weak LabController *weakSelf = self;
+    [command addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LabController *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (finished.status == MTLCommandBufferStatusCompleted) {
+                ++strongSelf->_completedFrames;
+                strongSelf->_report[@"metal_completed_frames"] = @(strongSelf->_completedFrames);
+                if (strongSelf->_completedFrames == 1 || strongSelf->_completedFrames % 30 == 0) {
+                    auto pacing = strongSelf->_pacingTracker.get_stats();
+                    uint64_t mem_bytes = strongSelf->_memoryMonitor.query_physical_footprint_bytes();
+                    double mem_mb = static_cast<double>(mem_bytes) / (1024.0 * 1024.0);
+                    strongSelf->_gpuStatus.text = [NSString stringWithFormat:
+                        @"Metal 3: %lu frames | FLVER (%u vtx, %u tri) | P50: %.1fms | Mem: %.1f MB",
+                        (unsigned long)strongSelf->_completedFrames,
+                        strongSelf->_modelVertexCount,
+                        strongSelf->_modelTriangleCount,
+                        pacing.p50_ms, mem_mb];
+
+                    if (strongSelf->_bootCoordinator && strongSelf->_bootCoordinator->state() == bb::BootState::running) {
+                        auto coordDiag = strongSelf->_bootCoordinator->diagnostics();
+                        strongSelf->_topStatusLabel.text = [NSString stringWithFormat:@"⚔ Bloodborne | %.0f FPS | %.1fM | ● Executando",
+                            pacing.average_fps,
+                            static_cast<double>(coordDiag.total_steps) / 1000000.0];
+                    }
+                }
+            } else {
+                [strongSelf gpuError:finished.error ? finished.error.localizedDescription : @"Erro no command buffer"];
+            }
+        });
+    }];
+    [command commit];
+}
+
+- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
+    (void)view; (void)size;
+}
+
+#pragma mark - Touch & Controller Handlers
+
+- (void)handleTouchId:(uint64_t)tid x:(float)x y:(float)y phase:(bb::TouchPhase)phase {
+    _touchOverlay.handle_touch(tid, x, y, phase);
+}
+
+- (void)onVirtualButtonTouch:(UIButton *)sender {
+    NSString *t = sender.currentTitle;
+    sender.backgroundColor = [UIColor colorWithRed:0.85 green:0.25 blue:0.25 alpha:0.85];
+
+    if ([t containsString:@"✖"]) _inputManager.set_button(bb::PAD_CROSS, true);
+    else if ([t containsString:@"●"]) _inputManager.set_button(bb::PAD_CIRCLE, true);
+    else if ([t containsString:@"■"]) _inputManager.set_button(bb::PAD_SQUARE, true);
+    else if ([t containsString:@"▲"] && [sender.superview isEqual:_controlsOverlay]) _inputManager.set_button(bb::PAD_TRIANGLE, true);
+    else if ([t isEqualToString:@"▲"]) _inputManager.set_button(bb::PAD_UP, true);
+    else if ([t isEqualToString:@"▼"]) _inputManager.set_button(bb::PAD_DOWN, true);
+    else if ([t isEqualToString:@"◀"]) _inputManager.set_button(bb::PAD_LEFT, true);
+    else if ([t isEqualToString:@"▶"]) _inputManager.set_button(bb::PAD_RIGHT, true);
+    else if ([t isEqualToString:@"R1"]) _inputManager.set_button(bb::PAD_R1, true);
+    else if ([t isEqualToString:@"R2"]) _inputManager.set_button(bb::PAD_R2, true);
+    else if ([t isEqualToString:@"L1"]) _inputManager.set_button(bb::PAD_L1, true);
+    else if ([t isEqualToString:@"L2"]) _inputManager.set_button(bb::PAD_L2, true);
+    else if ([t isEqualToString:@"R3"]) _inputManager.set_button(bb::PAD_R3, true);
+    else if ([t isEqualToString:@"L3"]) _inputManager.set_button(bb::PAD_L3, true);
+    else if ([t isEqualToString:@"OPT"]) _inputManager.set_button(bb::PAD_OPTIONS, true);
+
+    if (@available(iOS 10.0, *)) {
+        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+        [feedback impactOccurred];
+    }
+    AudioServicesPlaySystemSound(1104);
+}
+
+- (void)onVirtualButtonRelease:(UIButton *)sender {
+    NSString *t = sender.currentTitle;
+    sender.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.65];
+
+    if ([t containsString:@"✖"]) _inputManager.set_button(bb::PAD_CROSS, false);
+    else if ([t containsString:@"●"]) _inputManager.set_button(bb::PAD_CIRCLE, false);
+    else if ([t containsString:@"■"]) _inputManager.set_button(bb::PAD_SQUARE, false);
+    else if ([t containsString:@"▲"] && [sender.superview isEqual:_controlsOverlay]) _inputManager.set_button(bb::PAD_TRIANGLE, false);
+    else if ([t isEqualToString:@"▲"]) _inputManager.set_button(bb::PAD_UP, false);
+    else if ([t isEqualToString:@"▼"]) _inputManager.set_button(bb::PAD_DOWN, false);
+    else if ([t isEqualToString:@"◀"]) _inputManager.set_button(bb::PAD_LEFT, false);
+    else if ([t isEqualToString:@"▶"]) _inputManager.set_button(bb::PAD_RIGHT, false);
+    else if ([t isEqualToString:@"R1"]) _inputManager.set_button(bb::PAD_R1, false);
+    else if ([t isEqualToString:@"R2"]) _inputManager.set_button(bb::PAD_R2, false);
+    else if ([t isEqualToString:@"L1"]) _inputManager.set_button(bb::PAD_L1, false);
+    else if ([t isEqualToString:@"L2"]) _inputManager.set_button(bb::PAD_L2, false);
+    else if ([t isEqualToString:@"R3"]) _inputManager.set_button(bb::PAD_R3, false);
+    else if ([t isEqualToString:@"L3"]) _inputManager.set_button(bb::PAD_L3, false);
+    else if ([t isEqualToString:@"OPT"]) _inputManager.set_button(bb::PAD_OPTIONS, false);
+}
+
+#pragma mark - Physical GameController Support
+
+- (void)setupGameControllers {
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onControllerConnected:)
         name:GCControllerDidConnectNotification object:nil];
     if (GCController.controllers.count > 0) {
         [self onControllerConnected:nil];
     }
-
-    _metal.delegate = self;
-    _metal.paused = NO;
 }
 
 - (void)setupController:(GCController *)controller {
@@ -582,102 +1275,58 @@
     if (controller) {
         [self setupController:controller];
         _subsystemStatus.text = [NSString stringWithFormat:@"GameController conectado: %@ (Mapeamento ativo)",
-            (controller.vendorName ? controller.vendorName : @"Compatível")];
+            controller.vendorName ?: @"Compatível"];
     }
 }
 
-- (void)setLeftStickX:(float)x y:(float)y {
-    _inputManager.set_left_stick(x, y);
-    if (std::abs(x) > 0.05f || std::abs(y) > 0.05f) {
-        _subsystemStatus.text = [NSString stringWithFormat:@"Analógico Esq (Movimento): [%.2f, %.2f]", x, y];
-    }
-}
+#pragma mark - CoreAudio Subsystem
 
-- (void)setRightStickX:(float)x y:(float)y {
-    _inputManager.set_right_stick(x, y);
-    if (std::abs(x) > 0.05f || std::abs(y) > 0.05f) {
-        _subsystemStatus.text = [NSString stringWithFormat:@"Analógico Dir (Câmera): [%.2f, %.2f]", x, y];
-    }
-}
+- (void)setupAudio {
+    NSError *error = nil;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&error];
+    [session setActive:YES error:&error];
 
-- (void)handleTouchId:(uint64_t)tid x:(float)x y:(float)y phase:(bb::TouchPhase)phase {
-    _touchOverlay.on_touch(tid, x, y, phase);
-}
+    AudioStreamBasicDescription format{};
+    format.mSampleRate = 48000;
+    format.mFormatID = kAudioFormatLinearPCM;
+    format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    format.mBytesPerPacket = 4;
+    format.mFramesPerPacket = 1;
+    format.mBytesPerFrame = 4;
+    format.mChannelsPerFrame = 2;
+    format.mBitsPerChannel = 16;
 
-- (void)toggleContinuousExecution {
-    _continuousExecution = !_continuousExecution;
-    if (_continuousExecution) {
-        [_continuousButton setTitle:@"⏸ Pausar Execução Contínua" forState:UIControlStateNormal];
-        _continuousButton.backgroundColor = [UIColor colorWithRed:0.9 green:0.5 blue:0.1 alpha:0.25];
-        if (_bootCoordinator && _bootCoordinator->state() == bb::BootState::modules_initialized) {
-            _bootCoordinator->step(10000);
+    OSStatus status = AudioQueueNewOutput(&format, AudioQueueOutputCallback, (__bridge void *)self, NULL, NULL, 0, &_audioQueue);
+    if (status == noErr) {
+        const UInt32 bufferSize = 2048 * 4;
+        for (int i = 0; i < 3; ++i) {
+            AudioQueueAllocateBuffer(_audioQueue, bufferSize, &_audioBuffers[i]);
+            _audioBuffers[i]->mAudioDataByteSize = bufferSize;
+            std::memset(_audioBuffers[i]->mAudioData, 0, bufferSize);
+            AudioQueueEnqueueBuffer(_audioQueue, _audioBuffers[i], 0, NULL);
         }
-    } else {
-        [_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
-        _continuousButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.7 blue:0.3 alpha:0.15];
+        AudioQueueStart(_audioQueue, NULL);
+        _audioActive = YES;
     }
 }
 
-- (void)stepGameBootLarge {
-    if (!_bootCoordinator || (_bootCoordinator->state() != bb::BootState::running && _bootCoordinator->state() != bb::BootState::modules_initialized)) {
-        _gameBootStatus.text = @"Motor Bloodborne não inicializado. Toque em 'Iniciar Motor do Jogo' primeiro.";
-        return;
+- (void)fillAudioBuffer:(AudioQueueBufferRef)buffer {
+    std::memset(buffer->mAudioData, 0, buffer->mAudioDataBytesCapacity);
+    buffer->mAudioDataByteSize = buffer->mAudioDataBytesCapacity;
+    if (_bootCoordinator && _bootCoordinator->runtime()) {
+        auto* ring = _bootCoordinator->audio_out().get_port_ring_buffer(0);
+        if (ring) {
+            uint32_t framesRequested = buffer->mAudioDataBytesCapacity / 4;
+            size_t readFrames = ring->read(static_cast<int16_t*>(buffer->mAudioData), framesRequested);
+            if (readFrames > 0) {
+                buffer->mAudioDataByteSize = static_cast<UInt32>(readFrames * 4);
+            }
+        }
     }
-
-    std::uint64_t steps = _bootCoordinator->step(1000000);
-    auto diag = _bootCoordinator->diagnostics();
-
-    const bool is_running = (diag.total_steps > 0);
-    _report[@"game_execution"] = @(is_running);
-
-    [self updateCoordinatorReportAndUI:diag executedSteps:steps];
 }
 
-- (void)onVirtualButtonTouch:(UIButton *)sender {
-    NSString *t = sender.currentTitle;
-    if ([t containsString:@"Esquiva"]) _inputManager.set_button(bb::PAD_CROSS, true);
-    else if ([t containsString:@"Interagir"]) _inputManager.set_button(bb::PAD_CIRCLE, true);
-    else if ([t containsString:@"Item"]) _inputManager.set_button(bb::PAD_SQUARE, true);
-    else if ([t containsString:@"Arma"]) _inputManager.set_button(bb::PAD_TRIANGLE, true);
-    else if ([t containsString:@"R1"]) _inputManager.set_button(bb::PAD_R1, true);
-    else if ([t containsString:@"R2"]) _inputManager.set_button(bb::PAD_R2, true);
-    else if ([t containsString:@"L1"]) _inputManager.set_button(bb::PAD_L1, true);
-    else if ([t containsString:@"L2"]) _inputManager.set_button(bb::PAD_L2, true);
-    else if ([t containsString:@"R3"] || [t containsString:@"Lock"]) _inputManager.set_button(bb::PAD_R3, true);
-    else if ([t containsString:@"L3"] || [t containsString:@"Agachar"]) _inputManager.set_button(bb::PAD_L3, true);
-    else if ([t containsString:@"Menu"] || [t containsString:@"Options"]) _inputManager.set_button(bb::PAD_OPTIONS, true);
-    else if ([t containsString:@"Cima"]) _inputManager.set_button(bb::PAD_UP, true);
-    else if ([t containsString:@"Baixo"]) _inputManager.set_button(bb::PAD_DOWN, true);
-    else if ([t containsString:@"Esq"]) _inputManager.set_button(bb::PAD_LEFT, true);
-    else if ([t containsString:@"Dir"]) _inputManager.set_button(bb::PAD_RIGHT, true);
-
-    if (@available(iOS 10.0, *)) {
-        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-        [feedback impactOccurred];
-    }
-    _subsystemStatus.text = [NSString stringWithFormat:@"Entrada ativa: %@", t];
-}
-
-- (void)onVirtualButtonRelease:(UIButton *)sender {
-    NSString *t = sender.currentTitle;
-    if ([t containsString:@"Esquiva"]) _inputManager.set_button(bb::PAD_CROSS, false);
-    else if ([t containsString:@"Interagir"]) _inputManager.set_button(bb::PAD_CIRCLE, false);
-    else if ([t containsString:@"Item"]) _inputManager.set_button(bb::PAD_SQUARE, false);
-    else if ([t containsString:@"Arma"]) _inputManager.set_button(bb::PAD_TRIANGLE, false);
-    else if ([t containsString:@"R1"]) _inputManager.set_button(bb::PAD_R1, false);
-    else if ([t containsString:@"R2"]) _inputManager.set_button(bb::PAD_R2, false);
-    else if ([t containsString:@"L1"]) _inputManager.set_button(bb::PAD_L1, false);
-    else if ([t containsString:@"L2"]) _inputManager.set_button(bb::PAD_L2, false);
-    else if ([t containsString:@"R3"] || [t containsString:@"Lock"]) _inputManager.set_button(bb::PAD_R3, false);
-    else if ([t containsString:@"L3"] || [t containsString:@"Agachar"]) _inputManager.set_button(bb::PAD_L3, false);
-    else if ([t containsString:@"Menu"] || [t containsString:@"Options"]) _inputManager.set_button(bb::PAD_OPTIONS, false);
-    else if ([t containsString:@"Cima"]) _inputManager.set_button(bb::PAD_UP, false);
-    else if ([t containsString:@"Baixo"]) _inputManager.set_button(bb::PAD_DOWN, false);
-    else if ([t containsString:@"Esq"]) _inputManager.set_button(bb::PAD_LEFT, false);
-    else if ([t containsString:@"Dir"]) _inputManager.set_button(bb::PAD_RIGHT, false);
-
-    _subsystemStatus.text = @"Entrada: neutro";
-}
+#pragma mark - Diagnostics & Documents Inventory
 
 - (void)gpuError:(NSString *)message {
     _gpuStatus.text = [@"GPU: " stringByAppendingString:message];
@@ -715,19 +1364,9 @@
             result[@"status"] = @"too_large";
         } else {
             NSData *bytes = [NSData dataWithContentsOfURL:file options:NSDataReadingMappedIfSafe error:&error];
-            if (!bytes) {
-                result[@"status"] = @"read_error";
-                if (error) {
-                    result[@"error_domain"] = error.domain;
-                    result[@"error_code"] = @(error.code);
-                }
-            } else {
+            if (bytes) {
                 NSString *content = [[NSString alloc] initWithData:bytes encoding:NSUTF8StringEncoding];
-                if (!content) {
-                    result[@"status"] = @"invalid_utf8";
-                } else if (bytes.length == 0) {
-                    result[@"status"] = @"empty";
-                } else {
+                if (content && bytes.length > 0) {
                     result[@"status"] = @"ok";
                     result[@"valid"] = @YES;
                     result[@"content_utf8"] = content;
@@ -735,21 +1374,10 @@
                 }
             }
         }
-    } else if (error) {
-        if ([error.domain isEqualToString:NSCocoaErrorDomain] &&
-            (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError)) {
-            result[@"status"] = @"not_found";
-        } else {
-            result[@"status"] = @"read_error";
-            result[@"error_domain"] = error.domain;
-            result[@"error_code"] = @(error.code);
-        }
     }
     result[@"checked_at"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     _report[@"documents_test"] = result;
-    _documentStatus.text = [NSString stringWithFormat:@"Documento teste-bblab.txt: %@ (%@ bytes). %@",
-        result[@"status"], result[@"size_bytes"] ? result[@"size_bytes"] : @0,
-        [result[@"valid"] boolValue] ? @"Texto UTF-8 registrado no relatorio." : @"Confira o arquivo em Documentos de BB Lab."];
+    _documentStatus.text = [NSString stringWithFormat:@"teste-bblab.txt: %@", result[@"status"]];
 }
 
 - (void)checkGameAsset {
@@ -761,17 +1389,13 @@
         @"valid": @(probe.valid), @"size_bytes": @(probe.size_bytes),
         @"crc32": @(probe.crc32)} mutableCopy];
     if (probe.valid) {
-        NSString *titleId = [NSString stringWithUTF8String:probe.title_id.c_str()];
-        NSString *title = [NSString stringWithUTF8String:probe.title.c_str()];
-        NSString *version = [NSString stringWithUTF8String:probe.app_ver.c_str()];
-        result[@"title_id"] = titleId ? titleId : @"";
-        result[@"title"] = title ? title : @"";
-        result[@"app_ver"] = version ? version : @"";
+        result[@"title_id"] = [NSString stringWithUTF8String:probe.title_id.c_str()];
+        result[@"title"] = [NSString stringWithUTF8String:probe.title.c_str()];
+        result[@"app_ver"] = [NSString stringWithUTF8String:probe.app_ver.c_str()];
     }
     result[@"checked_at"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     _report[@"sfo_probe"] = result;
-    _assetStatus.text = [NSString stringWithFormat:@"SFO via VFS: %@ (%llu bytes, %@).",
-        status, probe.size_bytes, probe.valid ? result[@"title_id"] : @"sem metadados"];
+    _assetStatus.text = [NSString stringWithFormat:@"SFO: %@ (%@)", status, probe.valid ? result[@"title_id"] : @"sem metadados"];
 }
 
 - (void)checkDcx {
@@ -779,15 +1403,15 @@
         inDomains:NSUserDomainMask] firstObject];
     const auto probe = bb::probe_dcx_in_documents(documents.path ? documents.path.UTF8String : "");
     NSString *status = [NSString stringWithUTF8String:probe.status.c_str()];
-    _report[@"dcx_probe"] = @{@"path": @"/app0/m29_00_00_00_408010.flver.dcx",
+    _report[@"dcx_probe"] = @{
+        @"path": @"/app0/m29_00_00_00_408010.flver.dcx",
         @"status": status, @"valid": @(probe.valid),
         @"size_bytes": @(probe.size_bytes), @"decoded_bytes": @(probe.decoded_bytes),
-        @"crc32": @(probe.crc32), @"decoded_crc32": @(probe.decoded_crc32),
         @"geometry_status": [NSString stringWithUTF8String:probe.geometry_status.c_str()],
         @"geometry_vertices": @(probe.vertex_count), @"geometry_triangles": @(probe.triangle_count),
-        @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]};
-    _dcxStatus.text = [NSString stringWithFormat:@"DCX via VFS: %@ (%llu -> %llu bytes).",
-        status, probe.size_bytes, probe.decoded_bytes];
+        @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]
+    };
+    _dcxStatus.text = [NSString stringWithFormat:@"DCX: %@ (%llu -> %llu bytes)", status, probe.size_bytes, probe.decoded_bytes];
 }
 
 - (void)checkBootEntry {
@@ -795,252 +1419,17 @@
         inDomains:NSUserDomainMask] firstObject];
     const auto probe = bb::probe_eboot_entry(documents.path ? documents.path.UTF8String : "");
     NSString *status = [NSString stringWithUTF8String:probe.status.c_str()];
-    _report[@"boot_probe"] = @{@"path": @"Documents/eboot.elf",
+    _report[@"boot_probe"] = @{
+        @"path": @"Documents/eboot.elf",
         @"status": status, @"entry_reached": @(probe.entry_reached),
         @"file_size": @(probe.file_size), @"entry_rip": @(probe.entry_rip),
         @"stop_rip": @(probe.stop_rip), @"stack_pointer": @(probe.stack_pointer),
         @"instructions_executed": @(probe.instructions_executed),
-        @"stop_opcode": @(probe.stop_opcode),
         @"game_execution": @NO,
-        @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]};
-    _bootStatus.text = [NSString stringWithFormat:@"Entry x86-64: %@, %u instrucoes, parada em 0x%llx.",
-        status, probe.instructions_executed, probe.stop_rip];
-}
-
-- (void)initGameBoot {
-    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
-        inDomains:NSUserDomainMask] firstObject];
-    if (!documents) {
-        _gameBootStatus.text = @"Motor Bloodborne: pasta Documents indisponível.";
-        return;
-    }
-
-    bb::BootConfig config;
-    config.base_dir = documents.path.UTF8String;
-    config.save_dir = [documents.path stringByAppendingPathComponent:@"savedata"].UTF8String;
-    config.guest_memory_size = 768u << 20;
-    config.require_essential_assets = false;
-    config.enable_hle = true;
-    config.use_scheduler = true;
-
-    _bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
-    _bootCoordinator->attach_input_manager(&_inputManager);
-    _bootCoordinator->attach_video_out(&_videoOutManager);
-    bool ok = _bootCoordinator->initialize(config);
-    auto diag = _bootCoordinator->diagnostics();
-
-    if (!ok) {
-        NSString *err = [NSString stringWithUTF8String:diag.last_error.c_str()];
-        _gameBootStatus.text = [NSString stringWithFormat:@"Motor Bloodborne: FALHA: %@", err];
-        _report[@"game_boot_coordinator"] = @{
-            @"status": @"init_failed",
-            @"error": err,
-            @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
-            @"active_modules": @(diag.modules_count),
-            @"total_steps": @(diag.total_steps),
-            @"game_execution": @NO
-        };
-        _report[@"game_execution"] = @NO;
-        return;
-    }
-
-    if (_bootCoordinator->runtime()) {
-        _bootCoordinator->runtime()->pad_manager().set_default_input(&_inputManager);
-        _bootCoordinator->runtime()->attach_video_out(&_videoOutManager);
-    }
-
-    std::uint64_t steps = _bootCoordinator->step(100000);
-    diag = _bootCoordinator->diagnostics();
-
-    const bool is_running = (diag.total_steps > 0);
-    _report[@"game_execution"] = @(is_running);
-
-    [self updateCoordinatorReportAndUI:diag executedSteps:steps];
-}
-
-- (void)stepGameBoot {
-    if (!_bootCoordinator || (_bootCoordinator->state() != bb::BootState::running && _bootCoordinator->state() != bb::BootState::modules_initialized)) {
-        _gameBootStatus.text = @"Motor Bloodborne não inicializado. Toque em 'Iniciar Motor do Jogo' primeiro.";
-        return;
-    }
-
-    std::uint64_t steps = _bootCoordinator->step(250000);
-    auto diag = _bootCoordinator->diagnostics();
-
-    const bool is_running = (diag.total_steps > 0);
-    _report[@"game_execution"] = @(is_running);
-
-    [self updateCoordinatorReportAndUI:diag executedSteps:steps];
-}
-
-- (void)updateCoordinatorReportAndUI:(const bb::BootDiagnostics&)diag executedSteps:(std::uint64_t)steps {
-    NSMutableDictionary *importCounts = [NSMutableDictionary dictionary];
-    for (const auto& [name, count] : diag.import_call_counts) {
-        importCounts[[NSString stringWithUTF8String:name.c_str()]] = @(count);
-    }
-    NSMutableArray *modules = [NSMutableArray array];
-    for (const auto& m : diag.active_modules) {
-        [modules addObject:[NSString stringWithUTF8String:m.c_str()]];
-    }
-
-    const bool is_running = (diag.total_steps > 0);
-    _report[@"game_boot_coordinator"] = @{
-        @"status": (diag.state == bb::BootState::halted ? @"halted" : (diag.state == bb::BootState::error ? @"error" : @"running")),
-        @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
-        @"total_steps": @(diag.total_steps),
-        @"total_import_calls": @(diag.total_import_calls),
-        @"last_import_called": [NSString stringWithUTF8String:diag.last_import_called.c_str()],
-        @"import_call_counts": importCounts,
-        @"active_modules": modules,
-        @"modules_count": @(diag.modules_count),
-        @"entry_point": @(diag.entry_point),
-        @"current_rip": @(diag.current_rip),
-        @"last_stop_reason": [NSString stringWithUTF8String:diag.last_stop_reason.c_str()],
-        @"game_execution": @(is_running),
         @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]
     };
-
-    _gameBootStatus.text = [NSString stringWithFormat:
-        @"Motor Bloodborne (+%llu): Total %llu passos | %llu imports | RIP: 0x%llx | Stop: %s",
-        (unsigned long long)steps,
-        (unsigned long long)diag.total_steps,
-        (unsigned long long)diag.total_import_calls,
-        (unsigned long long)diag.current_rip,
-        diag.last_stop_reason.c_str()];
+    _bootStatus.text = [NSString stringWithFormat:@"Entry probe: %@, parada em 0x%llx", status, probe.stop_rip];
 }
-
-- (void)drawInMTKView:(MTKView *)view {
-    MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
-    id<CAMetalDrawable> drawable = view.currentDrawable;
-    if (!pass || !drawable || !_pipeline || !_vertexBuffer || !_indexBuffer) return;
-
-    auto now = std::chrono::steady_clock::now();
-    double frame_ms = std::chrono::duration<double, std::milli>(now - _lastFrameTime).count();
-    _lastFrameTime = now;
-    _pacingTracker.record_frame_ms(frame_ms);
-
-    if (_bootCoordinator && (_bootCoordinator->state() == bb::BootState::running || _bootCoordinator->state() == bb::BootState::modules_initialized)) {
-        uint64_t stepBudget = _continuousExecution ? 100000 : 2000;
-        _bootCoordinator->step(stepBudget);
-        _report[@"game_execution"] = @YES;
-    }
-
-    if (_videoOutManager.has_new_frame()) {
-        bb::HostFrameBuffer guestFrame;
-        if (_videoOutManager.read_current_frame_pixels(guestFrame) && guestFrame.valid) {
-            _report[@"guest_frame_flipped"] = @YES;
-            _report[@"guest_frame_seq"] = @(guestFrame.flip_sequence);
-            _report[@"guest_frame_w"] = @(guestFrame.width);
-            _report[@"guest_frame_h"] = @(guestFrame.height);
-
-            if (!_guestScreenTexture || _guestScreenTexture.width != guestFrame.width || _guestScreenTexture.height != guestFrame.height) {
-                MTLTextureDescriptor *screenDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                                     width:guestFrame.width
-                                                                                                    height:guestFrame.height
-                                                                                                 mipmapped:NO];
-                screenDesc.usage = MTLTextureUsageShaderRead;
-                _guestScreenTexture = [view.device newTextureWithDescriptor:screenDesc];
-            }
-            if (_guestScreenTexture && !guestFrame.pixel_data.empty()) {
-                [_guestScreenTexture replaceRegion:MTLRegionMake2D(0, 0, guestFrame.width, guestFrame.height)
-                                       mipmapLevel:0
-                                         withBytes:guestFrame.pixel_data.data()
-                                       bytesPerRow:guestFrame.pitch > 0 ? guestFrame.pitch : guestFrame.width * 4];
-            }
-        }
-    }
-
-    _angle += 0.02f;
-    float aspect = (view.bounds.size.height > 0) ? (float)view.bounds.size.width / (float)view.bounds.size.height : 1.777f;
-    bb::Matrix4x4 proj = bb::Matrix4x4::perspective(55.0f * 3.14159265f / 180.0f, aspect, 0.1f, 100.0f);
-    float eye[3] = {0.0f, 1.0f, 2.8f};
-    float target[3] = {0.0f, 0.3f, 0.0f};
-    float up[3] = {0.0f, 1.0f, 0.0f};
-    bb::Matrix4x4 viewMat = bb::Matrix4x4::look_at(eye, target, up);
-    bb::Matrix4x4 modelRot = bb::Matrix4x4::rotation_y(_angle);
-    bb::Matrix4x4 modelPitch = bb::Matrix4x4::rotation_x(0.2f);
-    bb::Matrix4x4 model = bb::Matrix4x4::multiply(modelRot, modelPitch);
-
-    bb::ModelViewProjectionUniforms mvpUniforms{};
-    mvpUniforms.model = model;
-    mvpUniforms.view = viewMat;
-    mvpUniforms.projection = proj;
-    bb::Matrix4x4 modelView = bb::Matrix4x4::multiply(viewMat, model);
-    mvpUniforms.mvp = bb::Matrix4x4::multiply(proj, modelView);
-    mvpUniforms.normal_matrix = bb::Matrix4x4::normal_matrix(modelView);
-
-
-    id<MTLCommandBuffer> command = [_queue commandBuffer];
-    if (!command) { [self gpuError:@"Falha ao criar command buffer"]; return; }
-    id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
-    if (!encoder) { [self gpuError:@"Falha ao criar render encoder"]; return; }
-
-    [encoder setRenderPipelineState:_pipeline];
-    if (_depthState) {
-        [encoder setDepthStencilState:_depthState];
-    }
-    [encoder setCullMode:MTLCullModeNone];
-
-    [encoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
-    [encoder setVertexBytes:&mvpUniforms length:sizeof(mvpUniforms) atIndex:1];
-
-    [encoder setFragmentBuffer:_lightingBuffer offset:0 atIndex:1];
-    if (_guestScreenTexture) {
-        [encoder setFragmentTexture:_guestScreenTexture atIndex:0];
-    } else if (_diffuseTexture) {
-        [encoder setFragmentTexture:_diffuseTexture atIndex:0];
-    }
-    if (_samplerState) {
-        [encoder setFragmentSamplerState:_samplerState atIndex:0];
-    }
-
-    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                        indexCount:_indexCount
-                         indexType:MTLIndexTypeUInt32
-                       indexBuffer:_indexBuffer
-                 indexBufferOffset:0];
-
-    [encoder endEncoding];
-    [command presentDrawable:drawable];
-
-    __weak LabController *weakSelf = self;
-    [command addCompletedHandler:^(id<MTLCommandBuffer> finished) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            LabController *strongSelf = weakSelf;
-            if (!strongSelf) return;
-            if (finished.status == MTLCommandBufferStatusCompleted) {
-                ++strongSelf->_completedFrames;
-                strongSelf->_report[@"metal_completed_frames"] = @(strongSelf->_completedFrames);
-                if (strongSelf->_completedFrames == 1 || strongSelf->_completedFrames % 30 == 0) {
-                    auto pacing = strongSelf->_pacingTracker.get_stats();
-                    uint64_t mem_bytes = strongSelf->_memoryMonitor.query_physical_footprint_bytes();
-                    double mem_mb = static_cast<double>(mem_bytes) / (1024.0 * 1024.0);
-                    strongSelf->_gpuStatus.text = [NSString stringWithFormat:
-                        @"Metal 3: %lu frames | FLVER (%u vtx, %u tri) | P50: %.1fms | Mem: %.1f MB",
-                        (unsigned long)strongSelf->_completedFrames,
-                        strongSelf->_modelVertexCount,
-                        strongSelf->_modelTriangleCount,
-                        pacing.p50_ms, mem_mb];
-                    if (strongSelf->_bootCoordinator && strongSelf->_bootCoordinator->state() == bb::BootState::running) {
-                        auto coordDiag = strongSelf->_bootCoordinator->diagnostics();
-                        strongSelf->_gameBootStatus.text = [NSString stringWithFormat:
-                            @"Motor Bloodborne (Frame %lu%s): Total %llu passos | %llu imports | RIP: 0x%llx",
-                            (unsigned long)strongSelf->_completedFrames,
-                            strongSelf->_continuousExecution ? " [Contínuo]" : "",
-                            (unsigned long long)coordDiag.total_steps,
-                            (unsigned long long)coordDiag.total_import_calls,
-                            (unsigned long long)coordDiag.current_rip];
-                    }
-                }
-            } else {
-                [strongSelf gpuError:finished.error ? finished.error.localizedDescription : @"Erro no command buffer"];
-            }
-        });
-    }];
-    [command commit];
-}
-
-- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size { (void)view; (void)size; }
 
 - (void)checkDocumentsInventory {
     NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
@@ -1048,40 +1437,17 @@
     NSFileManager *manager = [NSFileManager defaultManager];
     NSMutableDictionary *inventory = [NSMutableDictionary dictionary];
     inventory[@"directory_available"] = @(documents != nil);
-    NSError *directoryError = nil;
-    NSDictionary *directoryAttributes = documents ? [manager attributesOfItemAtPath:documents.path error:&directoryError] : nil;
-    inventory[@"directory_status"] = directoryAttributes ?
-        ([[directoryAttributes fileType] isEqualToString:NSFileTypeDirectory] ? @"ok" : @"not_directory") : @"unavailable";
-    if (directoryError) {
-        inventory[@"directory_error_domain"] = directoryError.domain;
-        inventory[@"directory_error_code"] = @(directoryError.code);
-    }
     bb::VirtualFileSystem vfs;
     const bool mounted = documents && vfs.mount("/app0", documents.path.UTF8String, true);
     inventory[@"vfs_mounted"] = @(mounted);
     NSMutableDictionary *files = [NSMutableDictionary dictionary];
-    for (NSString *name in @[@"teste-bblab.txt", @"param.sfo", @"m29_00_00_00_408010.flver.dcx", @"eboot.elf", @"libc.prx", @"libSceFios2.prx"]) {
+    for (NSString *name in @[@"teste-bblab.txt", @"param.sfo", @"m29_00_00_00_408010.flver.dcx", @"eboot.elf", @"eboot.bin", @"libc.prx", @"libSceFios2.prx"]) {
         NSError *error = nil;
         NSDictionary *attributes = documents ? [manager attributesOfItemAtPath:
             [documents.path stringByAppendingPathComponent:name] error:&error] : nil;
         NSMutableDictionary *item = [NSMutableDictionary dictionary];
-        item[@"foundation_status"] = attributes ?
-            ([[attributes fileType] isEqualToString:NSFileTypeRegular] ? @"regular_file" : @"not_regular_file") :
-            (error && [error.domain isEqualToString:NSCocoaErrorDomain] &&
-             (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) ? @"not_found" : @"stat_error");
+        item[@"foundation_status"] = attributes ? @"regular_file" : @"not_found";
         if (attributes) item[@"size_bytes"] = @([attributes fileSize]);
-        if (error && ![item[@"foundation_status"] isEqualToString:@"not_found"]) {
-            item[@"error_domain"] = error.domain;
-            item[@"error_code"] = @(error.code);
-        }
-        bb::VfsStat stat{};
-        if (mounted) {
-            const auto result = vfs.stat(std::string("/app0/") + name.UTF8String, stat);
-            item[@"vfs_status"] = result == bb::VfsError::ok ? @"ok" :
-                (result == bb::VfsError::not_found ? @"not_found" : @"stat_error");
-        } else {
-            item[@"vfs_status"] = @"not_mounted";
-        }
         files[name] = item;
     }
     inventory[@"files"] = files;
@@ -1099,40 +1465,14 @@
         auto diag = _bootCoordinator->diagnostics();
         const bool is_running = (diag.total_steps > 0);
         _report[@"game_execution"] = @(is_running);
-        NSMutableDictionary *importCounts = [NSMutableDictionary dictionary];
-        for (const auto& [name, count] : diag.import_call_counts) {
-            importCounts[[NSString stringWithUTF8String:name.c_str()]] = @(count);
-        }
-        NSMutableArray *modules = [NSMutableArray array];
-        for (const auto& m : diag.active_modules) {
-            [modules addObject:[NSString stringWithUTF8String:m.c_str()]];
-        }
-        _report[@"game_boot_coordinator"] = @{
-            @"status": (diag.state == bb::BootState::halted ? @"halted" : (diag.state == bb::BootState::error ? @"error" : @"running")),
-            @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
-            @"total_steps": @(diag.total_steps),
-            @"total_import_calls": @(diag.total_import_calls),
-            @"last_import_called": [NSString stringWithUTF8String:diag.last_import_called.c_str()],
-            @"import_call_counts": importCounts,
-            @"active_modules": modules,
-            @"modules_count": @(diag.modules_count),
-            @"entry_point": @(diag.entry_point),
-            @"current_rip": @(diag.current_rip),
-            @"last_stop_reason": [NSString stringWithUTF8String:diag.last_stop_reason.c_str()],
-            @"game_execution": @(is_running),
-            @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]
-        };
     }
     _report[@"timestamp"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     auto pacing = _pacingTracker.get_stats();
     _report[@"frame_pacing_p50_ms"] = @(pacing.p50_ms);
-    _report[@"frame_pacing_p95_ms"] = @(pacing.p95_ms);
-    _report[@"frame_pacing_p99_ms"] = @(pacing.p99_ms);
     _report[@"average_fps"] = @(pacing.average_fps);
     uint64_t mem_bytes = _memoryMonitor.query_physical_footprint_bytes();
     _report[@"memory_footprint_mb"] = @(static_cast<double>(mem_bytes) / (1024.0 * 1024.0));
     _report[@"gamepad_connected"] = @(GCController.controllers.count > 0);
-    _report[@"continuous_execution_enabled"] = @(_continuousExecution);
     _report[@"video_flips"] = @(_videoOutManager.flip_count());
 
     NSError *error = nil;
@@ -1140,20 +1480,20 @@
     NSURL *directory = [[NSFileManager defaultManager] URLForDirectory:NSApplicationSupportDirectory
         inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:&error];
     NSURL *file = [directory URLByAppendingPathComponent:@"bb-lab-report.json"];
-    if (!json || !file || ![json writeToURL:file options:NSDataWritingAtomic error:&error]) {
-        _status.text = [@"Erro ao salvar diagnóstico: " stringByAppendingString:error ? error.localizedDescription : @"desconhecido"];
-        return;
+    if (json && file && [json writeToURL:file options:NSDataWritingAtomic error:&error]) {
+        UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[file] applicationActivities:nil];
+        share.popoverPresentationController.sourceView = sender;
+        share.popoverPresentationController.sourceRect = sender.bounds;
+        [self presentViewController:share animated:YES completion:nil];
     }
-    UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[file] applicationActivities:nil];
-    share.popoverPresentationController.sourceView = sender;
-    share.popoverPresentationController.sourceRect = sender.bounds;
-    [self presentViewController:share animated:YES completion:nil];
 }
+
 @end
 
 @interface LabSceneDelegate : UIResponder <UIWindowSceneDelegate>
 @property(nonatomic, strong) UIWindow *window;
 @end
+
 @implementation LabSceneDelegate
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)options {
     (void)session; (void)options;
@@ -1163,14 +1503,17 @@
     [self.window makeKeyAndVisible];
 }
 @end
+
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
 @end
+
 @implementation AppDelegate
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)options {
     (void)application; (void)options;
     return YES;
 }
 @end
+
 int main(int argc, char *argv[]) {
     @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass(AppDelegate.class)); }
 }
