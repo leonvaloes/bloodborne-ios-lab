@@ -1167,8 +1167,22 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [encoder endEncoding];
         [command presentDrawable:drawable];
+        __weak LabController *weakSelf = self;
+        [command addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                LabController *strongSelf = weakSelf;
+                if (!strongSelf) return;
+                if (finished.status == MTLCommandBufferStatusCompleted) {
+                    ++strongSelf->_completedFrames;
+                    strongSelf->_report[@"metal_completed_frames"] = @(strongSelf->_completedFrames);
+                    strongSelf->_report[@"guest_frame_presented_to_metal"] = @YES;
+                } else {
+                    strongSelf->_report[@"guest_frame_presented_to_metal"] = @NO;
+                    [strongSelf gpuError:finished.error ? finished.error.localizedDescription : @"Falha ao apresentar frame guest"];
+                }
+            });
+        }];
         [command commit];
-        _report[@"guest_frame_presented_to_metal"] = @YES;
         return;
     }
 
@@ -1182,9 +1196,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     [encoder setVertexBytes:&mvpUniforms length:sizeof(mvpUniforms) atIndex:1];
     [encoder setFragmentBuffer:_lightingBuffer offset:0 atIndex:1];
 
-    if (_guestScreenTexture) {
-        [encoder setFragmentTexture:_guestScreenTexture atIndex:0];
-    } else if (_diffuseTexture) {
+    if (_diffuseTexture) {
         [encoder setFragmentTexture:_diffuseTexture atIndex:0];
     }
     if (_samplerState) {
