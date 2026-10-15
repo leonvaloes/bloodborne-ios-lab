@@ -983,6 +983,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     // A VideoOut anterior referencia GuestMemory do coordenador antigo.
     _videoOutManager.detach_guest_memory();
     _guestScreenTexture = nil;
+    _report[@"guest_frame_flipped"] = @NO;
+    _report[@"guest_frame_presented_to_metal"] = @NO;
+    _report[@"guest_steps_executed"] = @NO;
+    _report[@"game_execution"] = @NO;
     _bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
     _bootCoordinator->attach_input_manager(&_inputManager);
     _bootCoordinator->attach_video_out(&_videoOutManager);
