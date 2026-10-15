@@ -83,7 +83,7 @@
 @end
 
 // Callback de CoreAudio AudioQueue para streaming contínuo em 48 kHz estéreo
-static void AudioQueueOutputCallback(void *userData, AudioQueueRef queue, AudioQueueBufferRef buffer) {
+static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueueBufferRef buffer) {
     LabController *controller = (__bridge LabController *)userData;
     if (controller) {
         [controller fillAudioBuffer:buffer];
@@ -366,19 +366,19 @@ static void AudioQueueOutputCallback(void *userData, AudioQueueRef queue, AudioQ
     _report[@"metal_flver_vertices"] = @(_modelVertexCount);
     _report[@"metal_flver_triangles"] = @(_modelTriangleCount);
 
-    _vertexBuffer = [device newBufferWithBytes:mesh.vertex_bytes.data()
-                                        length:mesh.vertex_bytes.size()
+    _vertexBuffer = [device newBufferWithBytes:mesh.vertex_data.data()
+                                        length:mesh.vertex_data.size() * sizeof(float)
                                        options:MTLResourceStorageModeShared];
-    _indexBuffer = [device newBufferWithBytes:mesh.index_bytes.data()
-                                       length:mesh.index_bytes.size()
+    _indexBuffer = [device newBufferWithBytes:mesh.index_data.data()
+                                       length:mesh.index_data.size() * sizeof(uint32_t)
                                       options:MTLResourceStorageModeShared];
     _indexCount = mesh.index_count;
 
     bb::LightingUniforms lighting{};
-    lighting.light_direction = simd_make_float4(0.577f, 0.577f, 0.577f, 0.0f);
-    lighting.light_color = simd_make_float4(1.0f, 0.95f, 0.85f, 1.0f);
-    lighting.ambient_color = simd_make_float4(0.25f, 0.22f, 0.20f, 1.0f);
-    lighting.camera_position = simd_make_float4(0.0f, 0.0f, 2.5f, 1.0f);
+    lighting.camera_position[0] = 0.0f;
+    lighting.camera_position[1] = 0.0f;
+    lighting.camera_position[2] = 2.5f;
+    lighting.camera_position[3] = 1.0f;
     lighting.specular_power = 32.0f;
     _lightingBuffer = [device newBufferWithBytes:&lighting length:sizeof(lighting) options:MTLResourceStorageModeShared];
 
@@ -1068,8 +1068,9 @@ static void AudioQueueOutputCallback(void *userData, AudioQueueRef queue, AudioQ
     }
 
     // Atualização de rotação suave da câmera no modo demonstração 3D
-    _angle += 0.015f + (_inputManager.right_stick_x() * 0.04f);
-    _cameraPitch += (_inputManager.right_stick_y() * 0.03f);
+    auto pad = _inputManager.poll();
+    _angle += 0.015f + (pad.right_stick_x * 0.04f);
+    _cameraPitch += (pad.right_stick_y * 0.03f);
     _cameraPitch = std::max(-1.1f, std::min(1.1f, _cameraPitch));
 
     float aspect = (view.bounds.size.height > 0) ? (float)view.bounds.size.width / (float)view.bounds.size.height : 1.777f;
@@ -1163,8 +1164,24 @@ static void AudioQueueOutputCallback(void *userData, AudioQueueRef queue, AudioQ
 
 #pragma mark - Touch & Controller Handlers
 
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGSize sz = self.view.bounds.size;
+    if (sz.width > 0 && sz.height > 0) {
+        bb::ScreenLayoutConfig cfg;
+        cfg.width = sz.width;
+        cfg.height = sz.height;
+        UIEdgeInsets insets = self.view.safeAreaInsets;
+        cfg.safe_left = insets.left > 0 ? insets.left : bb::IPHONE_15_PRO_MAX_SAFE_LEFT_PT;
+        cfg.safe_right = insets.right > 0 ? insets.right : bb::IPHONE_15_PRO_MAX_SAFE_RIGHT_PT;
+        cfg.safe_top = insets.top;
+        cfg.safe_bottom = insets.bottom > 0 ? insets.bottom : bb::IPHONE_15_PRO_MAX_SAFE_BOTTOM_PT;
+        _touchOverlay.set_screen_layout(cfg);
+    }
+}
+
 - (void)handleTouchId:(uint64_t)tid x:(float)x y:(float)y phase:(bb::TouchPhase)phase {
-    _touchOverlay.handle_touch(tid, x, y, phase);
+    _touchOverlay.on_touch(tid, x, y, phase);
 }
 
 - (void)onVirtualButtonTouch:(UIButton *)sender {
@@ -1275,7 +1292,7 @@ static void AudioQueueOutputCallback(void *userData, AudioQueueRef queue, AudioQ
     if (controller) {
         [self setupController:controller];
         _subsystemStatus.text = [NSString stringWithFormat:@"GameController conectado: %@ (Mapeamento ativo)",
-            controller.vendorName ?: @"Compatível"];
+            controller.vendorName ? controller.vendorName : @"Compatível"];
     }
 }
 
@@ -1297,7 +1314,7 @@ static void AudioQueueOutputCallback(void *userData, AudioQueueRef queue, AudioQ
     format.mChannelsPerFrame = 2;
     format.mBitsPerChannel = 16;
 
-    OSStatus status = AudioQueueNewOutput(&format, AudioQueueOutputCallback, (__bridge void *)self, NULL, NULL, 0, &_audioQueue);
+    OSStatus status = AudioQueueNewOutput(&format, BB_AudioQueueCallback, (__bridge void *)self, NULL, NULL, 0, &_audioQueue);
     if (status == noErr) {
         const UInt32 bufferSize = 2048 * 4;
         for (int i = 0; i < 3; ++i) {
