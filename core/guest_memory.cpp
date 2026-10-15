@@ -27,6 +27,7 @@ MemoryError GuestMemory::map(std::uint64_t address, std::size_t size, unsigned p
     } catch (const std::bad_alloc&) { return MemoryError::allocation;
     } catch (const std::length_error&) { return MemoryError::allocation; }
     used_ += size;
+    if (used_ > peak_used_) peak_used_ = used_;
     return MemoryError::ok;
 }
 
@@ -82,6 +83,11 @@ MemoryError GuestMemory::store(std::uint64_t address, const void* source, std::s
 std::size_t GuestMemory::used() const {
     std::lock_guard<std::mutex> guard(mutex_);
     return used_;
+}
+
+std::size_t GuestMemory::peak_used() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return peak_used_;
 }
 
 bool GuestMemory::query_region(std::uint64_t address, std::uint64_t& base, std::size_t& size, unsigned& perm) const {

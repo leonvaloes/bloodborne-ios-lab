@@ -20,6 +20,8 @@ public:
     MemoryError load(std::uint64_t address, void* destination, std::size_t size) const;
     MemoryError store(std::uint64_t address, const void* source, std::size_t size);
     std::size_t used() const;
+    // Pico de bytes mapeados desde a criação; não é o footprint físico do processo.
+    std::size_t peak_used() const;
     std::size_t budget() const { return budget_; }
     bool query_region(std::uint64_t address, std::uint64_t& base, std::size_t& size, unsigned& perm) const;
 
@@ -36,6 +38,6 @@ private:
     Regions::const_iterator find(std::uint64_t address, std::size_t size) const;
     mutable std::mutex mutex_;
     Regions regions_;
-    std::size_t budget_, used_ = 0;
+    std::size_t budget_, used_ = 0, peak_used_ = 0;
 };
 }

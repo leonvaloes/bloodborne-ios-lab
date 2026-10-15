@@ -23,6 +23,7 @@ int main() { return run([] {
     CHECK(m.map(32, 32, read | write) == MemoryError::ok);
     CHECK(m.map(100, 1, read) == MemoryError::budget);
     CHECK(m.used() == 64);
+    CHECK(m.peak_used() == 64);
     std::array<std::uint8_t, 32> result{};
     result.fill(0xAA);
     CHECK(m.load(32, result.data(), result.size()) == MemoryError::ok);
@@ -49,6 +50,7 @@ int main() { return run([] {
     CHECK(m.protect(33, read) == MemoryError::unmapped);
     CHECK(m.unmap(33) == MemoryError::unmapped);
     CHECK(m.unmap(32) == MemoryError::ok && m.used() == 32);
+    CHECK(m.peak_used() == 64);
     CHECK(m.load(63, &output, 1) == MemoryError::unmapped);
     CHECK(m.unmap(32) == MemoryError::unmapped);
     CHECK(m.map(max - 32, 32, read | write) == MemoryError::ok);
