@@ -8,12 +8,17 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#if defined(_WIN32)
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
+#include <atomic>
+#include <chrono>
 #define assert(condition) do { if (!(condition)) throw std::runtime_error("falha: " #condition); } while (false)
+
+namespace {
+std::string unique_tag() {
+    static std::atomic<std::uint64_t> counter{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::to_string(now) + "_" + std::to_string(++counter);
+}
+} // namespace
 
 using namespace bb;
 int main() {
@@ -21,7 +26,7 @@ int main() {
     assert(orbis_nid("_init_env")=="bzQExy189ZI");
     assert(orbis_nid("sceKernelMapDirectMemory")=="L-Q3LEjIbgA");
     GuestMemory m(256*1024);
-    assert(m.map(0x1000,0x4000,read|write)==MemoryError::ok);
+    assert(m.map(0x1000,0x4000,bb::read|bb::write)==MemoryError::ok);
     // call rax via mov rax, imm64; call rax; hlt — sem execução nativa.
     const std::uint8_t program[]={0x48,0xb8,0,0,0,0,0,0,0,0,0xff,0xd0,0xf4};
     assert(m.store(0x1000,program,sizeof program)==MemoryError::ok);
@@ -208,7 +213,7 @@ int main() {
     // Testes de subsistemas HLE: libSceUserService, libScePad, libSceSaveData,
     // libSceAudioOut, Math, Conversões, Ordenação e snprintf
     // =========================================================================
-    assert(m.map(0x5000, 0xb000, read | write) == MemoryError::ok);
+    assert(m.map(0x5000, 0xb000, bb::read | bb::write) == MemoryError::ok);
 
     // 1. libSceUserService & libScePad
     assert(call("sceUserServiceInitialize", 0) == 0);
@@ -244,8 +249,9 @@ int main() {
     // 2. libSceSaveData & libSceAudioOut
     // Set up VFS and initialize SaveDataManager with it before HLE calls
     VirtualFileSystem vfs;
-    std::string temp_dir = std::filesystem::temp_directory_path().string() + "/save_test_" + std::to_string(getpid());
-    std::string save_base_dir = std::filesystem::temp_directory_path().string() + "/save_data_test_" + std::to_string(getpid());
+    const std::string tag = unique_tag();
+    std::string temp_dir = std::filesystem::temp_directory_path().string() + "/save_test_" + tag;
+    std::string save_base_dir = std::filesystem::temp_directory_path().string() + "/save_data_test_" + tag;
     std::error_code ec_clean;
     std::filesystem::remove_all(temp_dir, ec_clean);
     std::filesystem::remove_all(save_base_dir, ec_clean);
@@ -490,7 +496,7 @@ int main() {
 
     // 8. stdio HLE memory safety
     {
-        std::string tmp_file = (std::filesystem::temp_directory_path() / ("hle_stdio_test_" + std::to_string(getpid()) + ".tmp")).string();
+        std::string tmp_file = (std::filesystem::temp_directory_path() / ("hle_stdio_test_" + unique_tag() + ".tmp")).string();
         assert(m.store(0x6300, tmp_file.c_str(), tmp_file.size() + 1) == MemoryError::ok);
         assert(m.store(0x6400, "wb+", 4) == MemoryError::ok);
 
@@ -537,9 +543,9 @@ int main() {
     // =========================================================================
     {
         GuestMemory gm(2 * 1024 * 1024);
-        assert(gm.map(0x10000, 0x10000, read | write) == MemoryError::ok); // code
-        assert(gm.map(0x20000, 0x10000, read | write) == MemoryError::ok); // data
-        assert(gm.map(0x40000, 0x10000, read | write) == MemoryError::ok); // main stack
+        assert(gm.map(0x10000, 0x10000, bb::read | bb::write) == MemoryError::ok); // code
+        assert(gm.map(0x20000, 0x10000, bb::read | bb::write) == MemoryError::ok); // data
+        assert(gm.map(0x40000, 0x10000, bb::read | bb::write) == MemoryError::ok); // main stack
 
         GuestScheduler sched(gm, 32);
         OrbisRuntime srt(gm);
@@ -549,9 +555,10 @@ int main() {
 
         // Initialize VFS and SaveDataManager for save data tests
         VirtualFileSystem vfs;
-        std::string temp_dir = std::filesystem::temp_directory_path().string() + "/save_test_" + std::to_string(getpid());
+        const std::string tag2 = unique_tag();
+        std::string temp_dir = std::filesystem::temp_directory_path().string() + "/save_test_" + tag2;
         assert(vfs.mount("/save", temp_dir));
-        srt.save_data_manager().initialize(std::filesystem::temp_directory_path().string() + "/save_data_test_" + std::to_string(getpid()), 32 * 1024 * 1024, &vfs);
+        srt.save_data_manager().initialize(std::filesystem::temp_directory_path().string() + "/save_data_test_" + tag2, 32 * 1024 * 1024, &vfs);
 
         constexpr std::uint64_t trap_base = 0x50000;
         constexpr std::uint64_t return_trap = 0x50f00;
@@ -705,7 +712,7 @@ int main() {
             append(t1_code, {0xc3});
             assert(gm.store(0x10200, t1_code.data(), t1_code.size()) == MemoryError::ok);
 
-            assert(gm.map(0x60000, 0x10000, read | write) == MemoryError::ok);
+            assert(gm.map(0x60000, 0x10000, bb::read | bb::write) == MemoryError::ok);
             auto tid = sched.create(0x10200, 0x60000, 0x70000, return_trap);
             assert(tid && sched.start(tid) == ORBIS_OK);
 
@@ -769,7 +776,7 @@ int main() {
             append(t1_code, {0xc3});
             assert(gm.store(0x10400, t1_code.data(), t1_code.size()) == MemoryError::ok);
 
-            assert(gm.map(0x70000, 0x10000, read | write) == MemoryError::ok);
+            assert(gm.map(0x70000, 0x10000, bb::read | bb::write) == MemoryError::ok);
             auto tid = sched.create(0x10400, 0x70000, 0x80000, return_trap);
             assert(tid && sched.start(tid) == ORBIS_OK);
 
@@ -821,7 +828,7 @@ int main() {
             append(t1_code, {0xc3});
             assert(gm.store(0x10600, t1_code.data(), t1_code.size()) == MemoryError::ok);
 
-            assert(gm.map(0x80000, 0x10000, read | write) == MemoryError::ok);
+            assert(gm.map(0x80000, 0x10000, bb::read | bb::write) == MemoryError::ok);
             auto tid = sched.create(0x10600, 0x80000, 0x90000, return_trap);
             assert(tid && sched.start(tid) == ORBIS_OK);
 
@@ -855,7 +862,7 @@ int main() {
             append(caller_code, {0xc3});
             assert(gm.store(0x10800, caller_code.data(), caller_code.size()) == MemoryError::ok);
 
-            assert(gm.map(0x90000, 0x10000, read | write) == MemoryError::ok);
+            assert(gm.map(0x90000, 0x10000, bb::read | bb::write) == MemoryError::ok);
             auto tid = sched.create(0x10800, 0x90000, 0xa0000, return_trap);
             assert(tid && sched.start(tid) == ORBIS_OK);
 
@@ -888,7 +895,7 @@ int main() {
             append(guard_code, {0xc3});
             assert(gm.store(0x10a00, guard_code.data(), guard_code.size()) == MemoryError::ok);
 
-            assert(gm.map(0xa0000, 0x10000, read | write) == MemoryError::ok);
+            assert(gm.map(0xa0000, 0x10000, bb::read | bb::write) == MemoryError::ok);
             auto tid = sched.create(0x10a00, 0xa0000, 0xb0000, return_trap);
             assert(tid && sched.start(tid) == ORBIS_OK);
 
