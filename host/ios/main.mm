@@ -210,9 +210,12 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     [self setupGameControllers];
     [self setupAudio];
 
-    // Verifica inventário e tenta auto-boot
-    [self checkDocumentsInventory];
-    [self attemptAutoBoot];
+    // Adia o auto-boot até a próxima passagem do loop principal. A inicialização
+    // síncrona dos módulos ainda pode bloquear a interface: limite conhecido.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self checkDocumentsInventory];
+        [self attemptAutoBoot];
+    });
 }
 
 - (void)showFatalError:(NSString *)msg {
