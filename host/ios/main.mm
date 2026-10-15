@@ -1135,8 +1135,13 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                                        mipmapLevel:0
                                          withBytes:guestFrame.pixel_data.data()
                                        bytesPerRow:static_cast<NSUInteger>(guestFrame.pitch) * 4];
+                _report[@"guest_frame_status"] = @"Pixels guest lidos; origem GNM não comprovada.";
+            } else {
+                _report[@"guest_frame_status"] = @"Falha ao alocar textura de vídeo guest.";
             }
         } else {
+            _guestScreenTexture = nil;
+            _report[@"guest_frame_presented_to_metal"] = @NO;
             _report[@"guest_frame_status"] = @"Sem pixels lineares BGRA8 verificáveis; flip não demonstra imagem.";
         }
         _videoOutManager.consume_new_frame();
