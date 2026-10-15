@@ -296,16 +296,36 @@ int main() { return run([] {
 
     CHECK(sceAudioOutClose(p_out) == SCE_OK);
 
-    // A fila do host é estéreo: uma porta principal mono não deve ser drenada
-    // para um destino com capacidade para apenas 2 * frames amostras.
+    // A fila do host é estéreo: duplicar amostras mono sem escrever além
+    // do destino dimensionado para apenas 2 * frames amostras.
     const auto mono = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
                                     SCE_AUDIO_OUT_PARAM_FORMAT_S16_MONO);
     CHECK(mono > 0);
     std::vector<std::int16_t> mono_block(256, 42);
     CHECK(sceAudioOutOutput(mono, mono_block.data()) == SCE_OK);
-    std::vector<std::int16_t> host_buffer(512, -1);
-    CHECK(AudioOutManager::instance().drain_main_port_pcm16(host_buffer.data(), 256) == 0);
+    std::vector<std::int16_t> host_buffer(514, -1);
+    CHECK(AudioOutManager::instance().drain_main_port_pcm16(host_buffer.data(), 256) == 256);
+    for (std::size_t i = 0; i < 512; ++i) CHECK(host_buffer[i] == 42);
+    CHECK(host_buffer[512] == -1 && host_buffer[513] == -1);
     CHECK(sceAudioOutClose(mono) == SCE_OK);
+
+    // 8 canais: apenas L/R frontais são enviados ao host estéreo.
+    const auto surround = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
+                                        SCE_AUDIO_OUT_PARAM_FORMAT_S16_8CH);
+    CHECK(surround > 0);
+    std::vector<std::int16_t> surround_block(256 * 8, 999);
+    for (std::size_t i = 0; i < 256; ++i) {
+        surround_block[i * 8] = 10;
+        surround_block[i * 8 + 1] = 20;
+    }
+    CHECK(sceAudioOutOutput(surround, surround_block.data()) == SCE_OK);
+    std::fill(host_buffer.begin(), host_buffer.end(), -1);
+    CHECK(AudioOutManager::instance().drain_main_port_pcm16(host_buffer.data(), 256) == 256);
+    for (std::size_t i = 0; i < 256; ++i) {
+        CHECK(host_buffer[2 * i] == 10 && host_buffer[2 * i + 1] == 20);
+    }
+    CHECK(host_buffer[512] == -1 && host_buffer[513] == -1);
+    CHECK(sceAudioOutClose(surround) == SCE_OK);
 
     // Fechamento concorrente com o callback de saída não pode usar PortEntry
     // depois da destruição. Exercita ciclos curtos de abertura/drenagem/fecho.

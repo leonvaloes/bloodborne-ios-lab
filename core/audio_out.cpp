@@ -365,15 +365,25 @@ std::size_t AudioOutManager::drain_port_pcm16(std::int32_t handle, std::int16_t 
 std::size_t AudioOutManager::drain_main_port_pcm16(std::int16_t *out_samples, std::size_t frames) {
     if (!out_samples || frames == 0) return 0;
 
-    // Saída do host é S16 estéreo; nunca ler uma porta mono/8 canais
-    // diretamente para um buffer dimensionado em pares de amostras.
+    // Saída do host é S16 estéreo: converter os canais do guest sem
+    // ultrapassar o buffer do callback (que tem capacidade 2 * frames).
     std::lock_guard<std::mutex> lock(manager_mutex_);
     for (const auto& kv : ports_) {
         if (!kv.second || !kv.second->is_open ||
-            kv.second->type != SCE_AUDIO_OUT_PORT_TYPE_MAIN || kv.second->channels != 2) continue;
+            kv.second->type != SCE_AUDIO_OUT_PORT_TYPE_MAIN) continue;
         auto& port = *kv.second;
         std::lock_guard<std::mutex> port_lock(port.mutex);
-        if (port.is_open && port.ring_buffer) return port.ring_buffer->read(out_samples, frames);
+        if (!port.is_open || !port.ring_buffer) continue;
+        if (port.channels == 2) return port.ring_buffer->read(out_samples, frames);
+        if (port.channels != 1 && port.channels != 8) continue;
+        if (frames > std::vector<std::int16_t>().max_size() / port.channels) return 0;
+        std::vector<std::int16_t> input(frames * port.channels);
+        const auto received = port.ring_buffer->read(input.data(), frames);
+        for (std::size_t i = 0; i < received; ++i) {
+            out_samples[2 * i] = input[i * port.channels];
+            out_samples[2 * i + 1] = input[i * port.channels + (port.channels == 1 ? 0 : 1)];
+        }
+        return received;
     }
     return 0;
 }
