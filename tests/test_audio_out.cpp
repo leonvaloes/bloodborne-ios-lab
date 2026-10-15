@@ -303,7 +303,7 @@ int main() { return run([] {
     CHECK(mono > 0);
     std::vector<std::int16_t> mono_block(256, 42);
     CHECK(sceAudioOutOutput(mono, mono_block.data()) == SCE_OK);
-    std::vector<std::int16_t> host_buffer(514, -1);
+    std::vector<std::int16_t> host_buffer(514, static_cast<std::int16_t>(-1));
     CHECK(AudioOutManager::instance().drain_main_port_pcm16(host_buffer.data(), 256) == 256);
     for (std::size_t i = 0; i < 512; ++i) CHECK(host_buffer[i] == 42);
     CHECK(host_buffer[512] == -1 && host_buffer[513] == -1);
@@ -319,7 +319,7 @@ int main() { return run([] {
         surround_block[i * 8 + 1] = 20;
     }
     CHECK(sceAudioOutOutput(surround, surround_block.data()) == SCE_OK);
-    std::fill(host_buffer.begin(), host_buffer.end(), -1);
+    std::fill(host_buffer.begin(), host_buffer.end(), static_cast<std::int16_t>(-1));
     CHECK(AudioOutManager::instance().drain_main_port_pcm16(host_buffer.data(), 256) == 256);
     for (std::size_t i = 0; i < 256; ++i) {
         CHECK(host_buffer[2 * i] == 10 && host_buffer[2 * i + 1] == 20);

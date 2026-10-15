@@ -1291,15 +1291,17 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     if (n == "sceVideoOutSetBufferAttribute") {
         std::uint64_t attr_addr = a(0);
         if (attr_addr) {
-            std::uint32_t fields[6] = {
-                static_cast<std::uint32_t>(a(1)), // pixelFormat
-                static_cast<std::uint32_t>(a(2)), // tilingMode
-                static_cast<std::uint32_t>(a(3)), // aspectRatio
-                static_cast<std::uint32_t>(a(4)), // width
-                static_cast<std::uint32_t>(a(5)), // height
-                static_cast<std::uint32_t>(a(6))  // pitchInPixel
-            };
-            mem_.store(attr_addr, fields, sizeof(fields));
+            BufferAttribute attr{};
+            attr.pixel_format = static_cast<std::uint32_t>(a(1));
+            attr.tiling_mode = static_cast<std::uint32_t>(a(2));
+            attr.aspect_ratio = static_cast<std::int32_t>(a(3));
+            attr.width = static_cast<std::uint32_t>(a(4));
+            attr.height = static_cast<std::uint32_t>(a(5));
+            attr.pitch_in_pixel = static_cast<std::uint32_t>(a(6));
+            attr.option = 0;
+            attr.reserved0 = 0;
+            attr.reserved1 = 0;
+            mem_.store(attr_addr, &attr, sizeof(attr));
         }
         return 0;
     }
@@ -1313,20 +1315,29 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             buf_count <= 0 || buf_count > 16 || start_idx > 16 - buf_count) {
             return static_cast<std::uint64_t>(-1);
         }
-        std::uint32_t attr_fields[6] = {};
-        if (mem_.load(attr_ptr, attr_fields, sizeof(attr_fields)) != MemoryError::ok) {
+        BufferAttribute attr{};
+        if (mem_.load(attr_ptr, &attr, sizeof(attr)) != MemoryError::ok) {
             return static_cast<std::uint64_t>(-1);
         }
-        std::uint32_t width = attr_fields[3];
-        std::uint32_t height = attr_fields[4];
-        std::uint32_t pitch = attr_fields[5] ? attr_fields[5] : width;
+        if (attr.tiling_mode > 1) {
+            return static_cast<std::uint64_t>(-1);
+        }
+        std::uint32_t width = attr.width;
+        std::uint32_t height = attr.height;
+        std::uint32_t pitch = attr.pitch_in_pixel ? attr.pitch_in_pixel : width;
+        if (pitch < width) {
+            return static_cast<std::uint64_t>(-1);
+        }
         std::uint32_t bpp = 4;
+        if (attr.pixel_format == 0xC1060000) {
+            bpp = 8;
+        }
         for (int i = 0; i < buf_count; ++i) {
             std::uint64_t buf_addr = 0;
             if (mem_.load(addrs_ptr + static_cast<std::uint64_t>(i) * 8, &buf_addr, 8) != MemoryError::ok) {
                 return static_cast<std::uint64_t>(-1);
             }
-            VideoBuffer vb{buf_addr, width, height, pitch, bpp};
+            VideoBuffer vb{buf_addr, width, height, pitch, bpp, attr.pixel_format, attr.tiling_mode};
             if (video_out_->register_buffer(static_cast<std::uint32_t>(start_idx + i), vb) != VideoStatus::ok) {
                 return static_cast<std::uint64_t>(-1);
             }

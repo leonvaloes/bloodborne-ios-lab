@@ -472,14 +472,27 @@ int main() {
         assert(call("sceVideoOutAddFlipEvent", 0, vh, 0) == 0);
 
         constexpr std::uint64_t attr_addr = 0x6000;
-        assert(call("sceVideoOutSetBufferAttribute", attr_addr, 0, 0, 0, 2, 2, 2) == 0);
+        assert(call("sceVideoOutSetBufferAttribute", attr_addr, 0x80000000, 1, 0, 2, 2, 2) == 0);
         std::uint32_t read_attr[6] = {};
         assert(m.load(attr_addr, read_attr, sizeof(read_attr)) == MemoryError::ok);
+        assert(read_attr[0] == 0x80000000 && read_attr[1] == 1);
         assert(read_attr[3] == 2 && read_attr[4] == 2 && read_attr[5] == 2);
+        BufferAttribute full_attr{};
+        assert(m.load(attr_addr, &full_attr, sizeof(full_attr)) == MemoryError::ok);
+        assert(full_attr.pixel_format == 0x80000000 && full_attr.tiling_mode == 1);
+        assert(full_attr.option == 0 && full_attr.reserved0 == 0 && full_attr.reserved1 == 0);
+
+        // Rejeição de tiling_mode inválido (> 1) e pitch < width
+        constexpr std::uint64_t bad_tile_addr = 0x6050;
+        assert(call("sceVideoOutSetBufferAttribute", bad_tile_addr, 0, 2, 0, 2, 2, 2) == 0);
+        constexpr std::uint64_t bad_pitch_addr = 0x6080;
+        assert(call("sceVideoOutSetBufferAttribute", bad_pitch_addr, 0, 1, 0, 4, 2, 2) == 0);
 
         constexpr std::uint64_t addrs_ptr = 0x6100;
         constexpr std::uint64_t buf0_addr = 0x7000;
         assert(m.store(addrs_ptr, &buf0_addr, 8) == MemoryError::ok);
+        assert(call("sceVideoOutRegisterBuffers", vh, 0, addrs_ptr, 1, bad_tile_addr) == UINT64_MAX);
+        assert(call("sceVideoOutRegisterBuffers", vh, 0, addrs_ptr, 1, bad_pitch_addr) == UINT64_MAX);
         assert(call("sceVideoOutRegisterBuffers", vh, 0, addrs_ptr, 1, attr_addr) == 0);
         assert(call("sceVideoOutRegisterBuffers", vh, 1, addrs_ptr, 1, attr_addr) == 0);
         assert(call("sceVideoOutRegisterBuffers", vh, 1, addrs_ptr, 1, attr_addr) == UINT64_MAX);

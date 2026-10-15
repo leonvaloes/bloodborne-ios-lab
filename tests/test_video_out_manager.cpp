@@ -40,6 +40,7 @@ int main() { return run([] {
     CHECK(sink.flips == 1 && manager.flip_count() == 1);
     CHECK(manager.read_current_frame_pixels(frame));
     CHECK(frame.valid && frame.flip_sequence == 1 && frame.pixel_data.size() == pixels.size());
+    CHECK(!frame.is_tiled && frame.tiling_mode == 1);
     CHECK(std::equal(frame.pixel_data.begin(), frame.pixel_data.end(), pixels.begin()));
     CHECK(manager.has_new_frame());
     CHECK(memory.protect(0x1000, bb::write) == bb::MemoryError::ok);
@@ -49,6 +50,15 @@ int main() { return run([] {
     CHECK(manager.has_new_frame());
     CHECK(manager.consume_new_frame());
     CHECK(memory.protect(0x1000, bb::read | bb::write) == bb::MemoryError::ok);
+
+    // Buffer tiled (tiling_mode = 0) propaga flag is_tiled
+    CHECK(manager.unregister_buffer(0) == bb::VideoStatus::ok);
+    const bb::VideoBuffer tiled_buffer{0x1000, 2, 2, 2, 4, 0x80000000, 0};
+    CHECK(manager.register_buffer(0, tiled_buffer) == bb::VideoStatus::ok);
+    CHECK(manager.submit_flip(0, 11) == bb::VideoStatus::ok);
+    CHECK(manager.read_current_frame_pixels(frame));
+    CHECK(frame.valid && frame.is_tiled && frame.tiling_mode == 0 && frame.pixel_format == 0x80000000);
+    CHECK(manager.consume_new_frame());
     // Pitch é contado em pixels, não em bytes: a leitura inclui padding
     // entre linhas, e a apresentação BGRA8 usa pitch * 4 por linha.
     CHECK(manager.register_buffer(1, {0x1100, 2, 2, 3, 4}) == bb::VideoStatus::ok);

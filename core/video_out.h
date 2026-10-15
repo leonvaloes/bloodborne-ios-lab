@@ -18,7 +18,23 @@ struct VideoBuffer {
     std::uint32_t height = 0;
     std::uint32_t pitch = 0;
     std::uint32_t bytes_per_pixel = 0;
+    std::uint32_t pixel_format = 0; // Orbis PixelFormat (ex: 0x80000000 = A8R8G8B8Srgb)
+    std::uint32_t tiling_mode = 1;  // 0 = Tile (micro-tiled Display2DThin), 1 = Linear
 };
+
+// Estrutura canônica de atributos de buffer Orbis (40 bytes / 0x28 bytes)
+struct BufferAttribute {
+    std::uint32_t pixel_format = 0;
+    std::uint32_t tiling_mode = 0;
+    std::int32_t aspect_ratio = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t pitch_in_pixel = 0;
+    std::uint32_t option = 0;
+    std::uint32_t reserved0 = 0;
+    std::uint64_t reserved1 = 0;
+};
+static_assert(sizeof(BufferAttribute) == 40, "BufferAttribute deve ter exatamente 40 bytes");
 
 struct FlipEvent {
     std::uint32_t buffer_index = 0;
@@ -57,6 +73,9 @@ struct HostFrameBuffer {
     std::uint32_t height = 0;
     std::uint32_t pitch = 0;
     std::uint32_t bytes_per_pixel = 0;
+    std::uint32_t pixel_format = 0;
+    std::uint32_t tiling_mode = 1;
+    bool is_tiled = false;
     std::vector<std::uint8_t> pixel_data; // Dados efetivamente lidos da memória guest
     std::uint32_t buffer_index = 0;
     std::uint64_t flip_sequence = 0;
@@ -170,6 +189,9 @@ public:
         frame.height = buf->height;
         frame.pitch = buf->pitch;
         frame.bytes_per_pixel = buf->bytes_per_pixel;
+        frame.pixel_format = buf->pixel_format;
+        frame.tiling_mode = buf->tiling_mode;
+        frame.is_tiled = (buf->tiling_mode == 0);
         frame.buffer_index = index;
         frame.flip_sequence = internal_last_flip_.sequence;
         out_frame = std::move(frame);
