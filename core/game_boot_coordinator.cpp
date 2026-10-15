@@ -340,6 +340,9 @@ bool GameBootCoordinator::phase4_initialize_runtime(const BootConfig& config) {
     if (video_out_) {
         runtime_->attach_video_out(video_out_);
     }
+    if (input_manager_) {
+        runtime_->pad_manager().set_default_input(input_manager_);
+    }
 
     // Inicializa os módulos carregados na ordem topológica de dependência
     for (std::size_t i = 0; i < image_.modules.size(); ++i) {

@@ -12,6 +12,7 @@
 #include "boot_probe.h"
 #include "game_boot_coordinator.h"
 #include "vfs.h"
+#include "video_out.h"
 #include <exception>
 #include <sys/utsname.h>
 #include <simd/simd.h>
@@ -20,8 +21,68 @@
 #include <vector>
 #include <cstring>
 
-@interface LabController : UIViewController <MTKViewDelegate>
+@class LabController;
+
+@interface LabMTKView : MTKView
+@property (nonatomic, weak) LabController *controller;
 @end
+
+@interface LabController : UIViewController <MTKViewDelegate>
+- (void)setLeftStickX:(float)x y:(float)y;
+- (void)setRightStickX:(float)x y:(float)y;
+@end
+
+@implementation LabMTKView
+- (void)handleTouch:(UITouch *)touch phase:(NSString *)phase {
+    if (!self.controller) return;
+    CGPoint loc = [touch locationInView:self];
+    CGSize size = self.bounds.size;
+    if (size.width <= 0 || size.height <= 0) return;
+
+    if (loc.x < size.width * 0.5f) {
+        if ([phase isEqualToString:@"ended"] || [phase isEqualToString:@"cancelled"]) {
+            [self.controller setLeftStickX:0.0f y:0.0f];
+        } else {
+            float cx = size.width * 0.25f;
+            float cy = size.height * 0.5f;
+            float maxR = std::min(cx, cy) * 0.8f;
+            if (maxR < 10.0f) maxR = 50.0f;
+            float nx = std::clamp((float)(loc.x - cx) / maxR, -1.0f, 1.0f);
+            float ny = std::clamp((float)(cy - loc.y) / maxR, -1.0f, 1.0f);
+            [self.controller setLeftStickX:nx y:ny];
+        }
+    } else {
+        if ([phase isEqualToString:@"ended"] || [phase isEqualToString:@"cancelled"]) {
+            [self.controller setRightStickX:0.0f y:0.0f];
+        } else {
+            float cx = size.width * 0.75f;
+            float cy = size.height * 0.5f;
+            float maxR = std::min(size.width * 0.25f, cy) * 0.8f;
+            if (maxR < 10.0f) maxR = 50.0f;
+            float nx = std::clamp((float)(loc.x - cx) / maxR, -1.0f, 1.0f);
+            float ny = std::clamp((float)(cy - loc.y) / maxR, -1.0f, 1.0f);
+            [self.controller setRightStickX:nx y:ny];
+        }
+    }
+}
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    for (UITouch *t in touches) [self handleTouch:t phase:@"began"];
+    [super touchesBegan:touches withEvent:event];
+}
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    for (UITouch *t in touches) [self handleTouch:t phase:@"moved"];
+    [super touchesMoved:touches withEvent:event];
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    for (UITouch *t in touches) [self handleTouch:t phase:@"ended"];
+    [super touchesEnded:touches withEvent:event];
+}
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    for (UITouch *t in touches) [self handleTouch:t phase:@"cancelled"];
+    [super touchesCancelled:touches withEvent:event];
+}
+@end
+
 @implementation LabController {
     UILabel *_status;
     UILabel *_gpuStatus;
@@ -32,9 +93,13 @@
     UILabel *_bootStatus;
     UILabel *_gameBootStatus;
     UIButton *_gameBootButton;
+    UIButton *_continuousButton;
     UIButton *_gameStepButton;
+    UIButton *_gameStepLargeButton;
+    BOOL _continuousExecution;
     std::unique_ptr<bb::GameBootCoordinator> _bootCoordinator;
-    MTKView *_metal;
+    bb::VideoOutManager _videoOutManager;
+    LabMTKView *_metal;
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
     id<MTLDepthStencilState> _depthState;
@@ -123,16 +188,40 @@
     _gameBootStatus.numberOfLines = 0;
     _gameBootStatus.text = @"Motor Bloodborne: toque em 'Iniciar Motor do Jogo' para carregar eboot + módulos.";
     _gameBootButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_gameBootButton setTitle:@"Iniciar Motor do Jogo (GameBootCoordinator)" forState:UIControlStateNormal];
+    [_gameBootButton setTitle:@"▶ Iniciar Motor do Jogo (GameBootCoordinator)" forState:UIControlStateNormal];
+    _gameBootButton.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    _gameBootButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.4 blue:0.9 alpha:0.15];
+    _gameBootButton.layer.cornerRadius = 8;
     [_gameBootButton addTarget:self action:@selector(initGameBoot) forControlEvents:UIControlEventTouchUpInside];
+
+    _continuousButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
+    _continuousButton.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    _continuousButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.7 blue:0.3 alpha:0.15];
+    _continuousButton.layer.cornerRadius = 8;
+    [_continuousButton addTarget:self action:@selector(toggleContinuousExecution) forControlEvents:UIControlEventTouchUpInside];
 
     _gameStepButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_gameStepButton setTitle:@"Avançar Motor (+100.000 passos)" forState:UIControlStateNormal];
     [_gameStepButton addTarget:self action:@selector(stepGameBoot) forControlEvents:UIControlEventTouchUpInside];
 
+    _gameStepLargeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_gameStepLargeButton setTitle:@"Avançar Motor (+1.000.000 passos)" forState:UIControlStateNormal];
+    [_gameStepLargeButton addTarget:self action:@selector(stepGameBootLarge) forControlEvents:UIControlEventTouchUpInside];
+
     UIButton *run = [UIButton buttonWithType:UIButtonTypeSystem];
     [run setTitle:@"Executar testes completos (CPU, VFS, Áudio, Entrada)" forState:UIControlStateNormal];
     [run addTarget:self action:@selector(runTests) forControlEvents:UIControlEventTouchUpInside];
+
+    // Helper de estilização e eventos para botões virtuais
+    auto configureButton = ^(UIButton *b, NSString *btnTitle) {
+        [b setTitle:btnTitle forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.25];
+        b.layer.cornerRadius = 6;
+        [b addTarget:self action:@selector(onVirtualButtonTouch:) forControlEvents:UIControlEventTouchDown];
+        [b addTarget:self action:@selector(onVirtualButtonRelease:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    };
 
     // Controles virtuais na tela para testes de jogabilidade
     UIStackView *dpadRow = [UIStackView new];
@@ -140,19 +229,35 @@
     dpadRow.spacing = 8;
     for (NSString *btnTitle in @[@"▲ Cima", @"◀ Esq", @"▶ Dir", @"▼ Baixo"]) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        [b setTitle:btnTitle forState:UIControlStateNormal];
-        [b addTarget:self action:@selector(onVirtualButtonTouch:) forControlEvents:UIControlEventTouchDown];
+        configureButton(b, btnTitle);
         [dpadRow addArrangedSubview:b];
+    }
+
+    UIStackView *triggersRow = [UIStackView new];
+    triggersRow.distribution = UIStackViewDistributionFillEqually;
+    triggersRow.spacing = 8;
+    for (NSString *btnTitle in @[@"L1 Transf", @"L2 Tiro", @"R1 Golpe", @"R2 Pesado"]) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        configureButton(b, btnTitle);
+        [triggersRow addArrangedSubview:b];
     }
 
     UIStackView *actionsRow = [UIStackView new];
     actionsRow.distribution = UIStackViewDistributionFillEqually;
     actionsRow.spacing = 8;
-    for (NSString *btnTitle in @[@"✖ Esquiva", @"● Interagir", @"■ Item", @"▲ Arma", @"R1 Ataque"]) {
+    for (NSString *btnTitle in @[@"✖ Esquiva", @"● Interagir", @"■ Item", @"▲ Arma"]) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        [b setTitle:btnTitle forState:UIControlStateNormal];
-        [b addTarget:self action:@selector(onVirtualButtonTouch:) forControlEvents:UIControlEventTouchDown];
+        configureButton(b, btnTitle);
         [actionsRow addArrangedSubview:b];
+    }
+
+    UIStackView *systemRow = [UIStackView new];
+    systemRow.distribution = UIStackViewDistributionFillEqually;
+    systemRow.spacing = 8;
+    for (NSString *btnTitle in @[@"R3 Lock-on", @"L3 Agachar", @"Options Menu"]) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        configureButton(b, btnTitle);
+        [systemRow addArrangedSubview:b];
     }
 
     UIButton *exportButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -160,20 +265,29 @@
     [exportButton addTarget:self action:@selector(exportReport:) forControlEvents:UIControlEventTouchUpInside];
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    _metal = [[MTKView alloc] initWithFrame:CGRectZero device:device];
+    _metal = [[LabMTKView alloc] initWithFrame:CGRectZero device:device];
+    _metal.controller = self;
+    _metal.multipleTouchEnabled = YES;
+    _metal.userInteractionEnabled = YES;
     _metal.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
     _metal.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
     _metal.clearColor = MTLClearColorMake(0.04, 0.05, 0.09, 1);
     _metal.clearDepth = 1.0;
     _metal.preferredFramesPerSecond = 30;
     _metal.paused = YES;
-    [_metal.heightAnchor constraintEqualToConstant:220].active = YES;
+    [_metal.heightAnchor constraintEqualToConstant:240].active = YES;
+
+    UILabel *metalHint = [UILabel new];
+    metalHint.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+    metalHint.textColor = [UIColor secondaryLabelColor];
+    metalHint.text = @"Viewport 3D: arraste na metade esquerda para mover (Left Stick); arraste na metade direita para mover câmera (Right Stick).";
+    metalHint.numberOfLines = 0;
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        title, scope, _status, run, _metal, _gpuStatus, _subsystemStatus,
+        title, scope, _status, run, _metal, metalHint, _gpuStatus, _subsystemStatus,
         documentButton, _documentStatus, assetButton, _assetStatus, dcxButton, _dcxStatus,
-        bootButton, _bootStatus, _gameBootButton, _gameStepButton, _gameBootStatus,
-        dpadRow, actionsRow, exportButton]];
+        bootButton, _bootStatus, _gameBootButton, _continuousButton, _gameStepButton, _gameStepLargeButton, _gameBootStatus,
+        dpadRow, triggersRow, actionsRow, systemRow, exportButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -428,11 +542,101 @@
     _metal.paused = NO;
 }
 
+- (void)setupController:(GCController *)controller {
+    if (!controller) return;
+    GCExtendedGamepad *gamepad = controller.extendedGamepad;
+    if (!gamepad) return;
+
+    __weak LabController *weakSelf = self;
+    gamepad.valueChangedHandler = ^(GCExtendedGamepad *pad, GCControllerElement *element) {
+        (void)element;
+        LabController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        strongSelf->_inputManager.set_left_stick(pad.leftThumbstick.xAxis.value, pad.leftThumbstick.yAxis.value);
+        strongSelf->_inputManager.set_right_stick(pad.rightThumbstick.xAxis.value, pad.rightThumbstick.yAxis.value);
+
+        strongSelf->_inputManager.set_button(bb::PAD_CROSS, pad.buttonA.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_CIRCLE, pad.buttonB.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_SQUARE, pad.buttonX.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_TRIANGLE, pad.buttonY.isPressed);
+
+        strongSelf->_inputManager.set_button(bb::PAD_L1, pad.leftShoulder.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_R1, pad.rightShoulder.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_L2, pad.leftTrigger.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_R2, pad.rightTrigger.isPressed);
+
+        strongSelf->_inputManager.set_button(bb::PAD_UP, pad.dpad.up.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_DOWN, pad.dpad.down.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_LEFT, pad.dpad.left.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_RIGHT, pad.dpad.right.isPressed);
+
+        if (@available(iOS 12.1, *)) {
+            if (pad.leftThumbstickButton) {
+                strongSelf->_inputManager.set_button(bb::PAD_L3, pad.leftThumbstickButton.isPressed);
+            }
+            if (pad.rightThumbstickButton) {
+                strongSelf->_inputManager.set_button(bb::PAD_R3, pad.rightThumbstickButton.isPressed);
+            }
+        }
+        if (pad.buttonMenu) {
+            strongSelf->_inputManager.set_button(bb::PAD_OPTIONS, pad.buttonMenu.isPressed);
+        }
+    };
+}
+
 - (void)onControllerConnected:(NSNotification *)note {
     (void)note;
     _report[@"gamepad_connected"] = @YES;
-    _subsystemStatus.text = [NSString stringWithFormat:@"GameController MFi/DualSense conectado: %@",
-        (GCController.controllers.firstObject.vendorName ? GCController.controllers.firstObject.vendorName : @"Compatível")];
+    GCController *controller = GCController.controllers.firstObject;
+    if (controller) {
+        [self setupController:controller];
+        _subsystemStatus.text = [NSString stringWithFormat:@"GameController conectado: %@ (Mapeamento ativo)",
+            (controller.vendorName ? controller.vendorName : @"Compatível")];
+    }
+}
+
+- (void)setLeftStickX:(float)x y:(float)y {
+    _inputManager.set_left_stick(x, y);
+    if (std::abs(x) > 0.05f || std::abs(y) > 0.05f) {
+        _subsystemStatus.text = [NSString stringWithFormat:@"Analógico Esq (Movimento): [%.2f, %.2f]", x, y];
+    }
+}
+
+- (void)setRightStickX:(float)x y:(float)y {
+    _inputManager.set_right_stick(x, y);
+    if (std::abs(x) > 0.05f || std::abs(y) > 0.05f) {
+        _subsystemStatus.text = [NSString stringWithFormat:@"Analógico Dir (Câmera): [%.2f, %.2f]", x, y];
+    }
+}
+
+- (void)toggleContinuousExecution {
+    _continuousExecution = !_continuousExecution;
+    if (_continuousExecution) {
+        [_continuousButton setTitle:@"⏸ Pausar Execução Contínua" forState:UIControlStateNormal];
+        _continuousButton.backgroundColor = [UIColor colorWithRed:0.9 green:0.5 blue:0.1 alpha:0.25];
+        if (_bootCoordinator && _bootCoordinator->state() == bb::BootState::modules_initialized) {
+            _bootCoordinator->step(10000);
+        }
+    } else {
+        [_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
+        _continuousButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.7 blue:0.3 alpha:0.15];
+    }
+}
+
+- (void)stepGameBootLarge {
+    if (!_bootCoordinator || (_bootCoordinator->state() != bb::BootState::running && _bootCoordinator->state() != bb::BootState::modules_initialized)) {
+        _gameBootStatus.text = @"Motor Bloodborne não inicializado. Toque em 'Iniciar Motor do Jogo' primeiro.";
+        return;
+    }
+
+    std::uint64_t steps = _bootCoordinator->step(1000000);
+    auto diag = _bootCoordinator->diagnostics();
+
+    const bool is_running = (diag.total_steps > 0);
+    _report[@"game_execution"] = @(is_running);
+
+    [self updateCoordinatorReportAndUI:diag executedSteps:steps];
 }
 
 - (void)onVirtualButtonTouch:(UIButton *)sender {
@@ -442,12 +646,43 @@
     else if ([t containsString:@"Item"]) _inputManager.set_button(bb::PAD_SQUARE, true);
     else if ([t containsString:@"Arma"]) _inputManager.set_button(bb::PAD_TRIANGLE, true);
     else if ([t containsString:@"R1"]) _inputManager.set_button(bb::PAD_R1, true);
+    else if ([t containsString:@"R2"]) _inputManager.set_button(bb::PAD_R2, true);
+    else if ([t containsString:@"L1"]) _inputManager.set_button(bb::PAD_L1, true);
+    else if ([t containsString:@"L2"]) _inputManager.set_button(bb::PAD_L2, true);
+    else if ([t containsString:@"R3"] || [t containsString:@"Lock"]) _inputManager.set_button(bb::PAD_R3, true);
+    else if ([t containsString:@"L3"] || [t containsString:@"Agachar"]) _inputManager.set_button(bb::PAD_L3, true);
+    else if ([t containsString:@"Menu"] || [t containsString:@"Options"]) _inputManager.set_button(bb::PAD_OPTIONS, true);
     else if ([t containsString:@"Cima"]) _inputManager.set_button(bb::PAD_UP, true);
     else if ([t containsString:@"Baixo"]) _inputManager.set_button(bb::PAD_DOWN, true);
     else if ([t containsString:@"Esq"]) _inputManager.set_button(bb::PAD_LEFT, true);
     else if ([t containsString:@"Dir"]) _inputManager.set_button(bb::PAD_RIGHT, true);
 
+    if (@available(iOS 10.0, *)) {
+        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [feedback impactOccurred];
+    }
     _subsystemStatus.text = [NSString stringWithFormat:@"Entrada ativa: %@", t];
+}
+
+- (void)onVirtualButtonRelease:(UIButton *)sender {
+    NSString *t = sender.currentTitle;
+    if ([t containsString:@"Esquiva"]) _inputManager.set_button(bb::PAD_CROSS, false);
+    else if ([t containsString:@"Interagir"]) _inputManager.set_button(bb::PAD_CIRCLE, false);
+    else if ([t containsString:@"Item"]) _inputManager.set_button(bb::PAD_SQUARE, false);
+    else if ([t containsString:@"Arma"]) _inputManager.set_button(bb::PAD_TRIANGLE, false);
+    else if ([t containsString:@"R1"]) _inputManager.set_button(bb::PAD_R1, false);
+    else if ([t containsString:@"R2"]) _inputManager.set_button(bb::PAD_R2, false);
+    else if ([t containsString:@"L1"]) _inputManager.set_button(bb::PAD_L1, false);
+    else if ([t containsString:@"L2"]) _inputManager.set_button(bb::PAD_L2, false);
+    else if ([t containsString:@"R3"] || [t containsString:@"Lock"]) _inputManager.set_button(bb::PAD_R3, false);
+    else if ([t containsString:@"L3"] || [t containsString:@"Agachar"]) _inputManager.set_button(bb::PAD_L3, false);
+    else if ([t containsString:@"Menu"] || [t containsString:@"Options"]) _inputManager.set_button(bb::PAD_OPTIONS, false);
+    else if ([t containsString:@"Cima"]) _inputManager.set_button(bb::PAD_UP, false);
+    else if ([t containsString:@"Baixo"]) _inputManager.set_button(bb::PAD_DOWN, false);
+    else if ([t containsString:@"Esq"]) _inputManager.set_button(bb::PAD_LEFT, false);
+    else if ([t containsString:@"Dir"]) _inputManager.set_button(bb::PAD_RIGHT, false);
+
+    _subsystemStatus.text = @"Entrada: neutro";
 }
 
 - (void)gpuError:(NSString *)message {
@@ -594,6 +829,8 @@
     config.enable_hle = true;
 
     _bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
+    _bootCoordinator->attach_input_manager(&_inputManager);
+    _bootCoordinator->attach_video_out(&_videoOutManager);
     bool ok = _bootCoordinator->initialize(config);
     auto diag = _bootCoordinator->diagnostics();
 
@@ -610,6 +847,11 @@
         };
         _report[@"game_execution"] = @NO;
         return;
+    }
+
+    if (_bootCoordinator->runtime()) {
+        _bootCoordinator->runtime()->pad_manager().set_default_input(&_inputManager);
+        _bootCoordinator->runtime()->attach_video_out(&_videoOutManager);
     }
 
     std::uint64_t steps = _bootCoordinator->step(100000);
@@ -682,9 +924,20 @@
     _lastFrameTime = now;
     _pacingTracker.record_frame_ms(frame_ms);
 
-    if (_bootCoordinator && _bootCoordinator->state() == bb::BootState::running) {
-        _bootCoordinator->step(2000);
+    if (_bootCoordinator && (_bootCoordinator->state() == bb::BootState::running || _bootCoordinator->state() == bb::BootState::modules_initialized)) {
+        uint64_t stepBudget = _continuousExecution ? 100000 : 2000;
+        _bootCoordinator->step(stepBudget);
         _report[@"game_execution"] = @YES;
+    }
+
+    if (_videoOutManager.has_new_frame()) {
+        bb::HostFrameBuffer guestFrame;
+        if (_videoOutManager.read_current_frame_pixels(guestFrame) && guestFrame.valid) {
+            _report[@"guest_frame_flipped"] = @YES;
+            _report[@"guest_frame_seq"] = @(guestFrame.flip_sequence);
+            _report[@"guest_frame_w"] = @(guestFrame.width);
+            _report[@"guest_frame_h"] = @(guestFrame.height);
+        }
     }
 
     _angle += 0.02f;
@@ -759,8 +1012,9 @@
                     if (strongSelf->_bootCoordinator && strongSelf->_bootCoordinator->state() == bb::BootState::running) {
                         auto coordDiag = strongSelf->_bootCoordinator->diagnostics();
                         strongSelf->_gameBootStatus.text = [NSString stringWithFormat:
-                            @"Motor Bloodborne (Frame %lu): Total %llu passos | %llu imports | RIP: 0x%llx",
+                            @"Motor Bloodborne (Frame %lu%s): Total %llu passos | %llu imports | RIP: 0x%llx",
                             (unsigned long)strongSelf->_completedFrames,
+                            strongSelf->_continuousExecution ? " [Contínuo]" : "",
                             (unsigned long long)coordDiag.total_steps,
                             (unsigned long long)coordDiag.total_import_calls,
                             (unsigned long long)coordDiag.current_rip];
@@ -866,6 +1120,8 @@
     uint64_t mem_bytes = _memoryMonitor.query_physical_footprint_bytes();
     _report[@"memory_footprint_mb"] = @(static_cast<double>(mem_bytes) / (1024.0 * 1024.0));
     _report[@"gamepad_connected"] = @(GCController.controllers.count > 0);
+    _report[@"continuous_execution_enabled"] = @(_continuousExecution);
+    _report[@"video_flips"] = @(_videoOutManager.flip_count());
 
     NSError *error = nil;
     NSData *json = [NSJSONSerialization dataWithJSONObject:_report options:NSJSONWritingPrettyPrinted error:&error];

@@ -523,6 +523,34 @@ int main() { return run([] {
         CHECK(coordinator.cpu()->state.gpr[0] == 42);
     }
 
+    // ========================================================================
+    // 8. Teste de vinculacao de InputManager ao runtime
+    // ========================================================================
+    {
+        std::cout << "[test_game_boot_coordinator] 8. Testando vinculacao de InputManager...\n";
+        std::filesystem::path test_dir = sandbox / "input_boot";
+        std::filesystem::create_directories(test_dir, ec);
+
+        auto eboot_bytes = synthesize_elf(false, false);
+        std::ofstream elf_out(test_dir / "eboot.elf", std::ios::binary);
+        elf_out.write(reinterpret_cast<const char*>(eboot_bytes.data()), eboot_bytes.size());
+        elf_out.close();
+
+        InputManager input;
+        GameBootCoordinator coordinator;
+        coordinator.attach_input_manager(&input);
+        CHECK(coordinator.input_manager() == &input);
+
+        BootConfig config;
+        config.base_dir = test_dir.string();
+
+        CHECK(coordinator.initialize(config));
+        CHECK(coordinator.runtime() != nullptr);
+        input.set_button(PAD_CROSS, true);
+        auto pad_data = coordinator.runtime()->pad_manager().format_pad_data(input.poll());
+        CHECK(pad_data.buttons & PAD_CROSS);
+    }
+
     std::filesystem::remove_all(sandbox, ec);
     std::cout << "[test_game_boot_coordinator] Todos os testes passaram com sucesso!\n";
 }); }

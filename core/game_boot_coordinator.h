@@ -10,6 +10,7 @@
 #include "orbis_runtime.h"
 #include "x86_interp.h"
 #include "guest_memory.h"
+#include "input.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -155,6 +156,15 @@ public:
         if (runtime_) runtime_->attach_video_out(video_out_);
     }
 
+    void attach_input_manager(InputManager* input_mgr) {
+        input_manager_ = input_mgr;
+        if (runtime_ && input_manager_) {
+            runtime_->pad_manager().set_default_input(input_manager_);
+        }
+    }
+    InputManager* input_manager() { return input_manager_; }
+    const InputManager* input_manager() const { return input_manager_; }
+
     GuestMemory* guest_memory();
     const GuestMemory* guest_memory() const;
 
@@ -185,6 +195,7 @@ private:
     std::unique_ptr<X86Interpreter> cpu_;
     std::unique_ptr<OrbisRuntime> runtime_;
     VideoOutManager* video_out_{nullptr};
+    InputManager* input_manager_{nullptr};
     std::uint64_t tcb_address_{0};
 
     std::uint64_t total_steps_{0};

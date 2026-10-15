@@ -28,7 +28,7 @@ struct HostBridgeConfig {
     std::size_t guest_memory_size{768u << 20};
     std::uint64_t module_init_budget{10000000};
     std::vector<std::string> essential_asset_paths;
-    bool require_essential_assets{true};
+    bool require_essential_assets{false};
     double target_fps{60.0};            // FPS alvo para update()
     bool enable_hle{true};
 };
