@@ -151,12 +151,16 @@ BridgeResult<const CachedShader*> ShaderCache::get_or_compile(
     }
 
     // 2. Calcular hash
+    // O mesmo bytecode traduzido para VS/PS/CS produz assinaturas MSL diferentes.
+    // Incorpora o estágio à chave sem perder o hash de conteúdo usado no pipeline.
     std::uint64_t hash = calculate_hash(words.data(), words.size() * sizeof(std::uint32_t));
+    const std::uint64_t stage_key = hash ^
+        (0x9e3779b97f4a7c15ULL * (static_cast<std::uint64_t>(stage) + 1));
 
     // 3. Verificar cache
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = cache_.find(hash);
+        auto it = cache_.find(stage_key);
         if (it != cache_.end()) {
             hit_count_++;
             return {BridgeError::Ok, "", &it->second};
@@ -185,7 +189,7 @@ BridgeResult<const CachedShader*> ShaderCache::get_or_compile(
 
     // 7. Inserir no cache
     CachedShader cached;
-    cached.hash = hash;
+    cached.hash = stage_key;
     cached.stage = stage;
     cached.msl_source = std::move(msl_result.text);
     cached.instruction_count = static_cast<std::uint32_t>(prog.instructions.size());
@@ -200,7 +204,7 @@ BridgeResult<const CachedShader*> ShaderCache::get_or_compile(
             // Eviction simples: limpa tudo quando cheio (política FIFO/LRU simplificada)
             cache_.clear();
         }
-        auto [it, inserted] = cache_.emplace(hash, std::move(cached));
+        auto [it, inserted] = cache_.emplace(stage_key, std::move(cached));
         return {BridgeError::Ok, "", &it->second};
     }
 }
@@ -503,11 +507,12 @@ BridgeResult<MetalDrawCommand> GnmMetalBridge::process_draw_call(const DrawCall&
 
     // Validar index buffer (se indexado)
     if (draw_call.indexed) {
-        if (draw_call.index_buffer_address == 0 || draw_call.index_count == 0) {
+        if (draw_call.index_buffer_address == 0 || draw_call.index_count == 0 ||
+            draw_call.start_index > UINT32_MAX - draw_call.index_count) {
             return {BridgeError::InvalidIndexBuffer, "index buffer address is zero or count is zero"};
         }
         std::size_t index_stride = (draw_call.index_type == GnmIndexType::Index16) ? 2 : 4;
-        std::size_t index_size = draw_call.index_count * index_stride;
+        std::size_t index_size = static_cast<std::size_t>(draw_call.index_count + draw_call.start_index) * index_stride;
         if (!is_buffer_address_valid(draw_call.index_buffer_address, index_size)) {
             return {BridgeError::InvalidIndexBuffer, "index buffer out of bounds or invalid"};
         }
@@ -520,7 +525,14 @@ BridgeResult<MetalDrawCommand> GnmMetalBridge::process_draw_call(const DrawCall&
         cmd.vertex_count = draw_call.vertex_count;
     }
 
-    // Bindings de vértices (VS) e fragment (PS)
+    // Recusar bindings não mapeados antes que um backend tente lê-los.
+    for (const auto* bindings : {&vs_bindings_, &ps_bindings_}) {
+        for (const auto& buffer : bindings->buffers) {
+            if (buffer.valid && !is_buffer_address_valid(buffer.guest_address, buffer.size)) {
+                return {BridgeError::InvalidBufferAddress, "vertex/fragment buffer unmapped or invalid"};
+            }
+        }
+    }
     cmd.vertex_bindings = vs_bindings_;
     cmd.fragment_bindings = ps_bindings_;
 
@@ -550,6 +562,12 @@ BridgeResult<MetalDrawCommand> GnmMetalBridge::process_draw_call(const DrawCall&
         active_rt++;
     }
     cmd.pipeline_config.active_color_attachments = active_rt;
+    // MSL de pixel exporta color(0): passagens somente depth ficam para outro backend.
+    if (active_rt != 1 || !rt_state.targets[0].is_valid() ||
+        cmd.pipeline_config.color_attachments[0].pixel_format != MetalPixelFormat::BGRA8Unorm ||
+        cmd.pipeline_config.ps_msl.empty()) {
+        return {BridgeError::PipelineConfigurationFailed, "only BGRA8 RT0 with pixel shader is supported"};
+    }
 
     // Depth/Stencil
     const auto& ds_state = draw_call.pipeline_state.depth_stencil;

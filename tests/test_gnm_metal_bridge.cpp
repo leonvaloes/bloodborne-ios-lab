@@ -129,7 +129,6 @@ int main() {
         CHECK(cmd1.indexed);
         CHECK(cmd1.index_count == 3);
         CHECK(cmd1.index_buffer_address == 0x20000000);
-
         // Verificar cache stats
         CHECK(bridge.shader_cache().miss_count() == 2); // VS + PS
         CHECK(bridge.shader_cache().hit_count() == 0);
@@ -147,6 +146,20 @@ int main() {
         // Cache hits: VS e PS já estão no cache
         CHECK(bridge.shader_cache().hit_count() == 2);
         CHECK(bridge.shader_cache().miss_count() == 2);
+        DrawCall bad_index_offset = draw_call;
+        bad_index_offset.start_index = 32767; // ultrapassa região de 64 KiB
+        auto bad_offset = bridge.process_draw_call(bad_index_offset);
+        CHECK(!bad_offset.ok());
+        CHECK(bad_offset.error == BridgeError::InvalidIndexBuffer);
+
+        // Bytecode idêntico em VS e PS não pode compartilhar MSL de estágios diferentes.
+        DrawCall same_shader = draw_call;
+        same_shader.pipeline_state.ps_program_address = same_shader.pipeline_state.vs_program_address;
+        auto same_result = bridge.process_draw_call(same_shader);
+        CHECK(same_result.ok());
+        CHECK(same_result->pipeline_config.vs_hash != same_result->pipeline_config.ps_hash);
+        CHECK(same_result->pipeline_config.ps_msl.find("fragment GcnFragmentOut") != std::string::npos);
+        CHECK(bridge.shader_cache().size() == 3);
 
         // =====================================================================
         // 7. Verificar mapeamento de V# buffers e T# textures
@@ -223,9 +236,10 @@ int main() {
         bad_vbuf.stride = 16;
         bad_vbuf.num_records = 1000;
         bridge.bind_buffer(ShaderStage::Vertex, 1, bad_vbuf);
-        // Deve falhar na validação dentro do draw call (o bridge valida bindings)
-        // Nota: process_draw_call não valida automaticamente todos os bindings,
-        // mas a validação pode ser adicionada. Por ora, testamos is_buffer_address_valid.
+        auto invalid_binding = bridge.process_draw_call(draw_call);
+        CHECK(!invalid_binding.ok());
+        CHECK(invalid_binding.error == BridgeError::InvalidBufferAddress);
+        bridge.clear_bindings(ShaderStage::Vertex);
 
         // =====================================================================
         // 12. Testar map_surface_format
@@ -355,7 +369,7 @@ int main() {
         // =====================================================================
         // 19. Teste: ShaderCache stats
         // =====================================================================
-        CHECK(bridge.shader_cache().size() == 3); // VS, PS, CS
+        CHECK(bridge.shader_cache().size() == 4); // VS, PS, PS com bytecode de VS, CS
         CHECK(bridge.shader_cache().hit_count() == hits_before + 1);
         CHECK(bridge.shader_cache().miss_count() == misses_before + 1);
 
