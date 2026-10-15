@@ -20,7 +20,7 @@ int main() {
     CHECK(bb::ShaderTranslator::validate_spirv_header(vert_spv.data(), vert_spv.size(), err));
 
     auto vert_refl = bb::ShaderTranslator::reflect(vert_spv.data(), vert_spv.size());
-    CHECK(vert_refl.stage == bb::ShaderStage::Vertex);
+    CHECK(vert_refl.stage == bb::SpirvShaderStage::Vertex);
     CHECK(vert_refl.entry_point_name == "vertex_main");
     CHECK(vert_refl.vertex_inputs.size() >= 3);
     CHECK(vert_refl.vertex_inputs[0].location == 0);
@@ -46,7 +46,7 @@ int main() {
     auto frag_spv = bb::ShaderTranslator::build_basic_fragment_spirv();
     CHECK(frag_spv.size() > 10);
     auto frag_refl = bb::ShaderTranslator::reflect(frag_spv.data(), frag_spv.size());
-    CHECK(frag_refl.stage == bb::ShaderStage::Fragment);
+    CHECK(frag_refl.stage == bb::SpirvShaderStage::Fragment);
     CHECK(frag_refl.entry_point_name == "fragment_main");
 
     bb::TranslationOptions frag_opts{};

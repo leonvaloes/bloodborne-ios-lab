@@ -7,7 +7,7 @@
 
 namespace bb {
 
-enum class ShaderStage {
+enum class SpirvShaderStage {
     Vertex,
     Fragment,
     Compute,
@@ -43,7 +43,7 @@ struct VertexAttributeBinding {
 };
 
 struct ShaderReflection {
-    ShaderStage stage = ShaderStage::Unknown;
+    SpirvShaderStage stage = SpirvShaderStage::Unknown;
     std::string entry_point_name = "main0";
     std::vector<ShaderResourceBinding> resources;
     std::vector<VertexAttributeBinding> vertex_inputs;
