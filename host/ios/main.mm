@@ -53,8 +53,8 @@
     CGSize size = self.bounds.size;
     if (size.width <= 0 || size.height <= 0) return;
 
-    float nx = (float)(loc.x / size.width);
-    float ny = (float)(loc.y / size.height);
+    float px = (float)loc.x;
+    float py = (float)loc.y;
     uint64_t tid = (uint64_t)(uintptr_t)touch;
 
     bb::TouchPhase tp = bb::TouchPhase::Began;
@@ -62,7 +62,7 @@
     else if ([phase isEqualToString:@"ended"]) tp = bb::TouchPhase::Ended;
     else if ([phase isEqualToString:@"cancelled"]) tp = bb::TouchPhase::Cancelled;
 
-    [self.controller handleTouchId:tid x:nx y:ny phase:tp];
+    [self.controller handleTouchId:tid x:px y:py phase:tp];
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     for (UITouch *t in touches) [self handleTouch:t phase:@"began"];
@@ -186,6 +186,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 
     _lastFrameTime = std::chrono::steady_clock::now();
     _touchOverlay.bind_input_manager(&_inputManager);
+    _touchOverlay.set_left_stick_mode(bb::StickMode::Floating);
+    _touchOverlay.set_right_stick_mode(bb::StickMode::Floating);
     _virtualControlsVisible = YES;
     _angle = 0.0f;
     _cameraPitch = 0.2f;
@@ -464,7 +466,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _topStatusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     _topStatusLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightMedium];
     _topStatusLabel.textColor = [UIColor colorWithRed:0.95 green:0.85 blue:0.65 alpha:1.0];
-    _topStatusLabel.text = @"⚔ Bloodborne | 60 FPS | Pronto";
+    _topStatusLabel.text = @"BB Lab | demonstração | sem gameplay validado";
     [topPill addSubview:_topStatusLabel];
 
     _menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -546,6 +548,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 
     // Cluster de botões PlayStation no canto inferior direito
     UIButton *btnTriangle = [self createHudButtonWithTitle:@"▲" width:48 height:48 radius:24 fontSize:18];
+    btnTriangle.accessibilityIdentifier = @"triangle";
     [btnTriangle setTitleColor:[UIColor colorWithRed:0.3 green:0.9 blue:0.4 alpha:1.0] forState:UIControlStateNormal];
 
     UIButton *btnCross = [self createHudButtonWithTitle:@"✖" width:48 height:48 radius:24 fontSize:18];
@@ -919,7 +922,16 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 
     NSString *gameDir = [self findGameDirectoryIn:documents.path];
     if (!gameDir) {
-        gameDir = documents.path;
+        _gameBootStatus.text = @"Motor: eboot.bin não encontrado em Documentos.";
+        [self showWelcomeCard];
+        return;
+    }
+    NSString *dataDir = [gameDir stringByAppendingPathComponent:@"dvdroot_ps4"];
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:dataDir isDirectory:&isDirectory] || !isDirectory) {
+        _gameBootStatus.text = @"Motor: dvdroot_ps4 ausente; dados do jogo incompletos.";
+        [self showWelcomeCard];
+        return;
     }
 
     bb::BootConfig config;
@@ -961,9 +973,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     diag = _bootCoordinator->diagnostics();
 
     const bool is_running = (diag.total_steps > 0);
-    _report[@"game_execution"] = @(is_running);
-    _continuousExecution = YES;
-    [_continuousButton setTitle:@"⏸ Pausar Execução Contínua" forState:UIControlStateNormal];
+    _report[@"guest_steps_executed"] = @(is_running);
+    _report[@"game_execution"] = @NO; // Passos do interpretador não comprovam gameplay.
+    _continuousExecution = diag.state == bb::BootState::running || diag.state == bb::BootState::modules_initialized;
+    [_continuousButton setTitle:_continuousExecution ? @"⏸ Pausar Execução Contínua" : @"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
 
     if (_welcomeCardView) {
         _welcomeCardView.hidden = YES;
@@ -973,6 +986,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 }
 
 - (void)toggleContinuousExecution {
+    if (!_bootCoordinator || (_bootCoordinator->state() != bb::BootState::running &&
+                              _bootCoordinator->state() != bb::BootState::modules_initialized)) return;
     _continuousExecution = !_continuousExecution;
     if (_continuousExecution) {
         [_continuousButton setTitle:@"⏸ Pausar Execução Contínua" forState:UIControlStateNormal];
@@ -1007,7 +1022,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         @"entry_point": @(diag.entry_point),
         @"current_rip": @(diag.current_rip),
         @"last_stop_reason": [NSString stringWithUTF8String:diag.last_stop_reason.c_str()],
-        @"game_execution": @(is_running),
+        @"guest_steps_executed": @(is_running),
+        @"game_execution": @NO,
         @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]
     };
 
@@ -1019,7 +1035,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         (unsigned long long)diag.current_rip,
         diag.last_stop_reason.c_str()];
 
-    _topStatusLabel.text = [NSString stringWithFormat:@"⚔ Bloodborne | 60 FPS | %.1fM | ● %s",
+    _topStatusLabel.text = [NSString stringWithFormat:@"BB Lab | %.1fM passos | %s (não jogável)",
         static_cast<double>(diag.total_steps) / 1000000.0,
         diag.state_name.c_str()];
 }
@@ -1036,10 +1052,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _lastFrameTime = now;
     _pacingTracker.record_frame_ms(frame_ms);
 
-    if (_bootCoordinator && (_bootCoordinator->state() == bb::BootState::running || _bootCoordinator->state() == bb::BootState::modules_initialized)) {
-        uint64_t stepBudget = _continuousExecution ? 100000 : 2000;
-        _bootCoordinator->step(stepBudget);
-        _report[@"game_execution"] = @YES;
+    if (_continuousExecution && _bootCoordinator &&
+        (_bootCoordinator->state() == bb::BootState::running || _bootCoordinator->state() == bb::BootState::modules_initialized)) {
+        _bootCoordinator->step(100000);
+        _report[@"guest_steps_executed"] = @(_bootCoordinator->diagnostics().total_steps > 0);
     }
 
     if (_videoOutManager.has_new_frame()) {
@@ -1145,7 +1161,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 
                     if (strongSelf->_bootCoordinator && strongSelf->_bootCoordinator->state() == bb::BootState::running) {
                         auto coordDiag = strongSelf->_bootCoordinator->diagnostics();
-                        strongSelf->_topStatusLabel.text = [NSString stringWithFormat:@"⚔ Bloodborne | %.0f FPS | %.1fM | ● Executando",
+                        strongSelf->_topStatusLabel.text = [NSString stringWithFormat:@"BB Lab | %.0f FPS host | %.1fM passos guest",
                             pacing.average_fps,
                             static_cast<double>(coordDiag.total_steps) / 1000000.0];
                     }
@@ -1191,7 +1207,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     if ([t containsString:@"✖"]) _inputManager.set_button(bb::PAD_CROSS, true);
     else if ([t containsString:@"●"]) _inputManager.set_button(bb::PAD_CIRCLE, true);
     else if ([t containsString:@"■"]) _inputManager.set_button(bb::PAD_SQUARE, true);
-    else if ([t containsString:@"▲"] && [sender.superview isEqual:_controlsOverlay]) _inputManager.set_button(bb::PAD_TRIANGLE, true);
+    else if ([sender.accessibilityIdentifier isEqualToString:@"triangle"]) _inputManager.set_button(bb::PAD_TRIANGLE, true);
     else if ([t isEqualToString:@"▲"]) _inputManager.set_button(bb::PAD_UP, true);
     else if ([t isEqualToString:@"▼"]) _inputManager.set_button(bb::PAD_DOWN, true);
     else if ([t isEqualToString:@"◀"]) _inputManager.set_button(bb::PAD_LEFT, true);
@@ -1218,7 +1234,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     if ([t containsString:@"✖"]) _inputManager.set_button(bb::PAD_CROSS, false);
     else if ([t containsString:@"●"]) _inputManager.set_button(bb::PAD_CIRCLE, false);
     else if ([t containsString:@"■"]) _inputManager.set_button(bb::PAD_SQUARE, false);
-    else if ([t containsString:@"▲"] && [sender.superview isEqual:_controlsOverlay]) _inputManager.set_button(bb::PAD_TRIANGLE, false);
+    else if ([sender.accessibilityIdentifier isEqualToString:@"triangle"]) _inputManager.set_button(bb::PAD_TRIANGLE, false);
     else if ([t isEqualToString:@"▲"]) _inputManager.set_button(bb::PAD_UP, false);
     else if ([t isEqualToString:@"▼"]) _inputManager.set_button(bb::PAD_DOWN, false);
     else if ([t isEqualToString:@"◀"]) _inputManager.set_button(bb::PAD_LEFT, false);
@@ -1331,16 +1347,11 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 - (void)fillAudioBuffer:(AudioQueueBufferRef)buffer {
     std::memset(buffer->mAudioData, 0, buffer->mAudioDataBytesCapacity);
     buffer->mAudioDataByteSize = buffer->mAudioDataBytesCapacity;
-    if (_bootCoordinator && _bootCoordinator->runtime()) {
-        auto* ring = _bootCoordinator->audio_out().get_port_ring_buffer(0);
-        if (ring) {
-            uint32_t framesRequested = buffer->mAudioDataBytesCapacity / 4;
-            size_t readFrames = ring->read(static_cast<int16_t*>(buffer->mAudioData), framesRequested);
-            if (readFrames > 0) {
-                buffer->mAudioDataByteSize = static_cast<UInt32>(readFrames * 4);
-            }
-        }
-    }
+    // O gerenciador global recebe as chamadas HLE do guest. Manter a duração
+    // do buffer constante e deixar o restante zerado evita acelerar a fila.
+    const size_t frames = buffer->mAudioDataBytesCapacity / 4;
+    bb::AudioOutManager::instance().drain_main_port_pcm16(
+        static_cast<int16_t*>(buffer->mAudioData), frames);
 }
 
 #pragma mark - Diagnostics & Documents Inventory
@@ -1480,8 +1491,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     [self checkBootEntry];
     if (_bootCoordinator) {
         auto diag = _bootCoordinator->diagnostics();
-        const bool is_running = (diag.total_steps > 0);
-        _report[@"game_execution"] = @(is_running);
+        _report[@"guest_steps_executed"] = @(diag.total_steps > 0);
+        _report[@"game_execution"] = @NO;
     }
     _report[@"timestamp"] = [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]];
     auto pacing = _pacingTracker.get_stats();
