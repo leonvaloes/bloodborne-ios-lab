@@ -296,6 +296,35 @@ int main() { return run([] {
 
     CHECK(sceAudioOutClose(p_out) == SCE_OK);
 
+    // A fila do host é estéreo: uma porta principal mono não deve ser drenada
+    // para um destino com capacidade para apenas 2 * frames amostras.
+    const auto mono = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
+                                    SCE_AUDIO_OUT_PARAM_FORMAT_S16_MONO);
+    CHECK(mono > 0);
+    std::vector<std::int16_t> mono_block(256, 42);
+    CHECK(sceAudioOutOutput(mono, mono_block.data()) == SCE_OK);
+    std::vector<std::int16_t> host_buffer(512, -1);
+    CHECK(AudioOutManager::instance().drain_main_port_pcm16(host_buffer.data(), 256) == 0);
+    CHECK(sceAudioOutClose(mono) == SCE_OK);
+
+    // Fechamento concorrente com o callback de saída não pode usar PortEntry
+    // depois da destruição. Exercita ciclos curtos de abertura/drenagem/fecho.
+    std::atomic<bool> audio_run{true};
+    std::thread callback([&]() {
+        std::vector<std::int16_t> samples(256 * 2);
+        while (audio_run.load()) {
+            AudioOutManager::instance().drain_main_port_pcm16(samples.data(), 256);
+        }
+    });
+    for (int i = 0; i < 100; ++i) {
+        const auto h = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
+                                      SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        CHECK(h > 0);
+        CHECK(sceAudioOutClose(h) == SCE_OK);
+    }
+    audio_run = false;
+    callback.join();
+
     // ========================================================================
     // 8. Teste de Concorrência Multithreaded
     // ========================================================================

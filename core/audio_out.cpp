@@ -367,37 +367,31 @@ std::int32_t AudioOutManager::get_last_output_time(std::int32_t handle, std::uin
 std::size_t AudioOutManager::drain_port_pcm16(std::int32_t handle, std::int16_t *out_samples, std::size_t frames) {
     if (!out_samples || frames == 0 || handle <= 0) return 0;
 
-    PortEntry *port = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(manager_mutex_);
-        auto it = ports_.find(handle);
-        if (it == ports_.end() || !it->second || !it->second->is_open) {
-            return 0;
-        }
-        port = it->second.get();
-    }
-
-    std::lock_guard<std::mutex> port_lock(port->mutex);
-    if (!port->is_open || !port->ring_buffer) return 0;
-
-    return port->ring_buffer->read(out_samples, frames);
+    // Manter o lock do gerenciador até terminar a leitura: close_port pode
+    // destruir a PortEntry assim que o lock for liberado.
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    auto it = ports_.find(handle);
+    if (it == ports_.end() || !it->second || !it->second->is_open) return 0;
+    auto& port = *it->second;
+    std::lock_guard<std::mutex> port_lock(port.mutex);
+    if (!port.is_open || !port.ring_buffer) return 0;
+    return port.ring_buffer->read(out_samples, frames);
 }
 
 std::size_t AudioOutManager::drain_main_port_pcm16(std::int16_t *out_samples, std::size_t frames) {
     if (!out_samples || frames == 0) return 0;
 
-    std::int32_t main_handle = -1;
-    {
-        std::lock_guard<std::mutex> lock(manager_mutex_);
-        for (const auto &kv : ports_) {
-            if (kv.second && kv.second->is_open && kv.second->type == SCE_AUDIO_OUT_PORT_TYPE_MAIN) {
-                main_handle = kv.first;
-                break;
-            }
-        }
+    // Saída do host é S16 estéreo; nunca ler uma porta mono/8 canais
+    // diretamente para um buffer dimensionado em pares de amostras.
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    for (const auto& kv : ports_) {
+        if (!kv.second || !kv.second->is_open ||
+            kv.second->type != SCE_AUDIO_OUT_PORT_TYPE_MAIN || kv.second->channels != 2) continue;
+        auto& port = *kv.second;
+        std::lock_guard<std::mutex> port_lock(port.mutex);
+        if (port.is_open && port.ring_buffer) return port.ring_buffer->read(out_samples, frames);
     }
-    if (main_handle <= 0) return 0;
-    return drain_port_pcm16(main_handle, out_samples, frames);
+    return 0;
 }
 
 AudioRingBuffer* AudioOutManager::get_port_ring_buffer(std::int32_t handle) {
