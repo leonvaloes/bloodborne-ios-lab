@@ -2649,7 +2649,11 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n=="fileno") {
         FILE* fp = get_file(a(0));
+#if defined(_WIN32)
         return fp ? static_cast<std::uint64_t>(_fileno(fp)) : static_cast<std::uint64_t>(-1);
+#else
+        return fp ? static_cast<std::uint64_t>(fileno(fp)) : static_cast<std::uint64_t>(-1);
+#endif
     }
     if (n=="isatty") {
         // Stub
@@ -2756,7 +2760,11 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
     if (n=="getpid") {
+#if defined(_WIN32)
         return static_cast<std::uint64_t>(_getpid());
+#else
+        return static_cast<std::uint64_t>(getpid());
+#endif
     }
     if (n=="getppid") {
         return 1;
