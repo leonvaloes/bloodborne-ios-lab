@@ -424,7 +424,7 @@ int main() {
     assert(call("bsearch", 0x5c40, 0x5c00, 5, sizeof(int), 0x1500) == 0);
 
     // 5. snprintf
-    assert(m.store(0x5e00, "val=%d u=%u hex=%x s=%s", 25) == MemoryError::ok);
+    assert(m.store(0x5e00, "val=%d u=%u hex=%x s=%s", sizeof("val=%d u=%u hex=%x s=%s")) == MemoryError::ok);
     assert(m.store(0x5e40, "Hunter", 7) == MemoryError::ok);
     auto sn_len = call("snprintf", 0x5d00, 64, 0x5e00, static_cast<std::uint64_t>(-42), 100, 0xFE, 0x5e40);
     char sn_out[64]{};

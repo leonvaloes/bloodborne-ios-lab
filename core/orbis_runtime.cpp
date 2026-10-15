@@ -2606,9 +2606,9 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         // Already handled above
     }
     if (n=="ungetc") {
-        int c = static_cast<int>(a(0));
-        FILE* fp = reinterpret_cast<FILE*>(a(1));
-        return std::ungetc(c, fp);
+        int ch = static_cast<int>(a(0));
+        FILE* fp = get_file(a(1));
+        return fp ? std::ungetc(ch, fp) : EOF;
     }
     if (n=="fscanf") {
         // Stub
