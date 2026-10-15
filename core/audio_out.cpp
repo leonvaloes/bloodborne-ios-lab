@@ -176,16 +176,12 @@ std::int32_t AudioOutManager::output(std::int32_t handle, const void *ptr, std::
     if (!ptr) return SCE_AUDIO_OUT_ERROR_INVALID_POINTER;
     if (handle <= 0) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
 
-    PortEntry *port = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(manager_mutex_);
-        auto it = ports_.find(handle);
-        if (it == ports_.end() || !it->second || !it->second->is_open) {
-            return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
-        }
-        port = it->second.get();
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    auto it = ports_.find(handle);
+    if (it == ports_.end() || !it->second || !it->second->is_open) {
+        return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
     }
-
+    PortEntry *port = it->second.get();
     std::lock_guard<std::mutex> port_lock(port->mutex);
     if (!port->is_open || !port->ring_buffer) {
         return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
@@ -270,16 +266,12 @@ std::int32_t AudioOutManager::set_volume(std::int32_t handle, std::int32_t flag,
         return SCE_AUDIO_OUT_ERROR_INVALID_PARAM;
     }
 
-    PortEntry *port = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(manager_mutex_);
-        auto it = ports_.find(handle);
-        if (it == ports_.end() || !it->second || !it->second->is_open) {
-            return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
-        }
-        port = it->second.get();
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    auto it = ports_.find(handle);
+    if (it == ports_.end() || !it->second || !it->second->is_open) {
+        return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
     }
-
+    PortEntry *port = it->second.get();
     std::lock_guard<std::mutex> port_lock(port->mutex);
     if (!port->is_open) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
 
@@ -308,16 +300,12 @@ std::int32_t AudioOutManager::get_port_info(std::int32_t handle, SceAudioOutPort
     if (!info) return SCE_AUDIO_OUT_ERROR_INVALID_POINTER;
     if (handle <= 0) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
 
-    const PortEntry *port = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(manager_mutex_);
-        auto it = ports_.find(handle);
-        if (it == ports_.end() || !it->second || !it->second->is_open) {
-            return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
-        }
-        port = it->second.get();
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    auto it = ports_.find(handle);
+    if (it == ports_.end() || !it->second || !it->second->is_open) {
+        return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
     }
-
+    const PortEntry *port = it->second.get();
     std::lock_guard<std::mutex> port_lock(port->mutex);
     if (!port->is_open) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
 
@@ -347,16 +335,12 @@ std::int32_t AudioOutManager::get_last_output_time(std::int32_t handle, std::uin
     if (!output_time) return SCE_AUDIO_OUT_ERROR_INVALID_POINTER;
     if (handle <= 0) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
 
-    const PortEntry *port = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(manager_mutex_);
-        auto it = ports_.find(handle);
-        if (it == ports_.end() || !it->second || !it->second->is_open) {
-            return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
-        }
-        port = it->second.get();
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    auto it = ports_.find(handle);
+    if (it == ports_.end() || !it->second || !it->second->is_open) {
+        return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
     }
-
+    const PortEntry *port = it->second.get();
     std::lock_guard<std::mutex> port_lock(port->mutex);
     if (!port->is_open) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
 

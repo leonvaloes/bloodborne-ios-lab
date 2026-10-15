@@ -117,6 +117,9 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     BOOL _continuousExecution;
     std::unique_ptr<bb::GameBootCoordinator> _bootCoordinator;
     bb::VideoOutManager _videoOutManager;
+    struct GuestFlipSink : bb::VideoOutSink {
+        void on_flip(const bb::FlipEvent&) override {}
+    } _guestFlipSink;
     bb::InputManager _inputManager;
     bb::TouchControlsOverlay _touchOverlay;
 
@@ -942,6 +945,9 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     config.enable_hle = true;
     config.use_scheduler = true;
 
+    // A VideoOut anterior referencia GuestMemory do coordenador antigo.
+    _videoOutManager.detach_guest_memory();
+    _guestScreenTexture = nil;
     _bootCoordinator = std::make_unique<bb::GameBootCoordinator>();
     _bootCoordinator->attach_input_manager(&_inputManager);
     _bootCoordinator->attach_video_out(&_videoOutManager);
@@ -964,6 +970,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         return;
     }
 
+    _videoOutManager.attach_guest_memory(_bootCoordinator->guest_memory(), &_guestFlipSink);
     if (_bootCoordinator->runtime()) {
         _bootCoordinator->runtime()->pad_manager().set_default_input(&_inputManager);
         _bootCoordinator->runtime()->attach_video_out(&_videoOutManager);
@@ -1060,7 +1067,11 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 
     if (_videoOutManager.has_new_frame()) {
         bb::HostFrameBuffer guestFrame;
-        if (_videoOutManager.read_current_frame_pixels(guestFrame) && guestFrame.valid) {
+        if (_videoOutManager.read_current_frame_pixels(guestFrame) && guestFrame.valid &&
+            guestFrame.bytes_per_pixel == 4 && guestFrame.width > 0 && guestFrame.height > 0 &&
+            guestFrame.pitch >= guestFrame.width &&
+            guestFrame.pitch <= SIZE_MAX / 4 &&
+            guestFrame.pixel_data.size() >= static_cast<size_t>(guestFrame.pitch) * 4 * guestFrame.height) {
             _report[@"guest_frame_flipped"] = @YES;
             _report[@"guest_frame_seq"] = @(guestFrame.flip_sequence);
             _report[@"guest_frame_w"] = @(guestFrame.width);
@@ -1078,9 +1089,12 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                 [_guestScreenTexture replaceRegion:MTLRegionMake2D(0, 0, guestFrame.width, guestFrame.height)
                                        mipmapLevel:0
                                          withBytes:guestFrame.pixel_data.data()
-                                       bytesPerRow:guestFrame.pitch > 0 ? guestFrame.pitch : guestFrame.width * 4];
+                                       bytesPerRow:static_cast<NSUInteger>(guestFrame.pitch) * 4];
             }
+        } else {
+            _report[@"guest_frame_status"] = @"Sem pixels lineares BGRA8 verificáveis; flip não demonstra imagem.";
         }
+        _videoOutManager.consume_new_frame();
     }
 
     // Atualização de rotação suave da câmera no modo demonstração 3D
@@ -1172,6 +1186,16 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         });
     }];
     [command commit];
+}
+
+- (void)dealloc {
+    if (_audioQueue) {
+        AudioQueueStop(_audioQueue, true);
+        AudioQueueDispose(_audioQueue, true);
+        _audioQueue = nullptr;
+    }
+    _videoOutManager.detach_guest_memory();
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
