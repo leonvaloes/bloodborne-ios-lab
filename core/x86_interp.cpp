@@ -1047,10 +1047,10 @@ void Exec::sse(std::uint8_t op2, int opsz) {
             if (is_hi) { s.xmm[rg][0] = s.xmm[rg][1]; s.xmm[rg][1] = src[1]; }
             else { s.xmm[rg][1] = src[0]; }
         } else { // ps: 32-bit floats
-            const std::uint32_t a0 = s.xmm[rg][0], a1 = s.xmm[rg][0] >> 32;
-            const std::uint32_t a2 = s.xmm[rg][1], a3 = s.xmm[rg][1] >> 32;
-            const std::uint32_t b0 = src[0], b1 = src[0] >> 32;
-            const std::uint32_t b2 = src[1], b3 = src[1] >> 32;
+            const std::uint32_t a0 = static_cast<std::uint32_t>(s.xmm[rg][0]), a1 = static_cast<std::uint32_t>(s.xmm[rg][0] >> 32);
+            const std::uint32_t a2 = static_cast<std::uint32_t>(s.xmm[rg][1]), a3 = static_cast<std::uint32_t>(s.xmm[rg][1] >> 32);
+            const std::uint32_t b0 = static_cast<std::uint32_t>(src[0]), b1 = static_cast<std::uint32_t>(src[0] >> 32);
+            const std::uint32_t b2 = static_cast<std::uint32_t>(src[1]), b3 = static_cast<std::uint32_t>(src[1] >> 32);
             if (is_hi) {
                 s.xmm[rg][0] = static_cast<std::uint64_t>(a2) | (static_cast<std::uint64_t>(b2) << 32);
                 s.xmm[rg][1] = static_cast<std::uint64_t>(a3) | (static_cast<std::uint64_t>(b3) << 32);

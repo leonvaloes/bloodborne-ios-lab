@@ -32,6 +32,7 @@ set(ALL_FIXTURES
     abi_0args abi_1arg abi_6args abi_12args abi_struct_byval abi_struct_ret abi_fp_args abi_align16 abi_callee_saved)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(CMAKE_XCODE_ATTRIBUTE_CLANG_WARN_SHORTEN_64_TO_32 "NO")
     if(NOT BB_GENERATED_DIR)
         message(FATAL_ERROR "Set BB_GENERATED_DIR to fixtures produced by a host build")
     endif()
