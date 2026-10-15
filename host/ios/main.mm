@@ -126,6 +126,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     // Subsistema Metal 3
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
+    id<MTLRenderPipelineState> _screenPipeline;
+    id<MTLSamplerState> _screenSampler;
     id<MTLDepthStencilState> _depthState;
     id<MTLBuffer> _vertexBuffer;
     id<MTLBuffer> _indexBuffer;
@@ -256,6 +258,36 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _report[@"metal_max_buffer_length"] = @(device.maxBufferLength);
 
     _queue = [device newCommandQueue];
+
+    // Passe fullscreen independente da malha de demonstração. Não interpreta
+    // superfícies GNM: mostra somente pixels lineares efetivamente lidos do guest.
+    NSString *screenShader = @"#include <metal_stdlib>\n"
+        @"using namespace metal;\n"
+        @"struct ScreenVertex { float4 position [[position]]; float2 uv; };\n"
+        @"vertex ScreenVertex bbScreenVertex(uint id [[vertex_id]]) {\n"
+        @"  float2 p = float2((id << 1) & 2, id & 2);\n"
+        @"  return {float4(p * 2.0 - 1.0, 0.0, 1.0), float2(p.x, 1.0 - p.y)};\n"
+        @"}\n"
+        @"fragment float4 bbScreenFragment(ScreenVertex v [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+        @"                                  sampler s [[sampler(0)]]) { return t.sample(s, v.uv); }\n";
+    NSError *screenError = nil;
+    id<MTLLibrary> screenLibrary = [device newLibraryWithSource:screenShader options:nil error:&screenError];
+    if (screenLibrary) {
+        MTLRenderPipelineDescriptor *screenDesc = [MTLRenderPipelineDescriptor new];
+        screenDesc.vertexFunction = [screenLibrary newFunctionWithName:@"bbScreenVertex"];
+        screenDesc.fragmentFunction = [screenLibrary newFunctionWithName:@"bbScreenFragment"];
+        screenDesc.colorAttachments[0].pixelFormat = _metal.colorPixelFormat;
+        _screenPipeline = [device newRenderPipelineStateWithDescriptor:screenDesc error:&screenError];
+    }
+    if (!_screenPipeline) {
+        _report[@"guest_presentation_error"] = screenError.localizedDescription ?: @"Pipeline de vídeo indisponível";
+    }
+    MTLSamplerDescriptor *screenSamplerDesc = [MTLSamplerDescriptor new];
+    screenSamplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
+    screenSamplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
+    screenSamplerDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    screenSamplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    _screenSampler = [device newSamplerStateWithDescriptor:screenSamplerDesc];
 
     MTLDepthStencilDescriptor *depthDesc = [MTLDepthStencilDescriptor new];
     depthDesc.depthCompareFunction = MTLCompareFunctionLessEqual;
@@ -1125,6 +1157,18 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     if (!command) { [self gpuError:@"Falha ao criar command buffer"]; return; }
     id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
     if (!encoder) { [self gpuError:@"Falha ao criar render encoder"]; return; }
+
+    if (_guestScreenTexture && _screenPipeline && _screenSampler) {
+        [encoder setRenderPipelineState:_screenPipeline];
+        [encoder setFragmentTexture:_guestScreenTexture atIndex:0];
+        [encoder setFragmentSamplerState:_screenSampler atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder endEncoding];
+        [command presentDrawable:drawable];
+        [command commit];
+        _report[@"guest_frame_presented_to_metal"] = @YES;
+        return;
+    }
 
     [encoder setRenderPipelineState:_pipeline];
     if (_depthState) {
