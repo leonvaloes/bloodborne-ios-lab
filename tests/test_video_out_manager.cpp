@@ -48,6 +48,20 @@ int main() { return run([] {
     CHECK(!manager.current_display_buffer().valid);
     CHECK(manager.has_new_frame());
     CHECK(manager.consume_new_frame());
+    CHECK(memory.protect(0x1000, bb::read | bb::write) == bb::MemoryError::ok);
+    // Pitch é contado em pixels, não em bytes: a leitura inclui padding
+    // entre linhas, e a apresentação BGRA8 usa pitch * 4 por linha.
+    CHECK(manager.register_buffer(1, {0x1100, 2, 2, 3, 4}) == bb::VideoStatus::ok);
+    const std::array<std::uint8_t, 24> padded{{
+        1, 2, 3, 4, 5, 6, 7, 8, 0xaa, 0xbb, 0xcc, 0xdd,
+        9, 10, 11, 12, 13, 14, 15, 16, 0xee, 0xff, 0x17, 0x18
+    }};
+    CHECK(memory.store(0x1100, padded.data(), padded.size()) == bb::MemoryError::ok);
+    CHECK(manager.submit_flip(1, 10) == bb::VideoStatus::ok);
+    CHECK(manager.read_current_frame_pixels(frame));
+    CHECK(frame.pitch == 3 && frame.bytes_per_pixel == 4 && frame.pixel_data.size() == 24);
+    CHECK(std::equal(frame.pixel_data.begin(), frame.pixel_data.end(), padded.begin()));
+    CHECK(manager.consume_new_frame());
     manager.detach_guest_memory();
     CHECK(!manager.has_guest_memory() && !manager.has_new_frame());
     CHECK(manager.flip_count() == 0 && manager.last_flip().sequence == 0);
