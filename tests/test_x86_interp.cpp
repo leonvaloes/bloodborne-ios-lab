@@ -2,6 +2,7 @@
 #include "../core/x86_interp.h"
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 
 using namespace bb;
 
@@ -9,9 +10,15 @@ namespace {
 constexpr std::uint64_t CODE = 0x1000, STACK = 0x10000, DATA = 0x20000, TRAP = 0xF0000000ULL;
 
 struct Machine {
-    GuestMemory mem{1u << 20};
-    X86Interpreter cpu{mem};
-    Machine(std::initializer_list<std::uint8_t> code) {
+    std::unique_ptr<GuestMemory> mem_ptr;
+    std::unique_ptr<X86Interpreter> cpu_ptr;
+    GuestMemory& mem;
+    X86Interpreter& cpu;
+    Machine(std::initializer_list<std::uint8_t> code)
+        : mem_ptr(std::make_unique<GuestMemory>(1u << 20)),
+          cpu_ptr(std::make_unique<X86Interpreter>(*mem_ptr)),
+          mem(*mem_ptr),
+          cpu(*cpu_ptr) {
         CHECK(mem.map(CODE, 0x1000, Permission::read | Permission::write) == MemoryError::ok);
         CHECK(mem.map(STACK, 0x1000, Permission::read | Permission::write) == MemoryError::ok);
         CHECK(mem.map(DATA, 0x1000, Permission::read | Permission::write) == MemoryError::ok);

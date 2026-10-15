@@ -3317,6 +3317,7 @@ bool X86Interpreter::in_trap(std::uint64_t rip) const {
 CpuRunResult X86Interpreter::run(std::uint64_t max_steps) {
     CpuRunResult out;
     Exec e(state, mem_, tsc_);
+    if (recent_traces_.empty()) recent_traces_.resize(1024);
     while (out.steps < max_steps) {
         out.rip = state.rip;
         recent_traces_[recent_rips_count_++ % 1024] = { state.rip, state.gpr[5], state.gpr[4] };

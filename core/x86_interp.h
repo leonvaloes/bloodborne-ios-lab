@@ -79,10 +79,11 @@ private:
 public:
     struct TraceItem { std::uint64_t rip, rbp, rsp; };
 private:
-    TraceItem recent_traces_[1024] = {};
+    std::vector<TraceItem> recent_traces_;
     std::size_t recent_rips_count_ = 0;
 public:
     std::vector<TraceItem> recent_traces() const {
+        if (recent_traces_.empty()) return {};
         std::vector<TraceItem> res;
         std::size_t count = recent_rips_count_ < 1024 ? recent_rips_count_ : 1024;
         res.reserve(count);
