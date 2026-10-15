@@ -554,11 +554,11 @@ int main() {
         assert(srt.procparam() == 0xfeedfaceULL);
 
         // Initialize VFS and SaveDataManager for save data tests
-        VirtualFileSystem vfs;
+        VirtualFileSystem srt_vfs;
         const std::string tag2 = unique_tag();
-        std::string temp_dir = std::filesystem::temp_directory_path().string() + "/save_test_" + tag2;
-        assert(vfs.mount("/save", temp_dir));
-        srt.save_data_manager().initialize(std::filesystem::temp_directory_path().string() + "/save_data_test_" + tag2, 32 * 1024 * 1024, &vfs);
+        std::string srt_temp_dir = std::filesystem::temp_directory_path().string() + "/save_test_" + tag2;
+        assert(srt_vfs.mount("/save", srt_temp_dir));
+        srt.save_data_manager().initialize(std::filesystem::temp_directory_path().string() + "/save_data_test_" + tag2, 32 * 1024 * 1024, &srt_vfs);
 
         constexpr std::uint64_t trap_base = 0x50000;
         constexpr std::uint64_t return_trap = 0x50f00;

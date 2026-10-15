@@ -69,7 +69,7 @@ int main() {
             CHECK(m.cpu.state.gpr[0] == CODE + 7 + 0x10);
         }
         {   // LEA calcula offset efetivo, sem somar bases FS/GS; flags intactas.
-            for (const std::uint8_t prefix : {0x64, 0x65}) {
+            for (const std::uint8_t prefix : {std::uint8_t{0x64}, std::uint8_t{0x65}}) {
                 Machine m{prefix, 0x48, 0x8D, 0x47, 0x10, 0xC3};
                 m.cpu.state.gpr[7] = DATA;
                 m.cpu.state.fs_base = 0x10000;
