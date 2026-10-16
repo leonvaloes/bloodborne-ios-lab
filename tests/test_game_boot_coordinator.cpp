@@ -345,6 +345,9 @@ int main() { return run([] {
         CHECK(diag_before.save_initialized);
         CHECK(diag_before.save_mount_point == "/savedata0");
         CHECK(diag_before.total_steps == 0);
+        CHECK(diag_before.guest_mapped_bytes > 0);
+        CHECK(diag_before.guest_peak_mapped_bytes >= diag_before.guest_mapped_bytes);
+        CHECK(diag_before.guest_budget_bytes == config.guest_memory_size);
 
         // Executa fatia de passos
         std::uint64_t executed = coordinator.step(100);

@@ -106,6 +106,10 @@ struct BootDiagnostics {
     std::uint64_t current_rip{0};
     std::string last_stop_reason;
     std::string last_error;
+    // Bytes de regiões guest mapeadas (não é memória residente do processo).
+    std::size_t guest_mapped_bytes{0};
+    std::size_t guest_peak_mapped_bytes{0};
+    std::size_t guest_budget_bytes{0};
 
     // Sumário consolidado estruturado
     std::string summary() const;

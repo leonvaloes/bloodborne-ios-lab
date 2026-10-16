@@ -1130,6 +1130,9 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         @"current_rip": @(diag.current_rip),
         @"last_stop_reason": [NSString stringWithUTF8String:diag.last_stop_reason.c_str()],
         @"last_error": [NSString stringWithUTF8String:diag.last_error.c_str()],
+        @"guest_mapped_bytes": @(diag.guest_mapped_bytes),
+        @"guest_peak_mapped_bytes": @(diag.guest_peak_mapped_bytes),
+        @"guest_budget_bytes": @(diag.guest_budget_bytes),
         @"guest_steps_executed": @(is_running),
         @"game_execution": @NO,
         @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]

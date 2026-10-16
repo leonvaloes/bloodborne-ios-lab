@@ -615,6 +615,11 @@ BootDiagnostics GameBootCoordinator::diagnostics() const {
     diag.current_rip = cpu_ ? cpu_->state.rip : 0;
     diag.last_stop_reason = last_stop_reason_;
     diag.last_error = error_message_;
+    if (guest_memory_) {
+        diag.guest_mapped_bytes = guest_memory_->used();
+        diag.guest_peak_mapped_bytes = guest_memory_->peak_used();
+        diag.guest_budget_bytes = guest_memory_->budget();
+    }
 
     return diag;
 }
