@@ -65,6 +65,16 @@ RasterizerStatus GnmRasterizer::clear_render_target(
                      (static_cast<std::uint32_t>(u_a) << 24);
     }
 
+    std::uint64_t region_base = 0;
+    std::size_t region_size = 0;
+    unsigned permissions = 0;
+    if (pitch < target.width || total_bytes == 0 ||
+        !memory.query_region(target.base_address, region_base, region_size, permissions) ||
+        !(permissions & Permission::write) ||
+        target.base_address - region_base > region_size ||
+        total_bytes > region_size - static_cast<std::size_t>(target.base_address - region_base)) {
+        return RasterizerStatus::InvalidRenderTarget;
+    }
     std::vector<std::uint32_t> row_buffer(pitch, pixel_word);
     for (std::uint32_t y = 0; y < target.height; ++y) {
         std::uint64_t row_addr = target.base_address + static_cast<std::uint64_t>(y) * pitch * bpp;
@@ -93,6 +103,16 @@ RasterizerStatus GnmRasterizer::execute_draw(
     const std::size_t total_bytes = static_cast<std::size_t>(pitch) * rt.height * bpp;
     if (rt.base_address > UINT64_MAX - total_bytes) {
         return RasterizerStatus::BufferOverflow;
+    }
+    std::uint64_t region_base = 0;
+    std::size_t region_size = 0;
+    unsigned permissions = 0;
+    if (pitch < rt.width || total_bytes == 0 ||
+        !memory.query_region(rt.base_address, region_base, region_size, permissions) ||
+        !(permissions & Permission::write) ||
+        rt.base_address - region_base > region_size ||
+        total_bytes > region_size - static_cast<std::size_t>(rt.base_address - region_base)) {
+        return RasterizerStatus::InvalidRenderTarget;
     }
 
     // 1. Extração do Buffer de Vértices

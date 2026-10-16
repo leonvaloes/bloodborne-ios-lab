@@ -23,6 +23,9 @@ int main() { return run([] {
     rt.pitch = 64;
     rt.format = bb::GnmSurfaceFormat::B8G8R8A8_Unorm;
 
+    auto invalid_target = rt;
+    invalid_target.base_address = 0x10000 + 256 * 1024 - 4;
+    CHECK(rasterizer.clear_render_target(memory, invalid_target, 1, 0, 0, 1) == bb::RasterizerStatus::InvalidRenderTarget);
     CHECK(rasterizer.clear_render_target(memory, rt, 0.2f, 0.4f, 0.6f, 1.0f) == bb::RasterizerStatus::Ok);
 
     // Amostragem nos cantos e no centro
@@ -86,6 +89,10 @@ int main() { return run([] {
     std::memcpy(&dc.pipeline_state.vs_user_data[0], encoded.data(), 16);
 
     bb::RasterizerStats stats{};
+    auto invalid_draw_target = dc;
+    invalid_draw_target.pipeline_state.render_targets.targets[0] = invalid_target;
+    CHECK(rasterizer.execute_draw(memory, invalid_draw_target, &stats) == bb::RasterizerStatus::InvalidRenderTarget);
+    CHECK(stats.pixels_written == 0);
     CHECK(rasterizer.execute_draw(memory, dc, &stats) == bb::RasterizerStatus::Ok);
     CHECK(stats.triangles_drawn == 1);
     CHECK(stats.pixels_written > 100);
