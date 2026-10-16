@@ -1177,8 +1177,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                 if (auto *runtime = strongSelf->_bootCoordinator->runtime()) {
                     strongSelf->_guestSubmits.store(runtime->submit_count());
                     strongSelf->_guestTriangles.store(runtime->rasterizer_stats().triangles_drawn);
-            strongSelf->_guestRasterizerFailures.store(runtime->rasterizer_failure_count());
-            strongSelf->_guestLastRasterizerStatus.store(static_cast<int>(runtime->last_rasterizer_status()));
+                    strongSelf->_guestRasterizerFailures.store(runtime->rasterizer_failure_count());
+                    strongSelf->_guestLastRasterizerStatus.store(static_cast<int>(runtime->last_rasterizer_status()));
                 }
                 strongSelf->_guestCanStep.store(diag.state == bb::BootState::running ||
                                                 diag.state == bb::BootState::modules_initialized);
@@ -1188,7 +1188,12 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                     if (!sSelf) return;
                     sSelf->_lastGuestSteps = diag.total_steps;
                     sSelf->_report[@"guest_steps_executed"] = @(diag.total_steps > 0);
-                    if (diag.total_steps % 500000 < 50000) {
+                    if (diag.state == bb::BootState::error || diag.state == bb::BootState::halted) {
+                        sSelf->_continuousExecution = NO;
+                        [sSelf->_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
+                    }
+                    if (diag.state == bb::BootState::error || diag.state == bb::BootState::halted ||
+                        diag.total_steps % 500000 < 50000) {
                         [sSelf updateCoordinatorReportAndUI:diag executedSteps:steps];
                     }
                 });
