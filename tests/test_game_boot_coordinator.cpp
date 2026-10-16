@@ -471,6 +471,27 @@ int main() { return run([] {
         CHECK(diag.active_modules.at(0) == "libtest.prx");
     }
 
+    // Um inicializador que esgota o orçamento deve reportar orçamento, não
+    // "parada anormal" genérica; os arquivos são fixtures autorais.
+    {
+        auto dir = sandbox / "module_step_budget";
+        std::filesystem::create_directories(dir / "sce_module", ec);
+        auto prx = synthesize_elf(true);
+        std::ofstream module(dir / "sce_module" / "libtest.prx", std::ios::binary);
+        module.write(reinterpret_cast<const char*>(prx.data()), prx.size());
+        module.close();
+        auto eboot = synthesize_elf(false, false, "libtest.prx");
+        std::ofstream file(dir / "eboot.bin", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(eboot.data()), eboot.size());
+        file.close();
+        GameBootCoordinator coordinator;
+        BootConfig config;
+        config.base_dir = dir.string();
+        config.module_init_budget = 1;
+        CHECK(!coordinator.initialize(config));
+        CHECK(coordinator.diagnostics().last_error.find("exceeded step budget") != std::string::npos);
+    }
+
     // ========================================================================
     // 5. Despacho de Trap HLE pelo interpretador unificado
     // ========================================================================

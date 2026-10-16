@@ -365,6 +365,9 @@ bool GameBootCoordinator::phase4_initialize_runtime(const BootConfig& config) {
             CpuRunResult res = cpu_->run(slice);
             steps_in_mod += res.steps;
             total_steps_ += res.steps;
+            if (res.stop == CpuStop::step_limit) {
+                break; // orçamento do inicializador esgotado; erro específico abaixo
+            }
 
             if (res.stop == CpuStop::trap) {
                 if (res.rip == Ps4Bootstrap::exit_trap + 32) {
