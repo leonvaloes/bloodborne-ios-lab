@@ -80,6 +80,9 @@ public:
     const std::filesystem::path& app0_dir() const { return app0_dir_; }
     std::string resolve_guest_path(const std::string& guest_path) const;
 
+    void set_direct_memory_size(std::uint64_t size) { direct_memory_pool_ = size; }
+    std::uint64_t direct_memory_size() const { return direct_memory_pool_; }
+
     // Adaptador scheduler-traps:
     InvocationResult invoke_trap(const std::string& import, CpuState& cpu,
                                  GuestScheduler::Id thread, std::uint64_t return_trap = 0);
@@ -97,6 +100,7 @@ private:
     std::uint64_t get_errno_addr(GuestScheduler::Id tid = 1);
     GuestMemory& mem_;
     GuestScheduler* scheduler_ = nullptr;
+    std::uint64_t direct_memory_pool_ = 5056ULL << 20;
     std::uint64_t procparam_ = 0;
     std::uint64_t thread_stack_next_ = 0x3000000000ULL;
     std::uint64_t errno_page_ = 0;

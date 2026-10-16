@@ -9,6 +9,25 @@ namespace bb {
 enum class MemoryError { ok, invalid, overlap, budget, unmapped, denied, allocation };
 enum Permission : unsigned { read = 1, write = 2 };
 
+class MemoryBuffer {
+public:
+    MemoryBuffer() noexcept = default;
+    explicit MemoryBuffer(std::size_t size);
+    ~MemoryBuffer();
+    MemoryBuffer(const MemoryBuffer&) = delete;
+    MemoryBuffer& operator=(const MemoryBuffer&) = delete;
+    MemoryBuffer(MemoryBuffer&& other) noexcept;
+    MemoryBuffer& operator=(MemoryBuffer&& other) noexcept;
+
+    std::uint8_t* data() noexcept { return data_; }
+    const std::uint8_t* data() const noexcept { return data_; }
+    std::size_t size() const noexcept { return size_; }
+
+private:
+    std::uint8_t* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
 // Logical guest memory only: never maps executable pages or casts guest
 // addresses to host pointers. A transfer must fit a single region.
 class GuestMemory {
@@ -33,7 +52,7 @@ public:
     MemoryError atomic_compare_exchange_u32(std::uint64_t address, std::uint32_t& expected, std::uint32_t desired, bool& success);
 
 private:
-    struct Region { std::vector<std::uint8_t> bytes; unsigned permissions; };
+    struct Region { MemoryBuffer bytes; unsigned permissions; };
     using Regions = std::map<std::uint64_t, Region>;
     Regions::const_iterator find(std::uint64_t address, std::size_t size) const;
     mutable std::mutex mutex_;

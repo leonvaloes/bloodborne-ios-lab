@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "uso: bb-boot-diagnostic diretório [passos<=100000] [MiB<=6144] [init_passos<=1000000]\n");
         return 2;
     }
-    std::uint64_t steps = 100000, mib = 768, init = 1000000;
+    std::uint64_t steps = 100000, mib = 5632, init = 1000000;
     if ((args.size() > 2 && !number(args[2].string(), steps)) ||
         (args.size() > 3 && !number(args[3].string(), mib)) ||
         (args.size() > 4 && !number(args[4].string(), init)) || !steps || steps > 100000 ||

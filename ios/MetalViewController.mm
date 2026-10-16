@@ -217,7 +217,14 @@
     bb::HostBridgeConfig config;
     config.documents_dir = docs ? docs.UTF8String : "";
     config.save_dir = docs ? [docs stringByAppendingPathComponent:@"savedata"].UTF8String : "";
-    config.guest_memory_size = 768u << 20;
+    const unsigned long long physRam = [NSProcessInfo processInfo].physicalMemory;
+    if (physRam >= (7ULL << 30)) {
+        config.guest_memory_size = static_cast<std::size_t>(5632ULL << 20); // 5.5 GiB
+    } else if (physRam >= (5ULL << 30)) {
+        config.guest_memory_size = static_cast<std::size_t>(4096ULL << 20); // 4.0 GiB
+    } else {
+        config.guest_memory_size = static_cast<std::size_t>(3072ULL << 20); // 3.0 GiB
+    }
     config.enable_hle = true;
     config.use_scheduler = true;
 

@@ -1824,9 +1824,9 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (n=="__cxa_guard_release") put<std::uint8_t>(mem_,a(0),1);
         guards_.erase(a(0)); return 0;
     }
-    if (n=="sceKernelGetDirectMemorySize") return pool;
+    if (n=="sceKernelGetDirectMemorySize") return direct_memory_pool_;
     if (n=="sceKernelAllocateDirectMemory") {
-        auto low=a(0), high=std::min(a(1),pool), size=a(2), alignment=a(3) ? a(3) : page;
+        auto low=a(0), high=std::min(a(1),direct_memory_pool_), size=a(2), alignment=a(3) ? a(3) : page;
         if (!a(5) || !size || size%page || !valid_alignment(alignment) || low>=high || a(4)>10) return invalid;
         if (size>logical_limit-physical_used_) return no_memory;
         if (low>UINT64_MAX-alignment) return invalid;

@@ -25,7 +25,7 @@ struct HostBridgeConfig {
     std::string save_dir_name{"SPRJ0001"};
     int32_t user_id{0};
     std::size_t save_quota_bytes{32 * 1024 * 1024};
-    std::size_t guest_memory_size{768u << 20};
+    std::size_t guest_memory_size{5632ULL << 20};
     std::uint64_t module_init_budget{10000000};
     std::vector<std::string> essential_asset_paths;
     bool require_essential_assets{false};

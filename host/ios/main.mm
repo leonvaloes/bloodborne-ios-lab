@@ -1002,7 +1002,14 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     bb::BootConfig config;
     config.base_dir = gameDir.UTF8String;
     config.save_dir = [documents.path stringByAppendingPathComponent:@"savedata"].UTF8String;
-    config.guest_memory_size = 768u << 20;
+    const unsigned long long physRam = [NSProcessInfo processInfo].physicalMemory;
+    if (physRam >= (7ULL << 30)) {
+        config.guest_memory_size = static_cast<std::size_t>(5632ULL << 20); // 5.5 GiB (iPhone 15 Pro / Pro Max com 8 GB)
+    } else if (physRam >= (5ULL << 30)) {
+        config.guest_memory_size = static_cast<std::size_t>(4096ULL << 20); // 4.0 GiB (dispositivos com 6 GB)
+    } else {
+        config.guest_memory_size = static_cast<std::size_t>(3072ULL << 20); // 3.0 GiB
+    }
     config.require_essential_assets = false;
     config.enable_hle = true;
     config.use_scheduler = true;

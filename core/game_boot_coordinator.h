@@ -55,8 +55,8 @@ struct BootConfig {
     // Quota máxima por slot de save data (padrão: 32 MiB)
     std::size_t save_quota_bytes{32 * 1024 * 1024};
 
-    // Orçamento de memória virtual do guest (padrão: 768 MiB)
-    std::size_t guest_memory_size{768u << 20};
+    // Orçamento de memória virtual do guest (padrão: 5.5 GiB, alinhado à especificação PS4)
+    std::size_t guest_memory_size{5632ULL << 20};
 
     // Limite de passos para inicializadores de módulo em Fase 4
     std::uint64_t module_init_budget{10000000};

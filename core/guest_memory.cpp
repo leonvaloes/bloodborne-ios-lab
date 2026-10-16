@@ -3,8 +3,66 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <utility>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace bb {
+
+MemoryBuffer::MemoryBuffer(std::size_t size) : size_(size) {
+    if (size == 0) return;
+#if defined(_WIN32)
+    data_ = static_cast<std::uint8_t*>(::VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!data_) throw std::bad_alloc();
+#else
+    void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (p == MAP_FAILED) throw std::bad_alloc();
+    data_ = static_cast<std::uint8_t*>(p);
+#endif
+}
+
+MemoryBuffer::~MemoryBuffer() {
+    if (!data_) return;
+#if defined(_WIN32)
+    ::VirtualFree(data_, 0, MEM_RELEASE);
+#else
+    ::munmap(data_, size_);
+#endif
+}
+
+MemoryBuffer::MemoryBuffer(MemoryBuffer&& other) noexcept : data_(other.data_), size_(other.size_) {
+    other.data_ = nullptr;
+    other.size_ = 0;
+}
+
+MemoryBuffer& MemoryBuffer::operator=(MemoryBuffer&& other) noexcept {
+    if (this != &other) {
+        if (data_) {
+#if defined(_WIN32)
+            ::VirtualFree(data_, 0, MEM_RELEASE);
+#else
+            ::munmap(data_, size_);
+#endif
+        }
+        data_ = other.data_;
+        size_ = other.size_;
+        other.data_ = nullptr;
+        other.size_ = 0;
+    }
+    return *this;
+}
+
 namespace {
 bool valid_permissions(unsigned p) { return (p & ~(read | write)) == 0; }
 bool valid_span(std::uint64_t address, std::size_t size) {
@@ -23,7 +81,7 @@ MemoryError GuestMemory::map(std::uint64_t address, std::size_t size, unsigned p
     }
     if (size > budget_ - used_) return MemoryError::budget;
     try {
-        regions_.emplace(address, Region{std::vector<std::uint8_t>(size, 0), p});
+        regions_.emplace(address, Region{MemoryBuffer(size), p});
     } catch (const std::bad_alloc&) { return MemoryError::allocation;
     } catch (const std::length_error&) { return MemoryError::allocation; }
     used_ += size;
