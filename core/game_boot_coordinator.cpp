@@ -503,7 +503,8 @@ std::uint64_t GameBootCoordinator::step(std::uint64_t max_steps) {
             }
             if (sched_res.stop == GuestScheduler::Stop::fault) {
                 state_ = BootState::error;
-                error_message_ = "Fault in thread " + std::to_string(sched_res.thread) + ": " + sched_res.cpu.describe();
+                last_stop_reason_ = sched_res.cpu.describe();
+                error_message_ = "Fault in thread " + std::to_string(sched_res.thread) + ": " + last_stop_reason_;
                 break;
             }
         }

@@ -384,6 +384,47 @@ int main() { return run([] {
         CHECK(coordinator.diagnostics().total_steps == 7);
     }
 
+    // A mesma fixture pelo scheduler: import/trap e falha devem ser explícitos.
+    {
+        auto dir = sandbox / "scheduler_entry";
+        std::filesystem::create_directories(dir, ec);
+        auto bytes = synthesize_elf(false, false, "", true);
+        std::ofstream file(dir / "eboot.bin", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        file.close();
+        GameBootCoordinator coordinator;
+        BootConfig config;
+        config.base_dir = dir.string();
+        config.require_essential_assets = false;
+        config.use_scheduler = true;
+        CHECK(coordinator.initialize(config));
+        CHECK(coordinator.step(100) == 7);
+        auto diag = coordinator.diagnostics();
+        CHECK(diag.state == BootState::halted);
+        CHECK(diag.total_steps == 7);
+        CHECK(diag.last_stop_reason == "idle");
+    }
+    {
+        auto dir = sandbox / "scheduler_fault";
+        std::filesystem::create_directories(dir, ec);
+        auto bytes = synthesize_elf(false, false, "", true);
+        bytes[0x400] = 0x0F;
+        bytes[0x401] = 0x0B; // UD2: instrução inválida deliberada
+        std::ofstream file(dir / "eboot.bin", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        file.close();
+        GameBootCoordinator coordinator;
+        BootConfig config;
+        config.base_dir = dir.string();
+        config.use_scheduler = true;
+        CHECK(coordinator.initialize(config));
+        coordinator.step(100);
+        const auto diag = coordinator.diagnostics();
+        CHECK(diag.state == BootState::error);
+        CHECK(!diag.last_error.empty());
+        CHECK(!diag.last_stop_reason.empty());
+    }
+
     // ========================================================================
     // 4. Boot com modulo PRX na ordem de dependencia e despacho de trap HLE
     // ========================================================================
