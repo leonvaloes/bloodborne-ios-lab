@@ -1475,19 +1475,22 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (!gnm_context_ || !dcb_addrs_ptr || !dcb_sizes_ptr || count == 0 || count >= 64) {
             return static_cast<std::uint64_t>(-1);
         }
-        // Estado de registradores persiste; chamadas de draw/dispatch pertencem
-        // somente a esta submissão, nunca à anterior.
-        gnm_context_->clear_calls();
+        // Preparar um contexto temporário: um IB inválido não pode deixar
+        // registradores ou draws parcialmente aplicados ao contexto persistente.
+        // As chamadas da submissão anterior não são reaproveitadas.
+        auto pending = std::make_unique<GnmContext>(*gnm_context_);
+        pending->clear_calls();
         for (uint32_t i = 0; i < count; ++i) {
             uint64_t dcb_addr = 0;
             uint32_t dcb_size = 0;
             if (mem_.load(dcb_addrs_ptr + i * 8, &dcb_addr, 8) != MemoryError::ok ||
                 mem_.load(dcb_sizes_ptr + i * 4, &dcb_size, 4) != MemoryError::ok ||
                 dcb_addr == 0 || dcb_size < 4 || dcb_size % 4 != 0 ||
-                gnm_context_->submit(dcb_addr, dcb_size / 4) != Pm4Status::ok) {
+                pending->submit(dcb_addr, dcb_size / 4) != Pm4Status::ok) {
                 return static_cast<std::uint64_t>(-1);
             }
         }
+        gnm_context_.swap(pending);
         submit_count_ += count;
         if (!gnm_context_->draw_calls().empty()) {
             rasterizer_.execute_draw_calls(mem_, gnm_context_->draw_calls(), &rasterizer_stats_);

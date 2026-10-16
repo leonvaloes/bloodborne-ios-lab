@@ -531,6 +531,26 @@ int main() {
         assert(m.store(dcb_size_table, &dcb_size_bytes, 4) == MemoryError::ok);
         assert(call("sceGnmSubmitCommandBuffers", 1, dcb_ptr_table, dcb_size_table) == 0);
         assert(rt.gnm_context()->draw_calls().size() == 1);
+        // Se o segundo IB falhar, o primeiro não pode apagar ou duplicar o draw
+        // aceito anteriormente. Nenhum contador deve avançar.
+        const std::uint64_t ibs[] = {dcb_addr, 0};
+        const std::uint32_t sizes[] = {sizeof(draw_cmds), sizeof(draw_cmds)};
+        assert(m.store(dcb_ptr_table, ibs, sizeof(ibs)) == MemoryError::ok);
+        assert(m.store(dcb_size_table, sizes, sizeof(sizes)) == MemoryError::ok);
+        assert(call("sceGnmSubmitCommandBuffers", 2, dcb_ptr_table, dcb_size_table) == UINT64_MAX);
+        assert(rt.submit_count() == 1);
+        assert(rt.gnm_context()->draw_calls().size() == 1);
+        // Mesmo um registro aplicado pelo primeiro IB deve sofrer rollback.
+        const std::uint32_t register_cmds[] = {0xC0016900, 0x200, 0x12345678};
+        const auto old_reg = rt.gnm_context()->context_reg(0x200);
+        assert(m.store(dcb_addr, register_cmds, sizeof(register_cmds)) == MemoryError::ok);
+        const std::uint32_t register_sizes[] = {sizeof(register_cmds), sizeof(register_cmds)};
+        assert(m.store(dcb_size_table, register_sizes, sizeof(register_sizes)) == MemoryError::ok);
+        assert(call("sceGnmSubmitCommandBuffers", 2, dcb_ptr_table, dcb_size_table) == UINT64_MAX);
+        assert(rt.gnm_context()->context_reg(0x200) == old_reg);
+        assert(rt.gnm_context()->draw_calls().size() == 1);
+        assert(rt.submit_count() == 1);
+        assert(m.store(dcb_ptr_table, &dcb_addr, 8) == MemoryError::ok);
         assert(m.store(dcb_addr, pm4_cmds, sizeof(pm4_cmds)) == MemoryError::ok);
         dcb_size_bytes = sizeof(pm4_cmds);
         assert(m.store(dcb_size_table, &dcb_size_bytes, 4) == MemoryError::ok);
