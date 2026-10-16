@@ -1213,7 +1213,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         bb::HostFrameBuffer guestFrame;
         if (_videoOutManager.read_current_frame_pixels(guestFrame) && guestFrame.valid &&
             guestFrame.bytes_per_pixel == 4 && guestFrame.width > 0 && guestFrame.height > 0 &&
-            guestFrame.pitch >= guestFrame.width &&
+            guestFrame.pitch >= guestFrame.width && !guestFrame.is_tiled &&
+            guestFrame.pixel_format == 0x80000000 &&
             guestFrame.pixel_data.size() >= static_cast<size_t>(guestFrame.pitch) * 4 * guestFrame.height) {
             _report[@"guest_frame_flipped"] = @YES;
             _report[@"guest_frame_seq"] = @(guestFrame.flip_sequence);
@@ -1247,7 +1248,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         } else {
             _guestScreenTexture = nil;
             _report[@"guest_frame_presented_to_metal"] = @NO;
-            _report[@"guest_frame_status"] = @"Sem pixels lineares BGRA8 verificáveis; flip não demonstra imagem.";
+            _report[@"guest_frame_status"] = @"Sem pixels BGRA8 lineares em formato/tiling aceitos; flip não demonstra imagem.";
         }
         _videoOutManager.consume_new_frame();
     }

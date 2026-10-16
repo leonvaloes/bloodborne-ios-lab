@@ -12,7 +12,7 @@ Data: 15/10/2026. Estado observado no código do laboratório, não prova de exe
 ## Bloqueios não resolvidos
 
 - O caminho GNM ainda **não executa draws até produzir pixels do jogo**: o parser e `GnmContext` acumulam estados/chamadas, mas não há execução desses draws em render target Metal. O modelo 3D de demonstração não é vídeo do jogo.
-- O registro HLE de VideoOut ainda assume quatro bytes por pixel, sem comprovar o formato e o layout da superfície (incluindo tiling). A cópia de bytes como BGRA8 **não prova** que a imagem é correta.
+- O registro HLE de VideoOut ainda assume quatro bytes por pixel, sem comprovar o formato e o layout da superfície (incluindo tiling). O host iOS só apresenta a cópia para buffers declarados `0x80000000`, quatro bytes por pixel e `tiling_mode=1`; isso evita exibir buffers marcados tiled como se fossem lineares, mas **não prova** correção de imagens do jogo.
 - A inicialização de módulos e os slices de CPU do app continuam síncronos no thread da UI. Adiar o auto-boot uma passagem do loop principal não elimina travamentos ou lentidão durante boot; desempenho e pico de memória devem ser medidos no iPhone.
 - Não há validação nesta revisão de instalação, abertura, menus, controles, áudio/vídeo do jogo, fluxos de progresso nem estabilidade em iPhone físico. O workflow gera um IPA **sem assinatura e sem dados comerciais**.
 
