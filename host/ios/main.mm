@@ -1044,6 +1044,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                 LabController *sSelf = weakSelf;
                 if (!sSelf) return;
                 sSelf->_guestBooting.store(false);
+                sSelf->_continuousExecution = NO;
+                [sSelf->_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
                 NSString *err = [NSString stringWithUTF8String:diag.last_error.c_str()];
                 sSelf->_gameBootStatus.text = [NSString stringWithFormat:@"Motor Bloodborne: FALHA: %@", err];
                 sSelf->_topStatusLabel.text = [NSString stringWithFormat:@"⚔ Falha: %@", err];
@@ -1053,6 +1055,9 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                     @"state": [NSString stringWithUTF8String:diag.state_name.c_str()],
                     @"active_modules": @(diag.modules_count),
                     @"total_steps": @(diag.total_steps),
+                    @"guest_mapped_bytes": @(diag.guest_mapped_bytes),
+                    @"guest_peak_mapped_bytes": @(diag.guest_peak_mapped_bytes),
+                    @"guest_budget_bytes": @(diag.guest_budget_bytes),
                     @"game_execution": @NO
                 };
                 sSelf->_report[@"game_execution"] = @NO;
