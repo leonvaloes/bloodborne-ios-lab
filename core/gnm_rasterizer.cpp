@@ -93,6 +93,8 @@ RasterizerStatus GnmRasterizer::execute_draw(
     RasterizerStats* out_stats
 ) {
     const auto& rt = draw_call.pipeline_state.render_targets.targets[0];
+    if (draw_call.pipeline_state.primitive_type != GnmPrimitiveType::TriList)
+        return RasterizerStatus::InvalidTopology;
     if (rt.base_address == 0 || rt.width == 0 || rt.height == 0) {
         return RasterizerStatus::InvalidRenderTarget;
     }

@@ -92,6 +92,9 @@ int main() { return run([] {
     bb::RasterizerStats stats{};
     auto invalid_draw_target = dc;
     invalid_draw_target.pipeline_state.render_targets.targets[0] = invalid_target;
+    auto unsupported_topology = dc;
+    unsupported_topology.pipeline_state.primitive_type = bb::GnmPrimitiveType::LineList;
+    CHECK(rasterizer.execute_draw(memory, unsupported_topology, &stats) == bb::RasterizerStatus::InvalidTopology);
     CHECK(rasterizer.execute_draw(memory, invalid_draw_target, &stats) == bb::RasterizerStatus::InvalidRenderTarget);
     CHECK(stats.pixels_written == 0);
     CHECK(rasterizer.execute_draw(memory, dc, &stats) == bb::RasterizerStatus::Ok);
