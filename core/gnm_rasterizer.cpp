@@ -120,12 +120,21 @@ RasterizerStatus GnmRasterizer::execute_draw(
         return RasterizerStatus::InvalidVertexBuffer;
     }
 
-    // 2. Extração de Índices se Indexado
+    // 2. Extração de Índices se Indexado. Limite de trabalho para não alocar
+    // diretamente quantidades arbitrárias controladas pelo guest.
+    constexpr std::uint32_t max_vertices_per_draw = 1'048'576;
+    const auto requested = draw_call.indexed ? draw_call.index_count :
+        (draw_call.vertex_count ? draw_call.vertex_count : vb_desc.num_records);
+    if (requested > max_vertices_per_draw) return RasterizerStatus::BufferOverflow;
     std::vector<std::uint32_t> indices;
     if (draw_call.indexed) {
         if (draw_call.index_buffer_address == 0 || draw_call.index_count == 0) {
             return RasterizerStatus::InvalidIndexBuffer;
         }
+        const std::uint64_t index_end = static_cast<std::uint64_t>(draw_call.start_index) + draw_call.index_count;
+        const std::uint64_t index_stride = draw_call.index_type == GnmIndexType::Index16 ? 2 : 4;
+        if (index_end > (UINT64_MAX - draw_call.index_buffer_address) / index_stride)
+            return RasterizerStatus::BufferOverflow;
         indices.resize(draw_call.index_count);
         if (draw_call.index_type == GnmIndexType::Index16) {
             for (std::uint32_t i = 0; i < draw_call.index_count; ++i) {
@@ -147,8 +156,9 @@ RasterizerStatus GnmRasterizer::execute_draw(
             }
         }
     } else {
-        std::uint32_t count = draw_call.vertex_count;
-        if (count == 0) count = vb_desc.num_records;
+        const std::uint32_t count = requested;
+        if (static_cast<std::uint64_t>(draw_call.start_index) + count > UINT32_MAX)
+            return RasterizerStatus::BufferOverflow;
         indices.resize(count);
         for (std::uint32_t i = 0; i < count; ++i) {
             indices[i] = draw_call.start_index + i;
@@ -158,6 +168,8 @@ RasterizerStatus GnmRasterizer::execute_draw(
     if (indices.size() < 3) {
         return RasterizerStatus::Ok; // Nada a desenhar
     }
+    // Somente triângulos completos são lidos pelo rasterizador.
+    indices.resize((indices.size() / 3) * 3);
 
     // 3. Parâmetros de Viewport e Scissor
     const auto& vp = draw_call.pipeline_state.viewports.viewports[0];
@@ -179,6 +191,19 @@ RasterizerStatus GnmRasterizer::execute_draw(
     int sc_right = sc.right > 0 ? std::min(static_cast<int>(rt.width) - 1, static_cast<int>(sc.right) - 1) : static_cast<int>(rt.width) - 1;
     int sc_top = std::max(0, static_cast<int>(sc.top));
     int sc_bottom = sc.bottom > 0 ? std::min(static_cast<int>(rt.height) - 1, static_cast<int>(sc.bottom) - 1) : static_cast<int>(rt.height) - 1;
+
+    // Validar antes de escrever qualquer pixel: não tratar leitura ausente
+    // como posição (0,0,0) e gerar triângulos falsos.
+    for (std::uint32_t index : indices) {
+        const std::uint64_t offset = static_cast<std::uint64_t>(index) * vb_desc.stride;
+        const std::uint64_t needed = vb_desc.stride >= 28 ? 28 : 12;
+        if (vb_desc.stride < 12 || offset > UINT64_MAX - vb_desc.base_address ||
+            vb_desc.base_address + offset > UINT64_MAX - needed)
+            return RasterizerStatus::InvalidVertexBuffer;
+        std::uint8_t probe[28]{};
+        if (memory.load(vb_desc.base_address + offset, probe, static_cast<std::size_t>(needed)) != MemoryError::ok)
+            return RasterizerStatus::InvalidVertexBuffer;
+    }
 
     // Função auxiliar para carregar um vértice da GuestMemory
     auto load_vertex = [&](std::uint32_t index) -> Vertex2D {

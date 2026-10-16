@@ -102,6 +102,18 @@ int main() { return run([] {
     CHECK(memory.load(corner_addr, px, 4) == bb::MemoryError::ok);
     CHECK(px[0] == 153 && px[1] == 102 && px[2] == 51 && px[3] == 255);
 
+    bb::DrawCall invalid = dc;
+    invalid.vertex_count = 1'048'577;
+    CHECK(rasterizer.execute_draw(memory, invalid) == bb::RasterizerStatus::BufferOverflow);
+    invalid.vertex_count = 3;
+    invalid.start_index = UINT32_MAX;
+    CHECK(rasterizer.execute_draw(memory, invalid) == bb::RasterizerStatus::BufferOverflow);
+    invalid.start_index = 10'000;
+    CHECK(rasterizer.execute_draw(memory, invalid) == bb::RasterizerStatus::InvalidVertexBuffer);
+    // Uma falha de vértices não pode alterar pixels já desenhados.
+    CHECK(memory.load(center_addr, px, 4) == bb::MemoryError::ok);
+    CHECK(px[0] == 0 && px[1] == 0 && px[2] == 255 && px[3] == 255);
+
     // =========================================================================
     // 3. Conexão e Verificação via VideoOutManager
     // =========================================================================
