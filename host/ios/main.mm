@@ -925,8 +925,9 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     desc.numberOfLines = 0;
     desc.textAlignment = NSTextAlignmentCenter;
     desc.text = @"O motor gráfico Metal e o escalonador estão ativos.\n"
-                @"Aguardando arquivos do jogo (eboot.bin, dvdroot_ps4) na pasta Documentos do BBHost.\n"
-                @"Transfira a pasta pelo iTunes, Apple Devices ou aplicativo Arquivos.";
+                @"Para testar a execução do jogo no iPhone, transfira eboot.bin e a pasta sce_module\n"
+                @"(ou o pacote completo com dvdroot_ps4) para a pasta Documentos do BBHost.\n"
+                @"Transfira pelo iTunes, AltStore, Apple Devices ou aplicativo Arquivos.";
 
     UIButton *exploreBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [exploreBtn setTitle:@"▶ Entrar no Modo Demonstração 3D" forState:UIControlStateNormal];
@@ -989,14 +990,13 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     }
     NSString *dataDir = [gameDir stringByAppendingPathComponent:@"dvdroot_ps4"];
     BOOL isDirectory = NO;
-    if (![[NSFileManager defaultManager] fileExistsAtPath:dataDir isDirectory:&isDirectory] || !isDirectory) {
-        _gameBootStatus.text = @"Motor: dvdroot_ps4 ausente; dados do jogo incompletos.";
-        [self showWelcomeCard];
-        _guestBooting.store(false);
-        return;
+    const BOOL hasDvdroot = [[NSFileManager defaultManager] fileExistsAtPath:dataDir isDirectory:&isDirectory] && isDirectory;
+    _report[@"has_dvdroot_ps4"] = @(hasDvdroot);
+    if (!hasDvdroot) {
+        _gameBootStatus.text = @"Iniciando motor e módulos em segundo plano (sem dvdroot_ps4)...";
+    } else {
+        _gameBootStatus.text = @"Iniciando motor e pacotes em segundo plano...";
     }
-
-    _gameBootStatus.text = @"Iniciando motor e módulos em segundo plano...";
     _topStatusLabel.text = @"⚙ Carregando módulos...";
 
     bb::BootConfig config;
@@ -1691,6 +1691,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 }
 
 - (void)exportReport:(UIButton *)sender {
+    if (_bootCoordinator) {
+        auto diag = _bootCoordinator->diagnostics();
+        [self updateCoordinatorReportAndUI:diag executedSteps:0];
+    }
     [self checkDocumentsInventory];
     [self checkDocument];
     [self checkGameAsset];
