@@ -266,7 +266,15 @@ RasterizerStatus GnmRasterizer::execute_draw(
         Vertex2D v1 = load_vertex(indices[prim * 3 + 1]);
         Vertex2D v2 = load_vertex(indices[prim * 3 + 2]);
 
+        // Coordenadas guest não finitas/fora de int não podem chegar às
+        // conversões de floor/ceil para pixel (UB em float -> int).
+        auto safe = [](const Vertex2D& v) {
+            return std::isfinite(v.x) && std::isfinite(v.y) &&
+                   std::abs(v.x) < 1.0e7f && std::abs(v.y) < 1.0e7f;
+        };
+        if (!safe(v0) || !safe(v1) || !safe(v2)) return RasterizerStatus::InvalidVertexBuffer;
         float area = edge_function(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
+        if (!std::isfinite(area)) return RasterizerStatus::InvalidVertexBuffer;
         if (std::abs(area) < 1e-5f) continue; // Triângulo degenerado
 
         int min_x = std::max(sc_left, static_cast<int>(std::floor(std::min({v0.x, v1.x, v2.x}))));

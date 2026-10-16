@@ -3,6 +3,7 @@
 #include "video_out.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 int main() { return run([] {
@@ -118,6 +119,12 @@ int main() { return run([] {
     invalid.start_index = 10'000;
     CHECK(rasterizer.execute_draw(memory, invalid) == bb::RasterizerStatus::InvalidVertexBuffer);
     // Uma falha de vértices não pode alterar pixels já desenhados.
+    CHECK(memory.load(center_addr, px, 4) == bb::MemoryError::ok);
+    CHECK(px[0] == 0 && px[1] == 0 && px[2] == 255 && px[3] == 255);
+    auto bad_vertex = triangle[0];
+    bad_vertex.x = std::numeric_limits<float>::quiet_NaN();
+    CHECK(memory.store(0x50000, &bad_vertex, sizeof(bad_vertex)) == bb::MemoryError::ok);
+    CHECK(rasterizer.execute_draw(memory, dc) == bb::RasterizerStatus::InvalidVertexBuffer);
     CHECK(memory.load(center_addr, px, 4) == bb::MemoryError::ok);
     CHECK(px[0] == 0 && px[1] == 0 && px[2] == 255 && px[3] == 255);
 
