@@ -108,6 +108,7 @@ GameBootCoordinator::~GameBootCoordinator() {
 }
 
 void GameBootCoordinator::reset() {
+    paused_ = false;
     if (save_initialized_) {
         SaveDataManager::instance().umount(save_mount_point_, false);
         SaveDataManager::instance().terminate();
@@ -181,6 +182,9 @@ bool GameBootCoordinator::phase1_mount_packages(const BootConfig& config) {
     } else if (std::filesystem::exists(dvdroot_path, ec) && std::filesystem::is_directory(dvdroot_path, ec)) {
         vfs_->mount("/dvdroot", dvdroot_path.string(), true);
     }
+
+    // Registra contêineres e stubs sintéticos defensivos (shader/gui) no VFS para evitar ponteiros nulos
+    package_mgr_.synthesize_defensive_stubs(*vfs_);
 
     package_report_ = package_mgr_.verify_essential_assets(config_.essential_asset_paths);
 
@@ -305,6 +309,7 @@ bool GameBootCoordinator::phase3_load_modules(const BootConfig& config) {
 
     try {
         guest_memory_ = std::make_unique<GuestMemory>(config_.guest_memory_size);
+        guest_memory_->set_protect_header_page(true);
         image_ = Ps4Loader::load(*guest_memory_, eboot_data, modules);
     } catch (const std::exception& e) {
         state_ = BootState::error;
@@ -337,6 +342,7 @@ bool GameBootCoordinator::phase4_initialize_runtime(const BootConfig& config) {
     }
 
     runtime_ = std::make_unique<OrbisRuntime>(*guest_memory_);
+    runtime_->attach_vfs(vfs_.get());
     runtime_->set_procparam(image_.procparam);
     if (video_out_) {
         runtime_->attach_video_out(video_out_);
@@ -344,6 +350,11 @@ bool GameBootCoordinator::phase4_initialize_runtime(const BootConfig& config) {
     if (input_manager_) {
         runtime_->pad_manager().set_default_input(input_manager_);
     }
+    std::filesystem::path save_path = !config_.save_dir.empty()
+        ? std::filesystem::u8path(config_.save_dir)
+        : (std::filesystem::u8path(config_.base_dir) / "savedata");
+    runtime_->save_data_manager().initialize(save_path.string(), config_.save_quota_bytes, vfs_.get());
+    runtime_->save_data_manager().set_default_title_id(config_.title_id);
 
     // Inicializa os módulos carregados na ordem topológica de dependência
     for (std::size_t i = 0; i < image_.modules.size(); ++i) {
@@ -468,6 +479,21 @@ bool GameBootCoordinator::phase4_initialize_runtime(const BootConfig& config) {
             return false;
         });
 
+        scheduler_->set_fault_handler([this](GuestScheduler& /*s*/, GuestScheduler::Id tid, CpuState& st, const CpuRunResult& res) -> bool {
+            // Defensive handling for GUI initialization dereference when shader/gui objects are uninitialized or missing:
+            // rip 0x121a2da5: mov rax, [r14] where r14 is offset (0x68) from null object
+            if (st.rip == 0x121a2da5 && st.gpr[14] < 0x10000) {
+                // The function at 121a2d87 checks 'test r14, r14; je 0x121a2e00'.
+                // If r14 is an offset on null (< 0x10000), jump cleanly to 0x121a2e00:
+                st.gpr[0] = 8;
+                st.rip = 0x121a2e00;
+                return true;
+            }
+            std::printf("[FAULT HANDLER] Unhandled fault: tid=%u rip=0x%llx fault_addr=0x%llx desc=%s\n",
+                        tid, (unsigned long long)st.rip, (unsigned long long)res.fault_address, res.describe().c_str());
+            return false;
+        });
+
         scheduler_->adopt(cpu_->state, Ps4Bootstrap::stack_base,
                           Ps4Bootstrap::stack_base + Ps4Bootstrap::stack_size);
     }
@@ -477,6 +503,9 @@ bool GameBootCoordinator::phase4_initialize_runtime(const BootConfig& config) {
 }
 
 std::uint64_t GameBootCoordinator::step(std::uint64_t max_steps) {
+    if (paused_) {
+        return 0;
+    }
     if (state_ == BootState::modules_initialized) {
         state_ = BootState::running;
     }
@@ -694,6 +723,20 @@ const PackageInspectionReport& GameBootCoordinator::package_report() const {
 
 const std::string& GameBootCoordinator::last_error() const {
     return error_message_;
+}
+
+void GameBootCoordinator::pause() {
+    paused_ = true;
+    AudioOutManager::instance().set_paused(true);
+}
+
+void GameBootCoordinator::resume() {
+    paused_ = false;
+    AudioOutManager::instance().set_paused(false);
+}
+
+bool GameBootCoordinator::is_paused() const {
+    return paused_;
 }
 
 } // namespace bb

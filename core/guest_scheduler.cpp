@@ -58,6 +58,7 @@ void GuestScheduler::block(Id id, Wait kind, Id object, std::uint64_t timeout, s
 std::int32_t GuestScheduler::resume(Id id) const { auto* t=find(id); return t?t->result:ORBIS_KERNEL_ERROR_ESRCH; }
 GuestScheduler::State GuestScheduler::state(Id id) const { auto* t=find(id); return t?t->state:State::faulted; }
 const CpuState& GuestScheduler::cpu(Id id) const { auto* t=find(id); if (!t) throw std::out_of_range("guest thread"); return t->cpu; }
+CpuState& GuestScheduler::cpu(Id id) { auto* t=find(id); if (!t) throw std::out_of_range("guest thread"); return t->cpu; }
 std::uint64_t GuestScheduler::value(Id id) const { auto* t=find(id); if (!t) throw std::out_of_range("guest thread"); return t->result_value; }
 std::int32_t GuestScheduler::exit(Id id, std::uint64_t v) {
     auto* t=find(id); if (!t) return ORBIS_KERNEL_ERROR_ESRCH;
@@ -390,6 +391,12 @@ GuestScheduler::Result GuestScheduler::run(std::uint64_t max_steps) {
         if (res.stop==CpuStop::trap && trap_) {
             // Trap handler may only change scheduler state; it must not call run().
             if (!trap_(*this,id,t.cpu)) { t.state=State::faulted; out.stop=Stop::fault; return out; }
+        } else if (res.stop == CpuStop::memory_fault && fault_handler_) {
+            if (!fault_handler_(*this, id, t.cpu, res)) {
+                t.state = State::faulted;
+                out.stop = Stop::fault;
+                return out;
+            }
         } else if (res.stop!=CpuStop::step_limit) { t.state=State::faulted; out.stop=Stop::fault; return out; }
         if (t.state==State::ready) ready_.push_back(id);
         advance(res.steps); // one virtual microsecond per retired instruction

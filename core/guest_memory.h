@@ -51,6 +51,9 @@ public:
     MemoryError atomic_compare_exchange_u64(std::uint64_t address, std::uint64_t& expected, std::uint64_t desired, bool& success);
     MemoryError atomic_compare_exchange_u32(std::uint64_t address, std::uint32_t& expected, std::uint32_t desired, bool& success);
 
+    bool protect_header_page() const { return protect_header_page_; }
+    void set_protect_header_page(bool enable) { protect_header_page_ = enable; }
+
 private:
     struct Region { MemoryBuffer bytes; unsigned permissions; };
     using Regions = std::map<std::uint64_t, Region>;
@@ -58,5 +61,6 @@ private:
     mutable std::mutex mutex_;
     Regions regions_;
     std::size_t budget_, used_ = 0, peak_used_ = 0;
+    bool protect_header_page_ = false;
 };
 }

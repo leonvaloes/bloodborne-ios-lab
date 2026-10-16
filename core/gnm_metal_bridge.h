@@ -334,9 +334,15 @@ public:
     // Bounds checking
     bool is_buffer_address_valid(std::uint64_t address, std::size_t size) const;
 
+    // Shaders MSL de fallback para geometria 3D, normais e texturas (T015)
+    static CachedShader get_fallback_shader(ShaderStage stage);
+    void set_allow_fallback_shaders(bool allow) { allow_fallback_ = allow; }
+    bool allow_fallback_shaders() const { return allow_fallback_; }
+
 private:
     const GuestMemory& memory_;
     ShaderCache shader_cache_;
+    bool allow_fallback_{false};
 
     MetalResourceBindings vs_bindings_{};
     MetalResourceBindings ps_bindings_{};

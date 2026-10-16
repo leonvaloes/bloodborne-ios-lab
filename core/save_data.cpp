@@ -302,32 +302,53 @@ bool SaveDataManager::atomic_commit_directory(const std::string &staging_dir, co
         return false;
     }
 
-    // Passo 2: Troca atomica (atomic rename)
+    // Passo 2: Troca atomica (atomic rename) com fallback seguro para Windows
     bool dest_existed = std::filesystem::exists(dest, ec);
     if (dest_existed) {
         std::filesystem::rename(dest, bak_dir, ec);
         if (ec) {
+            ec.clear();
+            std::filesystem::copy(dest, bak_dir, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+            if (!ec) {
+                std::filesystem::remove_all(dest, ec);
+            }
+        }
+        if (ec) {
             std::filesystem::remove_all(temp_dir, ec);
             return false;
         }
 
+        ec.clear();
         std::filesystem::rename(temp_dir, dest, ec);
         if (ec) {
-            // Rollback: restaura backup
-            std::error_code r_ec;
-            std::filesystem::rename(bak_dir, dest, r_ec);
-            std::filesystem::remove_all(temp_dir, r_ec);
-            return false;
+            // Fallback de copia se rename falhar temporariamente por lock no Windows
+            ec.clear();
+            std::filesystem::create_directories(dest, ec);
+            std::filesystem::copy(temp_dir, dest, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) {
+                // Rollback: restaura backup
+                std::error_code r_ec;
+                std::filesystem::rename(bak_dir, dest, r_ec);
+                std::filesystem::remove_all(temp_dir, r_ec);
+                return false;
+            }
         }
 
-        // Remocao do backup apos substituicao concluida com sucesso
+        // Remocao do backup e do temp apos substituicao concluida com sucesso
+        std::filesystem::remove_all(temp_dir, ec);
         std::filesystem::remove_all(bak_dir, ec);
     } else {
         std::filesystem::rename(temp_dir, dest, ec);
         if (ec) {
-            std::filesystem::remove_all(temp_dir, ec);
-            return false;
+            ec.clear();
+            std::filesystem::create_directories(dest, ec);
+            std::filesystem::copy(temp_dir, dest, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) {
+                std::filesystem::remove_all(temp_dir, ec);
+                return false;
+            }
         }
+        std::filesystem::remove_all(temp_dir, ec);
     }
 
     return true;
@@ -577,8 +598,12 @@ int32_t SaveDataManager::write_file(const std::string &mount_point, const std::s
     }
 
     if (atomic) {
+        // Protocolo de gravação em 4 fases: tmp -> checksum -> backup -> rename atômico (T025)
         auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
         std::filesystem::path tmp = target.string() + ".tmp." + std::to_string(ts);
+        std::filesystem::path bak = target.string() + ".bak." + std::to_string(ts);
+
+        // Fase 1: Escrita no arquivo temporário .tmp
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
             if (!out.is_open()) return SCE_SAVEDATA_ERROR_INTERNAL;
@@ -591,15 +616,52 @@ int32_t SaveDataManager::write_file(const std::string &mount_point, const std::s
                 return SCE_SAVEDATA_ERROR_INTERNAL;
             }
         }
+
+        // Fase 2: Verificação de integridade via checksum CRC32 dos dados gravados
+        if (size > 0 && data) {
+            std::ifstream in(tmp, std::ios::binary);
+            if (!in.is_open()) {
+                std::filesystem::remove(tmp, ec);
+                return SCE_SAVEDATA_ERROR_INTERNAL;
+            }
+            std::vector<uint8_t> verify_buf(size);
+            in.read(reinterpret_cast<char *>(verify_buf.data()), static_cast<std::streamsize>(size));
+            if (!in.good() && !in.eof()) {
+                std::filesystem::remove(tmp, ec);
+                return SCE_SAVEDATA_ERROR_INTERNAL;
+            }
+            uint32_t expected_crc = VirtualFileSystem::compute_crc32(data, size);
+            uint32_t actual_crc = VirtualFileSystem::compute_crc32(verify_buf.data(), verify_buf.size());
+            if (expected_crc != actual_crc) {
+                std::filesystem::remove(tmp, ec);
+                return SCE_SAVEDATA_ERROR_INTERNAL;
+            }
+        }
+
+        // Fase 3: Backup do arquivo de destino existente para .bak
+        bool target_existed = std::filesystem::exists(target, ec);
+        if (target_existed) {
+            std::filesystem::copy_file(target, bak, std::filesystem::copy_options::overwrite_existing, ec);
+        }
+
+        // Fase 4: Rename atômico de .tmp para target com garantia de rollback
         std::filesystem::rename(tmp, target, ec);
         if (ec) {
             std::filesystem::remove(target, ec);
             std::filesystem::rename(tmp, target, ec);
             if (ec) {
+                if (target_existed) {
+                    std::error_code r_ec;
+                    std::filesystem::copy_file(bak, target, std::filesystem::copy_options::overwrite_existing, r_ec);
+                }
                 std::filesystem::remove(tmp, ec);
+                std::filesystem::remove(bak, ec);
                 return SCE_SAVEDATA_ERROR_INTERNAL;
             }
         }
+
+        // Limpeza do backup após rename com sucesso
+        std::filesystem::remove(bak, ec);
     } else {
         std::ofstream out(target, std::ios::binary | std::ios::trunc);
         if (!out.is_open()) return SCE_SAVEDATA_ERROR_INTERNAL;

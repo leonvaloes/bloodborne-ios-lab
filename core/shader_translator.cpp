@@ -620,4 +620,99 @@ std::vector<uint32_t> ShaderTranslator::build_lit_textured_spirv() {
     return build_basic_fragment_spirv();
 }
 
+std::string ShaderTranslator::fallback_geometry_vertex_msl() {
+    return R"(#include <metal_stdlib>
+using namespace metal;
+
+struct VertexInput {
+    float3 position  [[attribute(0)]];
+    float3 normal    [[attribute(1)]];
+    float4 tangent   [[attribute(2)]];
+    float2 uv        [[attribute(3)]];
+};
+
+struct VertexOutput {
+    float4 position [[position]];
+    float3 normal;
+    float2 uv;
+    float3 world_pos;
+};
+
+struct SceneUniforms {
+    float4x4 view_proj;
+    float4x4 model;
+};
+
+vertex VertexOutput vertex_main(VertexInput in [[stage_in]],
+                                constant SceneUniforms& uniforms [[buffer(1)]]) {
+    VertexOutput out;
+    float4 world = uniforms.model * float4(in.position, 1.0);
+    out.world_pos = world.xyz;
+    out.position = uniforms.view_proj * world;
+    out.normal = (uniforms.model * float4(in.normal, 0.0)).xyz;
+    out.uv = in.uv;
+    return out;
+}
+)";
+}
+
+std::string ShaderTranslator::fallback_geometry_fragment_msl() {
+    return R"(#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOutput {
+    float4 position [[position]];
+    float3 normal;
+    float2 uv;
+    float3 world_pos;
+};
+
+fragment float4 fragment_main(VertexOutput in [[stage_in]],
+                              texture2d<float> diffuse_tex [[texture(0)]],
+                              sampler s [[sampler(0)]]) {
+    float3 light_dir = normalize(float3(0.5, 1.0, 0.3));
+    float3 n = normalize(in.normal);
+    float diff = max(dot(n, light_dir), 0.2);
+    float4 tex_color = diffuse_tex.sample(s, in.uv);
+    return float4(tex_color.rgb * diff, tex_color.a);
+}
+)";
+}
+
+std::string ShaderTranslator::fallback_fullscreen_vertex_msl() {
+    return R"(#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex VertexOut vertex_main(uint vid [[vertex_id]]) {
+    VertexOut out;
+    float2 uv = float2((vid << 1) & 2, vid & 2);
+    out.position = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = float2(uv.x, 1.0 - uv.y);
+    return out;
+}
+)";
+}
+
+std::string ShaderTranslator::fallback_fullscreen_fragment_msl() {
+    return R"(#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+fragment float4 fragment_main(VertexOut in [[stage_in]],
+                              texture2d<float> tex [[texture(0)]],
+                              sampler s [[sampler(0)]]) {
+    return tex.sample(s, in.uv);
+}
+)";
+}
+
 } // namespace bb

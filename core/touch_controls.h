@@ -230,6 +230,17 @@ public:
     void set_haptic_callback(HapticCallback cb);
     std::vector<HapticEvent> poll_haptic_events();
 
+    // Visibilidade, translucidez e auto-ocultação na presença de gamepad (T020, T022)
+    void set_opacity(float opacity);
+    float get_opacity() const;
+    void set_visible(bool visible);
+    bool is_visible() const;
+    void set_gamepad_connected(bool connected);
+    bool is_gamepad_connected() const;
+    void set_auto_hide_on_gamepad(bool enable);
+    bool is_auto_hide_on_gamepad() const;
+    void fade_update(float delta_time_sec);
+
 private:
     void recalculate_layout_locked();
     bool on_touch_locked(const TouchPoint& touch);
@@ -256,6 +267,12 @@ private:
     HapticEvent current_haptic_{};
     std::vector<HapticEvent> haptic_history_{};
     HapticCallback haptic_callback_{nullptr};
+
+    float default_opacity_{0.65f};
+    float current_opacity_{0.65f};
+    bool visible_{true};
+    bool gamepad_connected_{false};
+    bool auto_hide_on_gamepad_{true};
 };
 
 } // namespace bb

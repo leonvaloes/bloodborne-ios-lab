@@ -12,6 +12,8 @@
 
 namespace bb {
 
+class Atrac9Decoder;
+
 // Constantes do subsistema SCE AudioOut (compatíveis com libSceAudioOut no Orbis OS)
 
 enum SceAudioOutPortType : std::int32_t {
@@ -100,6 +102,12 @@ public:
     // Guest memory:
     std::int32_t output_hle(std::int32_t handle, const GuestMemory &mem, std::uint64_t guest_addr, std::size_t frames = 0);
 
+    // Submissão de áudio comprimido ATRAC9 com decodificação para PCM estéreo 48 kHz
+    std::int32_t output_atrac9(std::int32_t handle, const std::uint8_t *at9_stream, std::size_t size,
+                               const std::uint8_t config[4] = nullptr);
+    std::int32_t output_hle_atrac9(std::int32_t handle, const GuestMemory &mem, std::uint64_t guest_addr,
+                                   std::size_t size, const std::uint8_t config[4] = nullptr);
+
     // Configuração de atenuação / ganho estereofônico
     std::int32_t set_volume(std::int32_t handle, std::int32_t flag, const std::int32_t *vol);
     std::int32_t set_volume(std::int32_t handle, std::int32_t flag, int32_t *vol);
@@ -108,6 +116,10 @@ public:
     // Diagnóstico e tempo
     std::int32_t get_port_info(std::int32_t handle, SceAudioOutPortInfo *info) const;
     std::int32_t get_last_output_time(std::int32_t handle, std::uint64_t *output_time) const;
+
+    // Controle de suspensao/retomada cooperativa de audio (ciclo de vida iOS)
+    void set_paused(bool paused);
+    bool is_paused() const;
 
     // Drenagem do ring buffer interno (para consumidor host / testes)
     std::size_t drain_port_pcm16(std::int32_t handle, std::int16_t *out_samples, std::size_t frames);
@@ -139,6 +151,7 @@ private:
         std::uint64_t last_output_time_us{0};
         bool is_open{false};
         std::unique_ptr<AudioRingBuffer> ring_buffer;
+        std::unique_ptr<Atrac9Decoder> atrac9_decoder;
         mutable std::mutex mutex;
     };
 
@@ -148,6 +161,7 @@ private:
     std::unordered_map<std::int32_t, std::unique_ptr<PortEntry>> ports_;
     std::int32_t next_handle_{1};
     TimeProvider time_provider_{nullptr};
+    bool paused_{false};
 };
 
 // Funções globais HLE estilo SCE C para libSceAudioOut
@@ -157,6 +171,10 @@ std::int32_t sceAudioOutOpen(std::int32_t userId, std::int32_t type, std::int32_
 std::int32_t sceAudioOutClose(std::int32_t handle);
 std::int32_t sceAudioOutOutput(std::int32_t handle, const void *ptr);
 std::int32_t sceAudioOutOutputHle(std::int32_t handle, const GuestMemory &mem, std::uint64_t guest_addr);
+std::int32_t sceAudioOutOutputAtrac9(std::int32_t handle, const std::uint8_t *at9_stream, std::size_t size,
+                                     const std::uint8_t config[4] = nullptr);
+std::int32_t sceAudioOutOutputHleAtrac9(std::int32_t handle, const GuestMemory &mem, std::uint64_t guest_addr,
+                                        std::size_t size, const std::uint8_t config[4] = nullptr);
 std::int32_t sceAudioOutSetVolume(std::int32_t handle, std::int32_t flag, const std::int32_t *vol);
 std::int32_t sceAudioOutSetVolume(std::int32_t handle, std::int32_t flag, int32_t *vol);
 std::int32_t sceAudioOutGetPortInfo(std::int32_t handle, SceAudioOutPortInfo *info);

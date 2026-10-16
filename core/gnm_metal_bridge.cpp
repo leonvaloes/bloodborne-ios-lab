@@ -1,5 +1,6 @@
 #include "gnm_metal_bridge.h"
 #include "guest_memory.h"
+#include "shader_translator.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -480,29 +481,78 @@ bool GnmMetalBridge::is_buffer_address_valid(std::uint64_t address, std::size_t 
     return err == MemoryError::ok;
 }
 
+CachedShader GnmMetalBridge::get_fallback_shader(ShaderStage stage) {
+    CachedShader cs;
+    cs.stage = stage;
+    switch (stage) {
+        case ShaderStage::Vertex:
+            cs.hash = 0xFB000001ULL;
+            cs.msl_source = ShaderTranslator::fallback_geometry_vertex_msl();
+            cs.instruction_count = 16;
+            cs.byte_size = cs.msl_source.size();
+            cs.bound_buffers = {0, 1};
+            break;
+        case ShaderStage::Pixel:
+            cs.hash = 0xFB000002ULL;
+            cs.msl_source = ShaderTranslator::fallback_geometry_fragment_msl();
+            cs.instruction_count = 16;
+            cs.byte_size = cs.msl_source.size();
+            cs.bound_textures = {0};
+            cs.bound_samplers = {0};
+            break;
+        case ShaderStage::Compute:
+            cs.hash = 0xFB000003ULL;
+            cs.msl_source = "#include <metal_stdlib>\nusing namespace metal;\nkernel void cs_fallback(uint tid [[thread_position_in_grid]]) {}\n";
+            cs.instruction_count = 4;
+            cs.byte_size = cs.msl_source.size();
+            break;
+    }
+    return cs;
+}
+
 BridgeResult<MetalDrawCommand> GnmMetalBridge::process_draw_call(const DrawCall& draw_call) {
     MetalDrawCommand cmd{};
 
     // Validar VS
     if (draw_call.pipeline_state.vs_program_address == 0) {
-        return {BridgeError::InvalidShaderAddress, "vertex shader address is zero"};
+        if (allow_fallback_) {
+            CachedShader fb = get_fallback_shader(ShaderStage::Vertex);
+            cmd.pipeline_config.vs_hash = fb.hash;
+            cmd.pipeline_config.vs_msl = fb.msl_source;
+        } else {
+            return {BridgeError::InvalidShaderAddress, "vertex shader address is zero"};
+        }
+    } else {
+        auto vs_result = shader_cache_.get_or_compile(memory_, draw_call.pipeline_state.vs_program_address, ShaderStage::Vertex);
+        if (!vs_result) {
+            if (allow_fallback_) {
+                CachedShader fb = get_fallback_shader(ShaderStage::Vertex);
+                cmd.pipeline_config.vs_hash = fb.hash;
+                cmd.pipeline_config.vs_msl = fb.msl_source;
+            } else {
+                return {vs_result.error, vs_result.message};
+            }
+        } else {
+            cmd.pipeline_config.vs_hash = vs_result.value->hash;
+            cmd.pipeline_config.vs_msl = vs_result.value->msl_source;
+        }
     }
-
-    auto vs_result = shader_cache_.get_or_compile(memory_, draw_call.pipeline_state.vs_program_address, ShaderStage::Vertex);
-    if (!vs_result) {
-        return {vs_result.error, vs_result.message};
-    }
-    cmd.pipeline_config.vs_hash = vs_result.value->hash;
-    cmd.pipeline_config.vs_msl = vs_result.value->msl_source;
 
     // Validar PS (pode ser null para passagens apenas de depth)
     if (draw_call.pipeline_state.ps_program_address != 0) {
         auto ps_result = shader_cache_.get_or_compile(memory_, draw_call.pipeline_state.ps_program_address, ShaderStage::Pixel);
         if (!ps_result) {
-            return {ps_result.error, ps_result.message};
+            if (allow_fallback_) {
+                CachedShader fb = get_fallback_shader(ShaderStage::Pixel);
+                cmd.pipeline_config.ps_hash = fb.hash;
+                cmd.pipeline_config.ps_msl = fb.msl_source;
+            } else {
+                return {ps_result.error, ps_result.message};
+            }
+        } else {
+            cmd.pipeline_config.ps_hash = ps_result.value->hash;
+            cmd.pipeline_config.ps_msl = ps_result.value->msl_source;
         }
-        cmd.pipeline_config.ps_hash = ps_result.value->hash;
-        cmd.pipeline_config.ps_msl = ps_result.value->msl_source;
     }
 
     // Validar index buffer (se indexado)

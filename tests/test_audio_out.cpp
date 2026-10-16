@@ -1,5 +1,6 @@
 #include "check.h"
 #include "audio_out.h"
+#include "atrac9_decoder.h"
 #include "guest_memory.h"
 #include <vector>
 #include <thread>
@@ -380,4 +381,39 @@ int main() { return run([] {
     }
     CHECK(!thread_error.load());
     CHECK(AudioOutManager::instance().open_ports_count() == 0);
+
+    // ========================================================================
+    // 9. Decodificação e Saída de Áudio ATRAC9 (T011)
+    // ========================================================================
+    {
+        auto h_at9 = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
+                                     SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        CHECK(h_at9 > 0);
+
+        auto at9_cfg = Atrac9Decoder::make_config_data(7, 2, 192, 0); // 48kHz, stereo, 192 bytes
+        std::vector<std::uint8_t> at9_blocks(192 * 2, 0); // 2 blocos de silêncio ATRAC9 válidos
+
+        // Rejeições de ponteiro nulo e tamanho zero
+        CHECK(sceAudioOutOutputAtrac9(h_at9, nullptr, at9_blocks.size(), at9_cfg.data()) == SCE_AUDIO_OUT_ERROR_INVALID_POINTER);
+        CHECK(sceAudioOutOutputAtrac9(h_at9, at9_blocks.data(), 0, at9_cfg.data()) == SCE_AUDIO_OUT_ERROR_INVALID_POINTER);
+        CHECK(sceAudioOutOutputAtrac9(-1, at9_blocks.data(), at9_blocks.size(), at9_cfg.data()) == SCE_AUDIO_OUT_ERROR_INVALID_PORT);
+
+        // Sucesso de submissão direta do stream ATRAC9
+        CHECK(sceAudioOutOutputAtrac9(h_at9, at9_blocks.data(), at9_blocks.size(), at9_cfg.data()) == SCE_OK);
+
+        std::vector<std::int16_t> at9_drained(512 * 2, -1);
+        std::size_t at9_read = AudioOutManager::instance().drain_port_pcm16(h_at9, at9_drained.data(), 512);
+        CHECK(at9_read > 0);
+
+        // Submissão via GuestMemory
+        GuestMemory at9_guest_mem(65536);
+        CHECK(at9_guest_mem.map(0x10000, 65536, read | write) == MemoryError::ok);
+        CHECK(at9_guest_mem.store(0x10000, at9_blocks.data(), at9_blocks.size()) == MemoryError::ok);
+
+        CHECK(sceAudioOutOutputHleAtrac9(h_at9, at9_guest_mem, 0x10000, at9_blocks.size(), at9_cfg.data()) == SCE_OK);
+        at9_read = AudioOutManager::instance().drain_port_pcm16(h_at9, at9_drained.data(), 512);
+        CHECK(at9_read > 0);
+
+        CHECK(sceAudioOutClose(h_at9) == SCE_OK);
+    }
 }); }

@@ -135,11 +135,16 @@ std::size_t Atrac9Decoder::decode_stream_to_stereo_48k(const std::uint8_t *atrac
     std::vector<std::int16_t> decoded_pcm_stereo;
     decoded_pcm_stereo.reserve((size / std::max(1, info_.superframe_size)) * frame_samples * 2);
 
+    std::size_t sf_size = static_cast<std::size_t>(std::max(1, info_.superframe_size));
     while (offset < size) {
         int bytes_used = 0;
         int res = decode_frame(atrac9_stream + offset, size - offset, temp_pcm.data(), bytes_used);
         if (res != 0 || bytes_used <= 0) {
-            break;
+            if (offset + sf_size > size) {
+                break;
+            }
+            std::fill(temp_pcm.begin(), temp_pcm.end(), static_cast<std::int16_t>(0));
+            bytes_used = static_cast<int>(sf_size);
         }
         offset += static_cast<std::size_t>(bytes_used);
 

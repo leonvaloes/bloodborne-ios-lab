@@ -14,3 +14,20 @@ eboot.bin
 
 ios-artifact/
 ios-artifact*/
+*.log
+*.tmp
+logs/
+automation/supervisor.lock
+automation/STOP
+automation/NEEDS_HUMAN.md
+automation/READY_FOR_CI.flag
+automation/CI_FEEDBACK.md
+automation/CI_APPROVED.json
+automation/DELIVERY_AUTOMATIZADA.md
+
+# Workspace governance mirrors and test binaries
+.specify/
+specs/
+tools/*.exe
+tools/*.bin
+

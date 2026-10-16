@@ -19,9 +19,11 @@ public:
     struct Result { Stop stop; std::uint64_t steps; Id thread; CpuRunResult cpu; };
     struct Callback { std::uint64_t function, argument; };
     using Trap = std::function<bool(GuestScheduler&, Id, CpuState&)>;
+    using FaultHandler = std::function<bool(GuestScheduler&, Id, CpuState&, const CpuRunResult&)>;
     explicit GuestScheduler(GuestMemory& memory, std::uint64_t quantum = 256);
     void add_trap_range(std::uint64_t base, std::uint64_t size);
     void set_trap(Trap trap) { trap_ = std::move(trap); }
+    void set_fault_handler(FaultHandler handler) { fault_handler_ = std::move(handler); }
     // Caller maps disjoint stacks; create() places the return trap at the
     // SysV entry rsp (rsp % 16 == 8), with [rsp, rsp+8) inside the stack.
     Id create(std::uint64_t entry, std::uint64_t stack_bottom, std::uint64_t stack_top,
@@ -38,6 +40,7 @@ public:
     std::int32_t cancel(Id id);
     State state(Id id) const;
     const CpuState& cpu(Id id) const;
+    CpuState& cpu(Id id);
     std::uint64_t value(Id id) const;
     Result run(std::uint64_t max_steps);
     void advance(std::uint64_t microseconds);
@@ -127,6 +130,7 @@ private:
     std::vector<Callback> atexit_;
     std::deque<Id> ready_;
     Trap trap_;
+    FaultHandler fault_handler_{};
     bool running_ = false;
 };
 } // namespace bb

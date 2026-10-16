@@ -16,6 +16,7 @@
 #include "vfs.h"
 #include "video_out.h"
 #include "touch_controls.h"
+#include "pacing_tracker.h"
 #include <exception>
 #include <sys/utsname.h>
 #include <simd/simd.h>
@@ -111,6 +112,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     UILabel *_bootStatus;
     UILabel *_gameBootStatus;
     UIButton *_gameBootButton;
+    UIButton *_continueSaveButton;
     UIButton *_continuousButton;
 
     // Estado de execução do motor
@@ -151,7 +153,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     float _angle;
     float _cameraPitch;
     std::chrono::steady_clock::time_point _lastFrameTime;
-    bb::FramePacingTracker _pacingTracker;
+    bb::PacingTracker _pacingTracker{120, 30.0};
     bb::MemoryMonitor _memoryMonitor;
     uint32_t _modelVertexCount;
     uint32_t _modelTriangleCount;
@@ -227,6 +229,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     [self setupDrawerMenu];
     [self setupGameControllers];
     [self setupAudio];
+    [self setupLifecycleAndThermalMonitoring];
 
     // Adia o auto-boot até a próxima passagem do loop principal. A inicialização
     // síncrona dos módulos ainda pode bloquear a interface: limite conhecido.
@@ -257,7 +260,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _metal.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
     _metal.clearColor = MTLClearColorMake(0.02, 0.02, 0.03, 1.0);
     _metal.clearDepth = 1.0;
-    _metal.preferredFramesPerSecond = 60;
+    _metal.preferredFramesPerSecond = 30;
     _metal.paused = NO;
     _metal.enableSetNeedsDisplay = NO;
     _metal.translatesAutoresizingMaskIntoConstraints = NO;
@@ -707,6 +710,13 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _gameBootButton.layer.cornerRadius = 8;
     [_gameBootButton addTarget:self action:@selector(initGameBoot) forControlEvents:UIControlEventTouchUpInside];
 
+    _continueSaveButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_continueSaveButton setTitle:@"🗡 Continuar Caçada (Carregar Save)" forState:UIControlStateNormal];
+    _continueSaveButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    _continueSaveButton.backgroundColor = [UIColor colorWithRed:0.85 green:0.65 blue:0.15 alpha:0.35];
+    _continueSaveButton.layer.cornerRadius = 8;
+    [_continueSaveButton addTarget:self action:@selector(continueSavedGame) forControlEvents:UIControlEventTouchUpInside];
+
     _continuousButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
     _continuousButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
@@ -779,7 +789,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _bootStatus = [UILabel new]; _bootStatus.numberOfLines = 0;
 
     UIStackView *drawerStack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        drawerTitle, _gameBootButton, _continuousButton, toggleControlsBtn,
+        drawerTitle, _gameBootButton, _continueSaveButton, _continuousButton, toggleControlsBtn,
         verifyDocsBtn, runTestsBtn, exportBtn, closeBtn,
         _gameBootStatus, _status, _gpuStatus, _subsystemStatus
     ]];
@@ -816,6 +826,44 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 - (void)toggleControlsVisibility {
     _virtualControlsVisible = !_virtualControlsVisible;
     _controlsOverlay.hidden = !_virtualControlsVisible;
+}
+
+- (void)continueSavedGame {
+    NSURL *documents = [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+    NSString *saveDir = [documents.path stringByAppendingPathComponent:@"savedata"];
+
+    auto& sm = bb::SaveDataManager::instance();
+    if (!sm.is_initialized()) {
+        sm.initialize(saveDir.UTF8String, 16 * 1024 * 1024);
+    }
+    sm.set_default_title_id("CUSA03173");
+
+    std::vector<bb::SaveSearchEntry> entries;
+    int32_t ret = sm.dir_name_search(0, "CUSA03173", "%", SCE_SAVEDATA_SORT_KEY_MTIME, SCE_SAVEDATA_SORT_ORDER_DESC, entries);
+    if (ret != SCE_SAVEDATA_OK || entries.empty()) {
+        _gameBootStatus.text = @"Save: Nenhum progresso salvo encontrado em Documents/savedata.";
+        _topStatusLabel.text = @"🗡 Nenhum Save Encontrado";
+        return;
+    }
+
+    const auto& latest = entries[0];
+    std::string mountPt;
+    uint32_t status = 0;
+    int32_t mRet = sm.mount(0, "CUSA03173", latest.dir_name.c_str(), SCE_SAVEDATA_MOUNT_MODE_RDWR, 8192, mountPt, status);
+
+    NSString *saveTitle = latest.param.title[0] != '\0' ? [NSString stringWithUTF8String:latest.param.title] : [NSString stringWithUTF8String:latest.dir_name.c_str()];
+    _gameBootStatus.text = [NSString stringWithFormat:@"Save Carregado: %@ (Slot: %s, Status: %u)", saveTitle, latest.dir_name.c_str(), status];
+    _topStatusLabel.text = [NSString stringWithFormat:@"🗡 Progresso: %@", saveTitle];
+    _report[@"save_profile_loaded"] = @{
+        @"slot": [NSString stringWithUTF8String:latest.dir_name.c_str()],
+        @"title": saveTitle,
+        @"mount_point": [NSString stringWithUTF8String:mountPt.c_str()],
+        @"mount_status": @(status)
+    };
+
+    if (!_guestCanStep.load() && !_guestBooting.load()) {
+        [self initGameBoot];
+    }
 }
 
 #pragma mark - Auto-Boot and Search
@@ -1467,8 +1515,77 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 - (void)setupGameControllers {
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onControllerConnected:)
         name:GCControllerDidConnectNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onControllerDisconnected:)
+        name:GCControllerDidDisconnectNotification object:nil];
     if (GCController.controllers.count > 0) {
         [self onControllerConnected:nil];
+    }
+}
+
+#pragma mark - iOS Lifecycle and Thermal Monitoring
+
+- (void)setupLifecycleAndThermalMonitoring {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserver:self selector:@selector(onAppDidEnterBackground:)
+        name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [nc addObserver:self selector:@selector(onAppWillEnterForeground:)
+        name:UIApplicationWillEnterForegroundNotification object:nil];
+    if (@available(iOS 13.0, *)) {
+        [nc addObserver:self selector:@selector(onAppDidEnterBackground:)
+            name:UISceneDidEnterBackgroundNotification object:nil];
+        [nc addObserver:self selector:@selector(onAppWillEnterForeground:)
+            name:UISceneWillEnterForegroundNotification object:nil];
+    }
+    [nc addObserver:self selector:@selector(onAppDidReceiveMemoryWarning:)
+        name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
+    [nc addObserver:self selector:@selector(onThermalStateChanged:)
+        name:NSProcessInfoThermalStateDidChangeNotification object:nil];
+}
+
+- (void)onAppDidEnterBackground:(NSNotification *)note {
+    (void)note;
+    if (_bootCoordinator) {
+        _bootCoordinator->pause();
+    }
+    bb::AudioOutManager::instance().set_paused(true);
+    _metalView.paused = YES;
+    _report[@"lifecycle_state"] = @"background_paused";
+}
+
+- (void)onAppWillEnterForeground:(NSNotification *)note {
+    (void)note;
+    if (_bootCoordinator) {
+        _bootCoordinator->resume();
+    }
+    bb::AudioOutManager::instance().set_paused(false);
+    _metalView.paused = NO;
+    _report[@"lifecycle_state"] = @"foreground_active";
+}
+
+- (void)onAppDidReceiveMemoryWarning:(NSNotification *)note {
+    (void)note;
+    _memoryMonitor.trigger_low_memory_warning();
+    _report[@"memory_warning_triggered"] = @YES;
+}
+
+- (void)onThermalStateChanged:(NSNotification *)note {
+    (void)note;
+    NSProcessInfoThermalState state = [NSProcessInfo processInfo].thermalState;
+    if (state == NSProcessInfoThermalStateCritical) {
+        _pacingTracker.set_target_fps(20.0);
+        _metalView.preferredFramesPerSecond = 20;
+        _topStatusLabel.text = @"🔥 Alerta Térmico Crítico: Redução ativa para 20 FPS";
+        _report[@"thermal_state"] = @"critical_20fps";
+    } else if (state == NSProcessInfoThermalStateSerious) {
+        _pacingTracker.set_target_fps(24.0);
+        _metalView.preferredFramesPerSecond = 24;
+        _topStatusLabel.text = @"🌡 Atenção Térmica: Taxa ajustada para 24 FPS";
+        _report[@"thermal_state"] = @"serious_24fps";
+    } else {
+        _pacingTracker.set_target_fps(30.0);
+        _metalView.preferredFramesPerSecond = 30;
+        _topStatusLabel.text = @"⚙ Taxa Estável: 30 FPS";
+        _report[@"thermal_state"] = @"nominal_30fps";
     }
 }
 
@@ -1518,12 +1635,33 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 - (void)onControllerConnected:(NSNotification *)note {
     (void)note;
     _report[@"gamepad_connected"] = @YES;
+    _touchOverlay.set_gamepad_connected(true);
     GCController *controller = GCController.controllers.firstObject;
     if (controller) {
         [self setupController:controller];
         _subsystemStatus.text = [NSString stringWithFormat:@"GameController conectado: %@ (Mapeamento ativo)",
             controller.vendorName ? controller.vendorName : @"Compatível"];
     }
+
+    // Auto-ocultação e atenuação gradual dos botões na tela quando o controle físico estiver ativo (T022)
+    [UIView animateWithDuration:0.35 animations:^{
+        self->_controlsOverlay.alpha = 0.0;
+    } completion:^(BOOL finished) {
+        if (finished && self->_touchOverlay.is_gamepad_connected()) {
+            self->_controlsOverlay.hidden = YES;
+        }
+    }];
+}
+
+- (void)onControllerDisconnected:(NSNotification *)note {
+    (void)note;
+    _report[@"gamepad_connected"] = @NO;
+    _touchOverlay.set_gamepad_connected(false);
+    _controlsOverlay.hidden = NO;
+    [UIView animateWithDuration:0.35 animations:^{
+        self->_controlsOverlay.alpha = 1.0;
+    }];
+    _subsystemStatus.text = @"GameController desconectado. Controles virtuais na tela reativados.";
 }
 
 #pragma mark - CoreAudio Subsystem

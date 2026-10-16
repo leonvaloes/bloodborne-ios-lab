@@ -636,4 +636,71 @@ std::vector<HapticEvent> TouchControlsOverlay::poll_haptic_events() {
     return out;
 }
 
+void TouchControlsOverlay::set_opacity(float opacity) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    default_opacity_ = std::clamp(opacity, 0.0f, 1.0f);
+    if (!gamepad_connected_ || !auto_hide_on_gamepad_) {
+        current_opacity_ = default_opacity_;
+    }
+}
+
+float TouchControlsOverlay::get_opacity() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return current_opacity_;
+}
+
+void TouchControlsOverlay::set_visible(bool visible) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    visible_ = visible;
+    if (!visible_) {
+        current_opacity_ = 0.0f;
+    } else {
+        current_opacity_ = (gamepad_connected_ && auto_hide_on_gamepad_) ? 0.0f : default_opacity_;
+    }
+}
+
+bool TouchControlsOverlay::is_visible() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return visible_ && current_opacity_ > 0.01f;
+}
+
+void TouchControlsOverlay::set_gamepad_connected(bool connected) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    gamepad_connected_ = connected;
+    if (auto_hide_on_gamepad_) {
+        current_opacity_ = connected ? 0.0f : default_opacity_;
+    }
+}
+
+bool TouchControlsOverlay::is_gamepad_connected() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return gamepad_connected_;
+}
+
+void TouchControlsOverlay::set_auto_hide_on_gamepad(bool enable) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto_hide_on_gamepad_ = enable;
+    if (enable && gamepad_connected_) {
+        current_opacity_ = 0.0f;
+    } else if (!enable && visible_) {
+        current_opacity_ = default_opacity_;
+    }
+}
+
+bool TouchControlsOverlay::is_auto_hide_on_gamepad() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return auto_hide_on_gamepad_;
+}
+
+void TouchControlsOverlay::fade_update(float delta_time_sec) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const float target = (!visible_ || (gamepad_connected_ && auto_hide_on_gamepad_)) ? 0.0f : default_opacity_;
+    const float speed = 5.0f;
+    if (current_opacity_ < target) {
+        current_opacity_ = std::min(target, current_opacity_ + speed * delta_time_sec);
+    } else if (current_opacity_ > target) {
+        current_opacity_ = std::max(target, current_opacity_ - speed * delta_time_sec);
+    }
+}
+
 } // namespace bb

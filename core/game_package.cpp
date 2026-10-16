@@ -484,4 +484,8 @@ PackageInspectionReport GamePackageManager::verify_essential_hashes(const std::v
     return report;
 }
 
+void GamePackageManager::synthesize_defensive_stubs(VirtualFileSystem &vfs) {
+    vfs.register_shader_gui_stubs();
+}
+
 } // namespace bb

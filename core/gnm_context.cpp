@@ -404,7 +404,7 @@ void GnmContext::update_render_target(std::uint32_t index) {
     rt.fmask_address = static_cast<std::uint64_t>(reg_fmask) << 8;
 
     const auto fmt_id = (reg_info >> 2) & 0xF;
-    rt.enabled = (fmt_id != 0);
+    rt.enabled = (fmt_id != 0 && rt.base_address != 0);
 
     switch (fmt_id) {
     case 1: rt.format = GnmSurfaceFormat::R8_Unorm; break;
@@ -438,6 +438,10 @@ void GnmContext::update_depth_stencil() {
     ds.depth_address = static_cast<std::uint64_t>(reg_dbase) << 8;
     ds.stencil_address = static_cast<std::uint64_t>(reg_sbase) << 8;
     ds.htile_address = static_cast<std::uint64_t>(reg_htile) << 8;
+    if (ds.depth_address == 0) {
+        ds.depth_test_enabled = false;
+        ds.depth_write_enabled = false;
+    }
 
     ds.pitch = ((reg_size & 0x3FFF) + 1) * 8;
     ds.height = (((reg_size >> 14) & 0x3FFF) + 1) * 8;

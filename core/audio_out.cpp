@@ -1,4 +1,5 @@
 #include "audio_out.h"
+#include "atrac9_decoder.h"
 #include <chrono>
 #include <cmath>
 #include <algorithm>
@@ -177,6 +178,9 @@ std::int32_t AudioOutManager::output(std::int32_t handle, const void *ptr, std::
     if (handle <= 0) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
 
     std::lock_guard<std::mutex> lock(manager_mutex_);
+    if (paused_) {
+        return SCE_OK;
+    }
     auto it = ports_.find(handle);
     if (it == ports_.end() || !it->second || !it->second->is_open) {
         return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
@@ -257,6 +261,71 @@ std::int32_t AudioOutManager::output_hle(std::int32_t handle, const GuestMemory 
     }
 
     return output(handle, temp.data(), count);
+}
+
+std::int32_t AudioOutManager::output_atrac9(std::int32_t handle, const std::uint8_t *at9_stream, std::size_t size,
+                                            const std::uint8_t config[4]) {
+    if (!at9_stream || size == 0) return SCE_AUDIO_OUT_ERROR_INVALID_POINTER;
+    if (handle <= 0) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
+
+    std::vector<std::int16_t> pcm_data;
+    std::size_t decoded_frames = 0;
+    {
+        std::lock_guard<std::mutex> lock(manager_mutex_);
+        if (paused_) {
+            return SCE_OK;
+        }
+        auto it = ports_.find(handle);
+        if (it == ports_.end() || !it->second || !it->second->is_open) {
+            return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
+        }
+        PortEntry *port = it->second.get();
+        std::lock_guard<std::mutex> port_lock(port->mutex);
+        if (!port->is_open) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
+
+        if (!port->atrac9_decoder) {
+            port->atrac9_decoder = std::make_unique<Atrac9Decoder>();
+        }
+
+        if (!port->atrac9_decoder->is_initialized()) {
+            if (config) {
+                if (!port->atrac9_decoder->init(config)) {
+                    return SCE_AUDIO_OUT_ERROR_INVALID_PARAM;
+                }
+            } else if (size >= 12 && std::memcmp(at9_stream, "RIFF", 4) == 0) {
+                if (!port->atrac9_decoder->init_from_riff(at9_stream, size)) {
+                    return SCE_AUDIO_OUT_ERROR_INVALID_PARAM;
+                }
+            } else {
+                auto def_cfg = Atrac9Decoder::make_config_data(7, 2, 192, 0);
+                if (!port->atrac9_decoder->init(def_cfg.data())) {
+                    return SCE_AUDIO_OUT_ERROR_INVALID_PARAM;
+                }
+            }
+        }
+
+        decoded_frames = port->atrac9_decoder->decode_stream_to_stereo_48k(at9_stream, size, pcm_data);
+    }
+
+    if (decoded_frames == 0 || pcm_data.empty()) {
+        return SCE_AUDIO_OUT_ERROR_INVALID_PARAM;
+    }
+
+    return output(handle, pcm_data.data(), decoded_frames);
+}
+
+std::int32_t AudioOutManager::output_hle_atrac9(std::int32_t handle, const GuestMemory &mem, std::uint64_t guest_addr,
+                                                std::size_t size, const std::uint8_t config[4]) {
+    if (guest_addr == 0 || size == 0) return SCE_AUDIO_OUT_ERROR_INVALID_POINTER;
+    if (handle <= 0) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
+
+    std::vector<std::uint8_t> at9_buf(size);
+    MemoryError err = mem.load(guest_addr, at9_buf.data(), size);
+    if (err != MemoryError::ok) {
+        return SCE_AUDIO_OUT_ERROR_INVALID_POINTER;
+    }
+
+    return output_atrac9(handle, at9_buf.data(), size, config);
 }
 
 std::int32_t AudioOutManager::set_volume(std::int32_t handle, std::int32_t flag, const std::int32_t *vol) {
@@ -348,12 +417,24 @@ std::int32_t AudioOutManager::get_last_output_time(std::int32_t handle, std::uin
     return SCE_OK;
 }
 
+void AudioOutManager::set_paused(bool paused) {
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    paused_ = paused;
+}
+
+bool AudioOutManager::is_paused() const {
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    return paused_;
+}
+
 std::size_t AudioOutManager::drain_port_pcm16(std::int32_t handle, std::int16_t *out_samples, std::size_t frames) {
     if (!out_samples || frames == 0 || handle <= 0) return 0;
 
-    // Manter o lock do gerenciador até terminar a leitura: close_port pode
-    // destruir a PortEntry assim que o lock for liberado.
     std::lock_guard<std::mutex> lock(manager_mutex_);
+    if (paused_) {
+        std::memset(out_samples, 0, frames * sizeof(std::int16_t));
+        return 0;
+    }
     auto it = ports_.find(handle);
     if (it == ports_.end() || !it->second || !it->second->is_open) return 0;
     auto& port = *it->second;
@@ -365,9 +446,11 @@ std::size_t AudioOutManager::drain_port_pcm16(std::int32_t handle, std::int16_t 
 std::size_t AudioOutManager::drain_main_port_pcm16(std::int16_t *out_samples, std::size_t frames) {
     if (!out_samples || frames == 0) return 0;
 
-    // Saída do host é S16 estéreo: converter os canais do guest sem
-    // ultrapassar o buffer do callback (que tem capacidade 2 * frames).
     std::lock_guard<std::mutex> lock(manager_mutex_);
+    if (paused_) {
+        std::memset(out_samples, 0, frames * 2 * sizeof(std::int16_t));
+        return 0;
+    }
     for (const auto& kv : ports_) {
         if (!kv.second || !kv.second->is_open ||
             kv.second->type != SCE_AUDIO_OUT_PORT_TYPE_MAIN) continue;
@@ -415,6 +498,16 @@ std::int32_t sceAudioOutOutput(std::int32_t handle, const void *ptr) {
 
 std::int32_t sceAudioOutOutputHle(std::int32_t handle, const GuestMemory &mem, std::uint64_t guest_addr) {
     return AudioOutManager::instance().output_hle(handle, mem, guest_addr, 0);
+}
+
+std::int32_t sceAudioOutOutputAtrac9(std::int32_t handle, const std::uint8_t *at9_stream, std::size_t size,
+                                     const std::uint8_t config[4]) {
+    return AudioOutManager::instance().output_atrac9(handle, at9_stream, size, config);
+}
+
+std::int32_t sceAudioOutOutputHleAtrac9(std::int32_t handle, const GuestMemory &mem, std::uint64_t guest_addr,
+                                        std::size_t size, const std::uint8_t config[4]) {
+    return AudioOutManager::instance().output_hle_atrac9(handle, mem, guest_addr, size, config);
 }
 
 std::int32_t sceAudioOutSetVolume(std::int32_t handle, std::int32_t flag, const std::int32_t *vol) {

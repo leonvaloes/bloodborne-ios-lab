@@ -143,6 +143,11 @@ public:
     // Executa um slice de instruções no interpretador x86-64 e despacha traps HLE
     std::uint64_t step(std::uint64_t max_steps);
 
+    // Controle de ciclo de vida (suspensão/retomada cooperativa)
+    void pause();
+    void resume();
+    bool is_paused() const;
+
     // Consulta de estado e diagnóstico
     BootState state() const;
     BootDiagnostics diagnostics() const;
@@ -192,6 +197,7 @@ public:
 
 private:
     BootState state_{BootState::not_started};
+    bool paused_{false};
     BootConfig config_;
 
     std::unique_ptr<VirtualFileSystem> vfs_;

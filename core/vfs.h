@@ -43,6 +43,12 @@ public:
     bool mount_bhd5(const std::string &mount_point, std::shared_ptr<Bhd5Reader> reader, int priority = 0);
     bool mount_bnd4(const std::string &mount_point, std::shared_ptr<Bnd4Reader> reader);
 
+    // Suporte a arquivos sintéticos em memória (stubs para testes, shaders e GUI ausentes)
+    bool set_synthetic_file(const std::string &virtual_path, std::vector<std::uint8_t> data);
+    bool has_synthetic_file(const std::string &virtual_path) const;
+    bool remove_synthetic_file(const std::string &virtual_path);
+    void register_shader_gui_stubs();
+
     // Normaliza e resolve um caminho virtual para caminho f?sico host
     VfsError resolve(const std::string &virtual_path, std::string &out_host_path, bool &out_readonly) const;
 
@@ -79,6 +85,7 @@ private:
     std::unordered_map<std::string, MountPoint> mounts_;
     std::vector<Bhd5Mount> bhd5_mounts_;
     std::unordered_map<std::string, std::shared_ptr<Bnd4Reader>> bnd4_mounts_;
+    std::unordered_map<std::string, std::vector<std::uint8_t>> synthetic_files_;
 };
 
 } // namespace bb

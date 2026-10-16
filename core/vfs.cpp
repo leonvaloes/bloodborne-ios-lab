@@ -1,5 +1,6 @@
 ﻿#include "vfs.h"
 #include "binder.h"
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -35,6 +36,74 @@ bool VirtualFileSystem::mount_bnd4(const std::string &mount_point, std::shared_p
     std::lock_guard<std::mutex> lock(mutex_);
     bnd4_mounts_[norm_mount] = std::move(reader);
     return true;
+}
+
+bool VirtualFileSystem::set_synthetic_file(const std::string &virtual_path, std::vector<std::uint8_t> data) {
+    if (virtual_path.empty()) return false;
+    std::string norm = normalize_path(virtual_path);
+    std::lock_guard<std::mutex> lock(mutex_);
+    synthetic_files_[norm] = std::move(data);
+    return true;
+}
+
+bool VirtualFileSystem::has_synthetic_file(const std::string &virtual_path) const {
+    std::string norm = normalize_path(virtual_path);
+    std::lock_guard<std::mutex> lock(mutex_);
+    return synthetic_files_.find(norm) != synthetic_files_.end();
+}
+
+bool VirtualFileSystem::remove_synthetic_file(const std::string &virtual_path) {
+    std::string norm = normalize_path(virtual_path);
+    std::lock_guard<std::mutex> lock(mutex_);
+    return synthetic_files_.erase(norm) > 0;
+}
+
+void VirtualFileSystem::register_shader_gui_stubs() {
+    // 64-byte minimal compliant BND4 container with 0 files
+    std::vector<std::uint8_t> empty_bnd4(64, 0);
+    std::memcpy(empty_bnd4.data(), "BND4", 4);
+    std::memcpy(empty_bnd4.data() + 24, "00000000", 8);
+    empty_bnd4[16] = 64; // header_size
+    empty_bnd4[32] = 36; // file_header_size
+
+    std::vector<std::uint8_t> empty_dcx_blob;
+    if (DcxDecompressor::create_dcx(empty_bnd4.data(), empty_bnd4.size(), empty_dcx_blob) == BinderError::ok) {
+        static const char *const shader_files[] = {
+            "/app0/dvdroot_ps4/shader/gxgui.shaderbnd.dcx",
+            "/app0/dvdroot_ps4/shader/gxshader.shaderbnd.dcx",
+            "/app0/dvdroot_ps4/shader/gxrenderershader.shaderbnd.dcx",
+            "/app0/dvdroot_ps4/shader/gxposteffect.shaderbnd.dcx",
+            "/app0/dvdroot_ps4/shader/gxflvershader.shaderbnd.dcx",
+            "/app0/dvdroot_ps4/shader/gxflvershader.shaderbnddebug.dcx",
+            "/app0/dvdroot_ps4/shader/gxffxshader.shaderbnd.dcx",
+            "/app0/dvdroot_ps4/shader/gxdecal.shaderbnd.dcx",
+            "dvdroot_ps4/shader/gxgui.shaderbnd.dcx",
+            "dvdroot_ps4/shader/gxshader.shaderbnd.dcx",
+            "dvdroot_ps4/shader/gxrenderershader.shaderbnd.dcx",
+            "dvdroot_ps4/shader/gxposteffect.shaderbnd.dcx",
+            "dvdroot_ps4/shader/gxflvershader.shaderbnd.dcx",
+            "dvdroot_ps4/shader/gxflvershader.shaderbnddebug.dcx",
+            "dvdroot_ps4/shader/gxffxshader.shaderbnd.dcx",
+            "dvdroot_ps4/shader/gxdecal.shaderbnd.dcx"
+        };
+        for (const auto *sf : shader_files) {
+            set_synthetic_file(sf, empty_dcx_blob);
+        }
+    }
+
+    // Common text metadata stubs
+    std::vector<std::uint8_t> empty_txt = {'#', '\n'};
+    static const char *const txt_files[] = {
+        "/app0/dvdroot_ps4/action/eventnameid.txt",
+        "/app0/dvdroot_ps4/action/variablenameid.txt",
+        "/app0/dvdroot_ps4/action/statenameid.txt",
+        "dvdroot_ps4/action/eventnameid.txt",
+        "dvdroot_ps4/action/variablenameid.txt",
+        "dvdroot_ps4/action/statenameid.txt"
+    };
+    for (const auto *tf : txt_files) {
+        set_synthetic_file(tf, empty_txt);
+    }
 }
 
 std::string VirtualFileSystem::normalize_path(const std::string &path) {
@@ -227,6 +296,7 @@ bool VirtualFileSystem::exists(const std::string &virtual_path) const {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (synthetic_files_.find(norm) != synthetic_files_.end()) return true;
         for (const auto &m : bhd5_mounts_) {
             const std::string &mp = m.mount_point;
             if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
@@ -258,6 +328,13 @@ VfsError VirtualFileSystem::stat(const std::string &virtual_path, VfsStat &out_s
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        auto syn_it = synthetic_files_.find(norm);
+        if (syn_it != synthetic_files_.end()) {
+            out_stat.size = syn_it->second.size();
+            out_stat.is_directory = false;
+            out_stat.is_readonly = true;
+            return VfsError::ok;
+        }
         for (const auto &m : bhd5_mounts_) {
             const std::string &mp = m.mount_point;
             if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
@@ -320,6 +397,11 @@ VfsError VirtualFileSystem::read_file(const std::string &virtual_path, std::vect
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        auto syn_it = synthetic_files_.find(norm);
+        if (syn_it != synthetic_files_.end()) {
+            out_data = syn_it->second;
+            return VfsError::ok;
+        }
         for (const auto &m : bhd5_mounts_) {
             const std::string &mp = m.mount_point;
             if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
@@ -373,6 +455,24 @@ VfsError VirtualFileSystem::read_at(const std::string &virtual_path, std::uint64
     if (bytes_to_read && !dest) return VfsError::invalid_path;
     const std::string norm = normalize_path(virtual_path);
     if (contains_traversal(norm)) return VfsError::traversal_detected;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto syn_it = synthetic_files_.find(norm);
+        if (syn_it != synthetic_files_.end()) {
+            const auto &data = syn_it->second;
+            if (offset >= data.size()) {
+                out_bytes_read = 0;
+                return VfsError::ok;
+            }
+            std::size_t available = data.size() - static_cast<std::size_t>(offset);
+            out_bytes_read = std::min(bytes_to_read, available);
+            if (out_bytes_read > 0 && dest) {
+                std::memcpy(dest, data.data() + offset, out_bytes_read);
+            }
+            return VfsError::ok;
+        }
+    }
 
     // Archive mounts take precedence over host directories with the same path.
     // Copy the reader under the lock, then perform potentially slow BDT I/O unlocked.

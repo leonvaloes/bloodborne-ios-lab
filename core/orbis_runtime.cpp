@@ -2,6 +2,7 @@
 #include "kernel_threads.h"
 #include "dialog_hle.h"
 #include "gnm_context.h"
+#include "vfs.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -1094,8 +1095,9 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             if (p.max_quota_per_slot > 0) quota = static_cast<std::size_t>(p.max_quota_per_slot);
         }
         std::string base = save_mgr_.get_base_directory();
+        if (base.empty()) base = SaveDataManager::instance().get_base_directory();
         if (base.empty()) base = "savedata";
-        bool ok = save_mgr_.initialize(base, quota, save_mgr_.get_vfs());
+        bool ok = save_mgr_.initialize(base, quota, save_mgr_.get_vfs() ? save_mgr_.get_vfs() : vfs_);
         return static_cast<std::uint32_t>(ok ? SCE_SAVEDATA_OK : SCE_SAVEDATA_ERROR_INTERNAL);
     }
     if (n == "sceSaveDataMount" || n == "sceSaveDataMount2") {
@@ -1219,6 +1221,38 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         mem_.store(a(1), &result, sizeof(result));
         return SCE_SAVEDATA_OK;
     }
+    if (n == "sceSaveDataSetParam") {
+        if (!a(0) || !a(2)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        SceSaveDataMountPoint pt{};
+        if (mem_.load(a(0), &pt, sizeof(pt)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        std::vector<uint8_t> buf(a(3));
+        if (a(3) > 0) {
+            if (mem_.load(a(2), buf.data(), a(3)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        }
+        return static_cast<std::uint32_t>(save_mgr_.set_param(pt.data, static_cast<uint32_t>(a(1)), buf.data(), a(3)));
+    }
+    if (n == "sceSaveDataGetParam") {
+        if (!a(0) || !a(2)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        SceSaveDataMountPoint pt{};
+        if (mem_.load(a(0), &pt, sizeof(pt)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        SceSaveDataParam param{};
+        int32_t res = save_mgr_.get_param(pt.data, param);
+        if (res == SCE_SAVEDATA_OK) {
+            std::size_t copy_size = std::min<std::size_t>(sizeof(param), static_cast<std::size_t>(a(3)));
+            if (mem_.store(a(2), &param, copy_size) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        }
+        return static_cast<std::uint32_t>(res);
+    }
+    if (n == "sceSaveDataSaveIcon") {
+        if (!a(0) || !a(1)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        SceSaveDataMountPoint pt{};
+        if (mem_.load(a(0), &pt, sizeof(pt)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        std::vector<uint8_t> buf(a(2));
+        if (a(2) > 0) {
+            if (mem_.load(a(1), buf.data(), a(2)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        }
+        return static_cast<std::uint32_t>(save_mgr_.save_icon(pt.data, buf.data(), a(2)));
+    }
     if (n == "sceSaveDataTerminate") {
         save_mgr_.terminate();
         return 0;
@@ -1263,8 +1297,12 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
     if (n == "sceAvPlayerIsActive" || n == "sceAvPlayerGetVideoDataEx" ||
-        n == "sceAvPlayerGetAudioData" || n == "sceAvPlayerCurrentTime" ||
-        n == "sceAvPlayerStreamCount" || n == "sceAvPlayerGetStreamInfo") {
+        n == "sceAvPlayerGetVideoData" || n == "sceAvPlayerGetAudioData" ||
+        n == "sceAvPlayerGetAudioDataEx" || n == "sceAvPlayerCurrentTime" ||
+        n == "sceAvPlayerStreamCount" || n == "sceAvPlayerGetStreamInfo" ||
+        n == "sceAvPlayerReset" || n == "sceAvPlayerSetAvSync" ||
+        n == "sceAvPlayerJumpToTime" || n == "sceAvPlayerIsPaused" ||
+        n == "sceAvPlayerGetDuration") {
         return 0;
     }
 
@@ -2559,6 +2597,13 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     if (n=="sceSaveDataDialogInitialize") return 0;
     if (n=="sceSaveDataDialogOpen") return 0;
     if (n=="sceSaveDataDialogUpdateStatus") return 3; // FINISHED
+    if (n=="sceSaveDataDialogGetStatus") return 3; // FINISHED
+    if (n=="sceSaveDataDialogGetResult") {
+        if (a(0)) put<std::uint32_t>(mem_, a(0), 0); // SCE_OK
+        return 0;
+    }
+    if (n=="sceSaveDataDialogIsReadyToDisplay") return 1;
+    if (n=="sceSaveDataDialogClose") return 0;
     if (n=="sceSaveDataDialogTerminate") return 0;
     if (n=="sceNpProfileDialogInitialize") return 0;
     if (n=="sceNpProfileDialogOpen") return 0;
@@ -3138,6 +3183,16 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (!fp && (flags & 0x0200)) {
             fp = portable_fopen(host_path, "w+b");
         }
+        if (!fp && vfs_) {
+            std::vector<std::uint8_t> vfs_data;
+            if (vfs_->read_file(path, vfs_data) == VfsError::ok || vfs_->read_file(host_path, vfs_data) == VfsError::ok) {
+                int fd = next_kernel_fd_++;
+                std::uint64_t fsz = vfs_data.size();
+                kernel_files_[fd] = KernelFileEntry{nullptr, path, flags, fsz, std::move(vfs_data), 0, true};
+                std::printf("[FILE] %s: '%s' -> (synthetic VFS) fd=%d size=%llu\n", n.c_str(), path.c_str(), fd, (unsigned long long)fsz);
+                return static_cast<std::uint64_t>(fd);
+            }
+        }
         if (!fp) {
             return (n == "open") ? static_cast<std::uint64_t>(-1) : 0x80020002; // ENOENT
         }
@@ -3149,7 +3204,7 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         }
 
         int fd = next_kernel_fd_++;
-        kernel_files_[fd] = KernelFileEntry{fp, host_path, flags, fsz};
+        kernel_files_[fd] = KernelFileEntry{fp, host_path, flags, fsz, {}, 0, false};
         std::printf("[FILE] %s: '%s' -> fd=%d size=%llu\n", n.c_str(), path.c_str(), fd, (unsigned long long)fsz);
         return static_cast<std::uint64_t>(fd);
     }
@@ -3176,7 +3231,22 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             std::printf("[FILE] %s: fd=%d ('%s') nbyte=%zu\n", n.c_str(), fd, it->second.path.c_str(), nbyte);
         }
         if (!buf) return (n == "sceKernelRead") ? 0x80020016 : static_cast<std::uint64_t>(-1);
-        if (it == kernel_files_.end() || !it->second.fp) {
+        if (it == kernel_files_.end()) {
+            return (n == "sceKernelRead") ? 0x80020009 : static_cast<std::uint64_t>(-1);
+        }
+        if (it->second.is_synthetic) {
+            std::size_t available = (it->second.seek_pos < it->second.synthetic_data.size())
+                ? (it->second.synthetic_data.size() - static_cast<std::size_t>(it->second.seek_pos)) : 0;
+            std::size_t to_read = std::min(nbyte, available);
+            if (to_read > 0) {
+                if (mem_.store(buf, it->second.synthetic_data.data() + it->second.seek_pos, to_read) != MemoryError::ok) {
+                    return (n == "sceKernelRead") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+                }
+                it->second.seek_pos += to_read;
+            }
+            return static_cast<std::uint64_t>(to_read);
+        }
+        if (!it->second.fp) {
             return (n == "sceKernelRead") ? 0x80020009 : static_cast<std::uint64_t>(-1);
         }
         constexpr std::size_t max_chunk = 64ull * 1024 * 1024;
@@ -3202,7 +3272,21 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
                         fd, it->second.path.c_str(), (long long)offset, nbyte);
         }
         if (!buf) return 0x80020016;
-        if (it == kernel_files_.end() || !it->second.fp) {
+        if (it == kernel_files_.end()) return 0x80020009;
+        if (it->second.is_synthetic) {
+            if (offset < 0 || static_cast<std::uint64_t>(offset) > it->second.synthetic_data.size()) {
+                return 0;
+            }
+            std::size_t available = it->second.synthetic_data.size() - static_cast<std::size_t>(offset);
+            std::size_t to_read = std::min(nbyte, available);
+            if (to_read > 0) {
+                if (mem_.store(buf, it->second.synthetic_data.data() + offset, to_read) != MemoryError::ok) {
+                    return 0x80020016;
+                }
+            }
+            return static_cast<std::uint64_t>(to_read);
+        }
+        if (!it->second.fp) {
             return 0x80020009;
         }
         auto fp = it->second.fp;
@@ -3305,7 +3389,25 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         std::int64_t offset = static_cast<std::int64_t>(a(1));
         int whence = static_cast<int>(a(2));
         auto it = kernel_files_.find(fd);
-        if (it == kernel_files_.end() || !it->second.fp) {
+        if (it == kernel_files_.end()) {
+            return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020009;
+        }
+        if (it->second.is_synthetic) {
+            std::int64_t new_pos = 0;
+            if (whence == 0) { // SEEK_SET
+                new_pos = offset;
+            } else if (whence == 1) { // SEEK_CUR
+                new_pos = static_cast<std::int64_t>(it->second.seek_pos) + offset;
+            } else if (whence == 2) { // SEEK_END
+                new_pos = static_cast<std::int64_t>(it->second.synthetic_data.size()) + offset;
+            } else {
+                return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+            }
+            if (new_pos < 0) return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+            it->second.seek_pos = static_cast<std::uint64_t>(new_pos);
+            return static_cast<std::uint64_t>(it->second.seek_pos);
+        }
+        if (!it->second.fp) {
             return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020009;
         }
 #if defined(_WIN32)

@@ -20,6 +20,7 @@
 namespace bb {
 class GuestScheduler;
 class GnmContext;
+class VirtualFileSystem;
 // NID textual Orbis (11 caracteres base64, sem padding). Implementação local
 // independente de plataforma; a resolução pode ser substituída pelo loader.
 std::string orbis_nid(const std::string& symbol);
@@ -40,6 +41,9 @@ public:
 
     explicit OrbisRuntime(GuestMemory& memory);
     ~OrbisRuntime();
+    void attach_vfs(VirtualFileSystem* vfs) { vfs_ = vfs; }
+    VirtualFileSystem* vfs() { return vfs_; }
+    const VirtualFileSystem* vfs() const { return vfs_; }
     // Explicit opt-in; blocking guest services must be dispatched by a scheduler-aware
     // trap driver, not through invoke() on the host thread.
     void attach_scheduler(GuestScheduler& scheduler) { scheduler_ = &scheduler; }
@@ -129,11 +133,15 @@ private:
     RasterizerStatus last_rasterizer_status_ = RasterizerStatus::Ok;
     std::uint64_t rasterizer_failure_count_ = 0;
     std::filesystem::path app0_dir_;
+    VirtualFileSystem* vfs_ = nullptr;
     struct KernelFileEntry {
         FILE* fp = nullptr;
         std::string path;
         int flags = 0;
         std::uint64_t size = 0;
+        std::vector<std::uint8_t> synthetic_data{};
+        std::uint64_t seek_pos = 0;
+        bool is_synthetic = false;
     };
     std::unordered_map<int, KernelFileEntry> kernel_files_;
     int next_kernel_fd_ = 3;

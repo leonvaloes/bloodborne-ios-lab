@@ -111,8 +111,11 @@ public:
     bool unmount_all(VirtualFileSystem &vfs, const std::vector<std::string> &mount_points = {"/dvdroot", "/app0/dvdroot_ps4"});
 
     // ------------------------------------------------------------------------
-    // Validação de Integridade Essencial
+    // Validação de Integridade Essencial e Contêineres Sintéticos Defensivos
     // ------------------------------------------------------------------------
+    // Cria e registra contêineres sintéticos defensivos (shaders/gui) no VFS quando ausentes.
+    void synthesize_defensive_stubs(VirtualFileSystem &vfs);
+
     // Verifica se os arquivos essenciais para o boot da engine estão presentes nos contêineres.
     // Se essential_paths for vazio, utiliza default_essential_paths().
     PackageInspectionReport verify_essential_assets(const std::vector<std::string> &essential_paths = {}) const;

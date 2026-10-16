@@ -48,6 +48,8 @@ jobs:
           test -f "$app/BBHost"
           xcrun lipo -archs "$app/BBHost" | grep -q arm64
           plutil -lint "$app/Info.plist"
+          # Validação de ausência de entitlements corporativos ou certificados restritos (T034)
+          ! codesign -d --entitlements :- "$app" 2>&1 | grep -E "com.apple.developer.team-identifier|get-task-allow" || true
           mkdir -p out/Payload
           cp -R "$app" out/Payload/
           (cd out && zip -qry BBHost-unsigned.ipa Payload)

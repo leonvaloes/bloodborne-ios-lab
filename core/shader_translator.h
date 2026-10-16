@@ -201,6 +201,12 @@ public:
     static std::vector<uint32_t> build_basic_vertex_spirv();
     static std::vector<uint32_t> build_basic_fragment_spirv();
     static std::vector<uint32_t> build_lit_textured_spirv();
+
+    // Fallback MSL 3D geometry and fullscreen shaders (T015)
+    static std::string fallback_geometry_vertex_msl();
+    static std::string fallback_geometry_fragment_msl();
+    static std::string fallback_fullscreen_vertex_msl();
+    static std::string fallback_fullscreen_fragment_msl();
 };
 
 } // namespace bb

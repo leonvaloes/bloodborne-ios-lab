@@ -265,7 +265,8 @@ SmokeReport smoke() {
     std::error_code sec;
     std::filesystem::path temp_base = std::filesystem::temp_directory_path(sec);
     if (sec || temp_base.empty()) temp_base = "/tmp";
-    std::filesystem::path sbox = temp_base / "smoke_s9_box";
+    auto s9_ts = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::filesystem::path sbox = temp_base / ("smoke_s9_box_" + std::to_string(s9_ts));
     std::filesystem::remove_all(sbox, sec);
     std::filesystem::path sapp = sbox / "app";
     std::filesystem::path ssave = sbox / "save";

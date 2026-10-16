@@ -32,6 +32,7 @@ int main() { return run([] {
     std::filesystem::path app_dir = test_dir / "app";
     std::filesystem::path save_dir = test_dir / "saves";
     std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
     std::filesystem::create_directories(app_dir, ec);
     std::filesystem::create_directories(save_dir, ec);
 

@@ -151,7 +151,7 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     enable_language(OBJCXX)
-    add_executable(BBHost MACOSX_BUNDLE host/ios/main.mm)
+    add_executable(BBHost MACOSX_BUNDLE host/ios/main.mm host/ios/MetalGameView.mm)
     target_compile_options(BBHost PRIVATE -fobjc-arc)
     target_link_libraries(BBHost PRIVATE bb_core "-framework UIKit" "-framework MetalKit" "-framework Metal" "-framework GameController" "-framework Foundation" "-framework CoreGraphics" "-framework AudioToolbox" "-framework AVFoundation")
     set_target_properties(BBHost PROPERTIES
@@ -188,7 +188,7 @@ else()
     target_link_libraries(bb-boot-diagnostic PRIVATE bb_core)
     include(CTest)
     if(BUILD_TESTING)
-foreach(name guest_scheduler memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls dialog_hle vfs binder game_package game_asset_probe boot_probe audio audio_out ngs2_hle ngs2_atrac9 stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 gnm_context gnm_rasterizer gnm_metal_bridge video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle net_rtc_hle host_bridge)
+foreach(name guest_scheduler memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls dialog_hle vfs binder game_package game_asset_probe boot_probe audio audio_out ngs2_hle ngs2_atrac9 stability engine shader_translator metal_pipeline flver_parser x86_interp gnm_pm4 gnm_context gnm_rasterizer gnm_metal_bridge video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle net_rtc_hle host_bridge boot_456m_defense guest_scheduler_defense title_presentation area_load memory_containment touch_gamepad_latency controller_switch atomic_save save_profile_load lifecycle_pause_resume thermal_throttling)
             add_executable(test_${name} tests/test_${name}.cpp)
             target_link_libraries(test_${name} PRIVATE bb_core)
             add_test(NAME ${name} COMMAND test_${name})
@@ -213,6 +213,6 @@ foreach(name guest_scheduler memory threads alu integration simd dispatcher hle 
             "-DAOT=$<TARGET_FILE:bb-aot>" "-DSMOKE=$<TARGET_FILE:bb-smoke>"
             "-DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/add.hex"
             "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake")
-set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls dialog_hle vfs binder game_package game_asset_probe dcx_probe audio audio_out ngs2_hle ngs2_atrac9 stability engine shader_translator metal_pipeline flver_parser gnm_pm4 gnm_context gnm_rasterizer gnm_metal_bridge video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle net_rtc_hle host_bridge aot_rejection cli_integration PROPERTIES TIMEOUT 60)
+set_tests_properties(memory threads alu integration simd dispatcher hle concurrency manifest game_parser guest_boot input pad_hle touch_controls dialog_hle vfs binder game_package game_asset_probe dcx_probe audio audio_out ngs2_hle ngs2_atrac9 stability engine shader_translator metal_pipeline flver_parser gnm_pm4 gnm_context gnm_rasterizer gnm_metal_bridge video_out gcn_isa gcn_ir gcn_msl ps4_loader save_data app_content game_boot_coordinator fios2_hle net_rtc_hle host_bridge boot_456m_defense guest_scheduler_defense title_presentation area_load memory_containment touch_gamepad_latency controller_switch atomic_save save_profile_load lifecycle_pause_resume thermal_throttling aot_rejection cli_integration PROPERTIES TIMEOUT 60)
     endif()
 endif()

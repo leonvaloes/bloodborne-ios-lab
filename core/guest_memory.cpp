@@ -73,6 +73,7 @@ bool valid_span(std::uint64_t address, std::size_t size) {
 MemoryError GuestMemory::map(std::uint64_t address, std::size_t size, unsigned p) {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!valid_span(address, size) || !valid_permissions(p)) return MemoryError::invalid;
+    if (protect_header_page_ && address < 0x10000) return MemoryError::invalid;
     auto next = regions_.lower_bound(address);
     if (next != regions_.end() && next->first < address + size) return MemoryError::overlap;
     if (next != regions_.begin()) {
