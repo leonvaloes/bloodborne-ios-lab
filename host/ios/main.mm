@@ -1121,18 +1121,21 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         @"entry_point": @(diag.entry_point),
         @"current_rip": @(diag.current_rip),
         @"last_stop_reason": [NSString stringWithUTF8String:diag.last_stop_reason.c_str()],
+        @"last_error": [NSString stringWithUTF8String:diag.last_error.c_str()],
         @"guest_steps_executed": @(is_running),
         @"game_execution": @NO,
         @"checked_at": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]
     };
 
     _gameBootStatus.text = [NSString stringWithFormat:
-        @"Motor Bloodborne (+%llu): Total %llu passos | %llu imports | RIP: 0x%llx | Stop: %s",
+        @"Guest (%s, +%llu): %llu passos | %llu imports | RIP: 0x%llx | Stop: %s | Erro: %s",
+        diag.state_name.c_str(),
         (unsigned long long)steps,
         (unsigned long long)diag.total_steps,
         (unsigned long long)diag.total_import_calls,
         (unsigned long long)diag.current_rip,
-        diag.last_stop_reason.c_str()];
+        diag.last_stop_reason.c_str(),
+        diag.last_error.c_str()];
 
     _topStatusLabel.text = [NSString stringWithFormat:@"BB Lab | %.1fM passos | %s (não jogável)",
         static_cast<double>(diag.total_steps) / 1000000.0,

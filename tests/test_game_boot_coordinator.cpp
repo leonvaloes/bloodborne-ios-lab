@@ -39,7 +39,8 @@ void write_tag(Bytes& b, std::size_t& pos, std::uint64_t tag, std::uint64_t val)
     pos += 16;
 }
 
-Bytes synthesize_elf(bool library = false, bool call_import = false, const std::string& needed_module = "") {
+Bytes synthesize_elf(bool library = false, bool call_import = false, const std::string& needed_module = "",
+                     bool extended_entry = false) {
     Bytes b(0x900, 0);
     b[0] = 0x7f; b[1] = 'E'; b[2] = 'L'; b[3] = 'F';
     b[4] = 2; b[5] = 1; b[6] = 1;
@@ -72,6 +73,19 @@ Bytes synthesize_elf(bool library = false, bool call_import = false, const std::
             0x48, 0x8b, 0x00,                                           // mov rax, [rax]
             0xff, 0xd0,                                                 // call rax
             0xc3                                                        // ret
+        };
+        std::memcpy(b.data() + 0x400, code, sizeof(code));
+    } else if (extended_entry) {
+        // Prólogo autoral de seis instruções: exercita REX, pilha e retorno
+        // pelo loader e interpretador, sem depender de qualquer byte do jogo.
+        const std::uint8_t code[] = {
+            0x55,                         // push rbp
+            0x48, 0x89, 0xe5,             // mov rbp, rsp
+            0x41, 0x54,                   // push r12
+            0x48, 0xc7, 0xc0, 0x64, 0, 0, 0, // mov rax, 100
+            0x41, 0x5c,                   // pop r12
+            0x5d,                         // pop rbp
+            0xc3                          // ret
         };
         std::memcpy(b.data() + 0x400, code, sizeof(code));
     } else {
@@ -345,6 +359,26 @@ int main() { return run([] {
         std::string sum = diag_after.summary();
         CHECK(sum.find("halted") != std::string::npos);
         CHECK(sum.find("Total Steps Executed:") != std::string::npos);
+    }
+
+    // Prólogo x86-64 mais longo pelo caminho real do coordenador (fixture autoral).
+    {
+        auto dir = sandbox / "extended_entry";
+        std::filesystem::create_directories(dir, ec);
+        auto bytes = synthesize_elf(false, false, "", true);
+        std::ofstream file(dir / "eboot.bin", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        file.close();
+        GameBootCoordinator coordinator;
+        BootConfig config;
+        config.base_dir = dir.string();
+        config.require_essential_assets = false;
+        CHECK(coordinator.initialize(config));
+        CHECK(coordinator.diagnostics().total_steps == 0);
+        CHECK(coordinator.step(100) == 7);
+        CHECK(coordinator.state() == BootState::halted);
+        CHECK(coordinator.cpu()->state.gpr[0] == 100);
+        CHECK(coordinator.diagnostics().total_steps == 7);
     }
 
     // ========================================================================
