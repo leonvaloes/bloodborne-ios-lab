@@ -125,6 +125,11 @@ int main() { return run([] {
     bad_vertex.x = std::numeric_limits<float>::quiet_NaN();
     CHECK(memory.store(0x50000, &bad_vertex, sizeof(bad_vertex)) == bb::MemoryError::ok);
     CHECK(rasterizer.execute_draw(memory, dc) == bb::RasterizerStatus::InvalidVertexBuffer);
+    CHECK(memory.store(0x50000, triangle, sizeof(triangle)) == bb::MemoryError::ok);
+    auto huge_scissor = dc;
+    huge_scissor.pipeline_state.scissors.scissors[0].left = UINT32_MAX;
+    huge_scissor.pipeline_state.scissors.scissors[0].top = UINT32_MAX;
+    CHECK(rasterizer.execute_draw(memory, huge_scissor) == bb::RasterizerStatus::Ok);
     CHECK(memory.load(center_addr, px, 4) == bb::MemoryError::ok);
     CHECK(px[0] == 0 && px[1] == 0 && px[2] == 255 && px[3] == 255);
 

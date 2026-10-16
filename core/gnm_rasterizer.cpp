@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdint>
 #include <vector>
 
 namespace bb {
@@ -23,6 +24,7 @@ inline float edge_function(float ax, float ay, float bx, float by, float px, flo
 }
 
 inline float clamp01(float v) {
+    if (!std::isfinite(v)) return 0.0f;
     return std::max(0.0f, std::min(1.0f, v));
 }
 
@@ -207,10 +209,12 @@ RasterizerStatus GnmRasterizer::execute_draw(
     }
 
     const auto& sc = draw_call.pipeline_state.scissors.scissors[0];
-    int sc_left = std::max(0, static_cast<int>(sc.left));
-    int sc_right = sc.right > 0 ? std::min(static_cast<int>(rt.width) - 1, static_cast<int>(sc.right) - 1) : static_cast<int>(rt.width) - 1;
-    int sc_top = std::max(0, static_cast<int>(sc.top));
-    int sc_bottom = sc.bottom > 0 ? std::min(static_cast<int>(rt.height) - 1, static_cast<int>(sc.bottom) - 1) : static_cast<int>(rt.height) - 1;
+    if (rt.width > static_cast<std::uint32_t>(INT32_MAX) ||
+        rt.height > static_cast<std::uint32_t>(INT32_MAX)) return RasterizerStatus::InvalidRenderTarget;
+    int sc_left = static_cast<int>(std::min(sc.left, rt.width));
+    int sc_right = sc.right > 0 ? static_cast<int>(std::min(rt.width, sc.right)) - 1 : static_cast<int>(rt.width) - 1;
+    int sc_top = static_cast<int>(std::min(sc.top, rt.height));
+    int sc_bottom = sc.bottom > 0 ? static_cast<int>(std::min(rt.height, sc.bottom)) - 1 : static_cast<int>(rt.height) - 1;
 
     // Validar antes de escrever qualquer pixel: não tratar leitura ausente
     // como posição (0,0,0) e gerar triângulos falsos.
