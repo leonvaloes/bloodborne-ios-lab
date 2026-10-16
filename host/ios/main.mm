@@ -129,6 +129,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     std::atomic<bool> _guestCanStep;
     std::atomic<std::uint64_t> _guestSubmits;
     std::atomic<std::uint32_t> _guestTriangles;
+    std::atomic<std::uint64_t> _guestRasterizerFailures;
+    std::atomic<int> _guestLastRasterizerStatus;
 
     // Subsistema Metal 3
     id<MTLCommandQueue> _queue;
@@ -203,6 +205,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _guestCanStep.store(false);
     _guestSubmits.store(0);
     _guestTriangles.store(0);
+    _guestRasterizerFailures.store(0);
+    _guestLastRasterizerStatus.store(static_cast<int>(bb::RasterizerStatus::Ok));
     _guestExecutionQueue = dispatch_queue_create("org.bloodborne.lab.guest", DISPATCH_QUEUE_SERIAL);
     _touchOverlay.bind_input_manager(&_inputManager);
     _touchOverlay.set_left_stick_mode(bb::StickMode::Floating);
@@ -1013,6 +1017,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _guestCanStep.store(false);
     _guestSubmits.store(0);
     _guestTriangles.store(0);
+    _guestRasterizerFailures.store(0);
+    _guestLastRasterizerStatus.store(static_cast<int>(bb::RasterizerStatus::Ok));
 
     __weak LabController *weakSelf = self;
     dispatch_async(_guestExecutionQueue, ^{
@@ -1064,6 +1070,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         if (auto *runtime = strongSelf->_bootCoordinator->runtime()) {
             strongSelf->_guestSubmits.store(runtime->submit_count());
             strongSelf->_guestTriangles.store(runtime->rasterizer_stats().triangles_drawn);
+            strongSelf->_guestRasterizerFailures.store(runtime->rasterizer_failure_count());
+            strongSelf->_guestLastRasterizerStatus.store(static_cast<int>(runtime->last_rasterizer_status()));
         }
         strongSelf->_guestCanStep.store(diag.state == bb::BootState::running ||
                                         diag.state == bb::BootState::modules_initialized);
@@ -1169,6 +1177,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                 if (auto *runtime = strongSelf->_bootCoordinator->runtime()) {
                     strongSelf->_guestSubmits.store(runtime->submit_count());
                     strongSelf->_guestTriangles.store(runtime->rasterizer_stats().triangles_drawn);
+            strongSelf->_guestRasterizerFailures.store(runtime->rasterizer_failure_count());
+            strongSelf->_guestLastRasterizerStatus.store(static_cast<int>(runtime->last_rasterizer_status()));
                 }
                 strongSelf->_guestCanStep.store(diag.state == bb::BootState::running ||
                                                 diag.state == bb::BootState::modules_initialized);
@@ -1214,6 +1224,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                 const std::uint32_t tris = _guestTriangles.load();
                 _report[@"gnm_submit_count"] = @(submits);
                 _report[@"gnm_cpu_triangles"] = @(tris);
+                _report[@"gnm_cpu_rasterizer_failures"] = @(_guestRasterizerFailures.load());
+                _report[@"gnm_cpu_last_rasterizer_status_code"] = @(_guestLastRasterizerStatus.load());
                 _report[@"gnm_draws_executed_offscreen"] = @NO;
                 _report[@"guest_frame_status"] = @"Pixels lineares guest enviados à textura Metal; origem e sincronização com PM4 não comprovadas.";
             } else {
@@ -1680,6 +1692,10 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _report[@"memory_footprint_mb"] = @(static_cast<double>(mem_bytes) / (1024.0 * 1024.0));
     _report[@"gamepad_connected"] = @(GCController.controllers.count > 0);
     _report[@"video_flips"] = @(_videoOutManager.flip_count());
+    _report[@"gnm_submit_count"] = @(_guestSubmits.load());
+    _report[@"gnm_cpu_triangles"] = @(_guestTriangles.load());
+    _report[@"gnm_cpu_rasterizer_failures"] = @(_guestRasterizerFailures.load());
+    _report[@"gnm_cpu_last_rasterizer_status_code"] = @(_guestLastRasterizerStatus.load());
 
     NSError *error = nil;
     NSData *json = [NSJSONSerialization dataWithJSONObject:_report options:NSJSONWritingPrettyPrinted error:&error];

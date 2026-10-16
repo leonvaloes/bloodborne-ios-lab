@@ -52,6 +52,8 @@ public:
     const GnmRasterizer& rasterizer() const { return rasterizer_; }
     std::uint64_t submit_count() const { return submit_count_; }
     const RasterizerStats& rasterizer_stats() const { return rasterizer_stats_; }
+    RasterizerStatus last_rasterizer_status() const { return last_rasterizer_status_; }
+    std::uint64_t rasterizer_failure_count() const { return rasterizer_failure_count_; }
     void set_procparam(std::uint64_t address) { procparam_ = address; }
     std::uint64_t procparam() const { return procparam_; }
     void set_tls_template(const Ps4Tls& t) { tls_template_ = t; }
@@ -120,6 +122,8 @@ private:
     GnmRasterizer rasterizer_;
     std::uint64_t submit_count_ = 0;
     RasterizerStats rasterizer_stats_{};
+    RasterizerStatus last_rasterizer_status_ = RasterizerStatus::Ok;
+    std::uint64_t rasterizer_failure_count_ = 0;
     std::filesystem::path app0_dir_;
     struct KernelFileEntry {
         FILE* fp = nullptr;

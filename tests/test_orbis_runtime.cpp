@@ -531,6 +531,8 @@ int main() {
         assert(m.store(dcb_size_table, &dcb_size_bytes, 4) == MemoryError::ok);
         assert(call("sceGnmSubmitCommandBuffers", 1, dcb_ptr_table, dcb_size_table) == 0);
         assert(rt.gnm_context()->draw_calls().size() == 1);
+        assert(rt.last_rasterizer_status() == RasterizerStatus::InvalidRenderTarget);
+        assert(rt.rasterizer_failure_count() == 1);
         // Se o segundo IB falhar, o primeiro não pode apagar ou duplicar o draw
         // aceito anteriormente. Nenhum contador deve avançar.
         const std::uint64_t ibs[] = {dcb_addr, 0};
@@ -557,6 +559,8 @@ int main() {
 
         assert(call("sceGnmSubmitAndFlipCommandBuffers", 1, dcb_ptr_table, dcb_size_table, 0, 0, 0, 99, 42) == 0);
         assert(rt.gnm_context()->draw_calls().empty());
+        assert(rt.last_rasterizer_status() == RasterizerStatus::Ok);
+        assert(rt.rasterizer_failure_count() == 1);
         assert(rt.submit_count() == 2);
         assert(vom.has_new_frame());
         assert(vom.flip_count() == 2);

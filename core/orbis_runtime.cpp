@@ -1492,8 +1492,11 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         }
         gnm_context_.swap(pending);
         submit_count_ += count;
+        last_rasterizer_status_ = RasterizerStatus::Ok;
         if (!gnm_context_->draw_calls().empty()) {
-            rasterizer_.execute_draw_calls(mem_, gnm_context_->draw_calls(), &rasterizer_stats_);
+            last_rasterizer_status_ = rasterizer_.execute_draw_calls(
+                mem_, gnm_context_->draw_calls(), &rasterizer_stats_);
+            if (last_rasterizer_status_ != RasterizerStatus::Ok) ++rasterizer_failure_count_;
         }
         if (n == "sceGnmSubmitAndFlipCommandBuffers") {
             auto h = static_cast<std::uint32_t>(a(5));

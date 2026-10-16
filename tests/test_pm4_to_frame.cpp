@@ -65,6 +65,8 @@ int main() { return run([] {
     cpu.gpr[2] = size_table;
     CHECK(runtime.invoke("sceGnmSubmitCommandBuffers", cpu) == 0);
     CHECK(runtime.submit_count() == 1);
+    CHECK(runtime.last_rasterizer_status() == RasterizerStatus::Ok);
+    CHECK(runtime.rasterizer_failure_count() == 0);
     CHECK(runtime.gnm_context()->draw_calls().size() == 1);
     CHECK(runtime.rasterizer_stats().triangles_drawn == 1);
     CHECK(runtime.rasterizer_stats().pixels_written > 100);
