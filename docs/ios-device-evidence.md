@@ -9,4 +9,8 @@
 - **Obtido no relatório:** `metal_completed_frames=2504`, `average_fps=59.984264148033247`, `frame_pacing_p50_ms=16.6743335`, footprint físico pontual `109.64141082763672 MB`; `cpu_checks=118`, `cpu_failures=0`; malha `synthetic_saw_cleaver` com 8 vértices/12 triângulos; diretório Documents disponível e VFS montado. `audio_status=ready` indica inicialização, **não** saída audível confirmada.
 - **Ausências/limitações:** `video_flips=0`, `guest_steps_executed=false`, `game_execution=false`, `boot_probe.status=not_found`, `eboot.bin`/`eboot.elf`/`param.sfo` ausentes na listagem; `gamepad_connected=false`. FPS é da cena host, não do jogo. O dado reportado evidencia execução da infraestrutura no aparelho, mas não demonstra gameplay, tela de título, áudio audível, resposta dos controles, estabilidade prolongada nem assinatura reproduzível. Não marcar S9 concluído.
 
-Próxima medição útil: documentar duração e método de instalação (sem credenciais), verificar visualmente cena/controles e áudio, e repetir relatório após teste prolongado. Não enviar dumps, assets, saves ou logs brutos com dados pessoais ao repositório.
+### Confirmação posterior do usuário
+
+Ao ser perguntado sobre cena de demonstração/cartão de boas-vindas, resposta dos controles touch, som audível e funcionamento após 5–10 minutos, o usuário respondeu **“sim tudo sim”**. Trata-se de observação declarada pelo usuário, sem vídeo, duração cronometrada ou segundo relatório; não se pode inferir conteúdo de jogo, FPS sustentado durante todo o intervalo nem detalhes da saída de áudio. O teste fortalece a evidência de UI/entrada/áudio do **laboratório sintético** no aparelho.
+
+Próxima medição útil: documentar duração e método de instalação (sem credenciais), e repetir relatório após teste prolongado. Não enviar dumps, assets, saves ou logs brutos com dados pessoais ao repositório.

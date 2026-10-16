@@ -524,8 +524,20 @@ int main() {
         std::uint32_t dcb_size_bytes = sizeof(pm4_cmds);
         assert(m.store(dcb_size_table, &dcb_size_bytes, 4) == MemoryError::ok);
 
+        // Um draw de fixture não pode reaparecer quando a próxima submissão é NOP.
+        const std::uint32_t draw_cmds[] = {0xC0012D00, 3, 0};
+        assert(m.store(dcb_addr, draw_cmds, sizeof(draw_cmds)) == MemoryError::ok);
+        dcb_size_bytes = sizeof(draw_cmds);
+        assert(m.store(dcb_size_table, &dcb_size_bytes, 4) == MemoryError::ok);
+        assert(call("sceGnmSubmitCommandBuffers", 1, dcb_ptr_table, dcb_size_table) == 0);
+        assert(rt.gnm_context()->draw_calls().size() == 1);
+        assert(m.store(dcb_addr, pm4_cmds, sizeof(pm4_cmds)) == MemoryError::ok);
+        dcb_size_bytes = sizeof(pm4_cmds);
+        assert(m.store(dcb_size_table, &dcb_size_bytes, 4) == MemoryError::ok);
+
         assert(call("sceGnmSubmitAndFlipCommandBuffers", 1, dcb_ptr_table, dcb_size_table, 0, 0, 0, 99, 42) == 0);
-        assert(rt.submit_count() == 1);
+        assert(rt.gnm_context()->draw_calls().empty());
+        assert(rt.submit_count() == 2);
         assert(vom.has_new_frame());
         assert(vom.flip_count() == 2);
 

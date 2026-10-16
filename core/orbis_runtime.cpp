@@ -1475,6 +1475,9 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (!gnm_context_ || !dcb_addrs_ptr || !dcb_sizes_ptr || count == 0 || count >= 64) {
             return static_cast<std::uint64_t>(-1);
         }
+        // Estado de registradores persiste; chamadas de draw/dispatch pertencem
+        // somente a esta submissão, nunca à anterior.
+        gnm_context_->clear_calls();
         for (uint32_t i = 0; i < count; ++i) {
             uint64_t dcb_addr = 0;
             uint32_t dcb_size = 0;
