@@ -1,6 +1,6 @@
 # Estado verificável da ponte GNM → Metal
 
-Em 15/10/2026, o laboratório possui decodificação PM4, rasterizador de referência em CPU para um subconjunto e tradução GCN→MSL de um subconjunto muito pequeno de instruções. **Não há backend Metal offscreen funcional para draws PM4 do jogo.** O `BBHost` apresenta pixels BGRA8 lineares lidos do guest pela `VideoOutManager`; o triângulo FLVER é uma demonstração separada. Um IPA unsigned compilado não confirma instalação nem execução em um iPhone.
+Em 15/10/2026, o laboratório possui decodificação PM4, rasterizador de referência em CPU para um subconjunto e tradução GCN→MSL de um subconjunto muito pequeno de instruções. **Não há backend Metal offscreen funcional para draws PM4 do jogo.** O `BBHost` apresenta pixels BGRA8 lineares lidos do guest pela `VideoOutManager`; o triângulo FLVER é uma demonstração separada. Um IPA unsigned compilado, sozinho, não confirma instalação nem execução em um iPhone. Um relatório exportado pelo usuário após executar a revisão `5f2b0f7` no iPhone 15 Pro Max consta em `docs/ios-device-evidence.md`; ele comprova apenas o funcionamento observado da cena sintética do laboratório, sem flip guest ou execução do jogo.
 
 A tentativa anterior de conectar `GnmMetalBridge` diretamente ao `drawInMTKView:` foi revertida por ser insegura/incompleta:
 
