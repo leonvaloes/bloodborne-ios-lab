@@ -18,4 +18,4 @@ Data: 15/10/2026. Estado observado no código do laboratório, não prova de exe
 
 ## Próxima prova necessária
 
-Uma fixture gráfica autoral deve produzir pixels na memória guest **por execução efetiva de comandos GPU**, passar por registro, submit, flip, leitura e apresentação, com diagnóstico por etapa. Só então investigar os formatos/targets e comandos reais usados pelo jogo, com dados mantidos localmente. Não marcar S9 como concluído com base em testes host ou compilação do IPA.
+O teste host autoral `test_pm4_to_frame` percorre PM4 → estado GNM → rasterizador **CPU** → bytes do RT guest → HLE VideoOut flip → leitura do frame. O clear inicial é feito antes do PM4, não por comando GPU. Ainda falta um encoder Metal de draws PM4 e prova de apresentação no iPhone pela cadeia guest (não confundir com a cena sintética já validada). Só então investigar formatos/targets e comandos usados pelo jogo, mantendo os dados localmente. Não marcar S9 concluído com base em testes host ou compilação do IPA.
