@@ -43,6 +43,7 @@ constexpr std::int32_t SCE_FIOS_ERROR_ALREADY_EXISTS     = static_cast<std::int3
 constexpr std::int32_t SCE_FIOS_ERROR_NOT_INITIALIZED    = static_cast<std::int32_t>(0x8053000B);
 constexpr std::int32_t SCE_FIOS_ERROR_NOT_A_DIRECTORY    = static_cast<std::int32_t>(0x8053000C);
 constexpr std::int32_t SCE_FIOS_ERROR_IS_A_DIRECTORY     = static_cast<std::int32_t>(0x8053000D);
+constexpr std::int32_t SCE_FIOS_ERROR_DISK_FULL         = static_cast<std::int32_t>(0x8053000E);
 constexpr std::int32_t SCE_FIOS_ERROR_SEEK_OUT_OF_BOUNDS = static_cast<std::int32_t>(0x8053000F);
 constexpr std::int32_t SCE_FIOS_ERROR_EOF                = static_cast<std::int32_t>(0x80530010);
 
@@ -128,6 +129,10 @@ public:
     std::int64_t sceFiosFHTell(SceFiosFH fh);
     std::int32_t sceFiosFHSyncSync(SceFiosFH fh);
     std::int32_t sceFiosFHSyncSync(SceFiosOp* op, SceFiosFH fh);
+    std::int32_t sceFiosFHTruncateSync(SceFiosFH fh, std::int64_t length);
+    std::int32_t sceFiosFHTruncateSync(SceFiosOp* op, SceFiosFH fh, std::int64_t length);
+    std::int32_t sceFiosFileTruncateSync(const std::string& path, std::int64_t length);
+    std::int32_t sceFiosFileTruncateSync(SceFiosOp* op, const char* path, std::int64_t length);
 
     // Validação de handle
     bool sceFiosIsValidHandle(SceFiosFH fh) const;

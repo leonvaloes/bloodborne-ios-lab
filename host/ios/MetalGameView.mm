@@ -6,7 +6,7 @@
     id<MTLRenderPipelineState> _screenPipeline;
     id<MTLSamplerState> _screenSampler;
     id<MTLTexture> _guestScreenTexture;
-    bb::HostFrameBuffer _cachedFrame;
+    bb::PresentationFrame _cachedPresFrame;
     uint64_t _presentedFrameCount;
     id<MTLDepthStencilState> _depthState;
     id<MTLDepthStencilState> _depthStateReadOnly;
@@ -134,18 +134,23 @@
         return NO;
     }
 
-    if (!_videoMgr->read_current_frame_pixels(_cachedFrame)) {
+    if (!_videoMgr->read_presentation_frame(_cachedPresFrame)) {
+        _videoMgr->consume_new_frame();
+        if ([self.gameViewDelegate respondsToSelector:@selector(metalGameView:didFailWithError:)]) {
+            const char* diag = _cachedPresFrame.diagnostic.empty() ? _videoMgr->last_conversion_diagnostic().c_str() : _cachedPresFrame.diagnostic.c_str();
+            NSString *msg = [NSString stringWithFormat:@"Rejeicao na conversao de video: %s", (diag && diag[0]) ? diag : "dados invalidos"];
+            [self.gameViewDelegate metalGameView:self didFailWithError:msg];
+        }
+        return NO;
+    }
+
+    if (!_cachedPresFrame.valid || _cachedPresFrame.pixel_data.empty()) {
         _videoMgr->consume_new_frame();
         return NO;
     }
 
-    if (!_cachedFrame.valid || _cachedFrame.pixel_data.empty()) {
-        _videoMgr->consume_new_frame();
-        return NO;
-    }
-
-    const NSUInteger width = _cachedFrame.width;
-    const NSUInteger height = _cachedFrame.height;
+    const NSUInteger width = _cachedPresFrame.width;
+    const NSUInteger height = _cachedPresFrame.height;
     if (width == 0 || height == 0) {
         _videoMgr->consume_new_frame();
         return NO;
@@ -167,18 +172,18 @@
         }
     }
 
-    NSUInteger bytesPerRow = _cachedFrame.pitch * _cachedFrame.bytes_per_pixel;
+    NSUInteger bytesPerRow = _cachedPresFrame.pitch * _cachedPresFrame.bytes_per_pixel;
     if (bytesPerRow == 0) {
         bytesPerRow = width * 4;
     }
 
     [_guestScreenTexture replaceRegion:MTLRegionMake2D(0, 0, width, height)
                            mipmapLevel:0
-                             withBytes:_cachedFrame.pixel_data.data()
+                             withBytes:_cachedPresFrame.pixel_data.data()
                            bytesPerRow:bytesPerRow];
 
     _presentedFrameCount++;
-    uint64_t seq = _cachedFrame.flip_sequence;
+    uint64_t seq = _cachedPresFrame.flip_sequence;
     _videoMgr->consume_new_frame();
 
     if ([self.gameViewDelegate respondsToSelector:@selector(metalGameView:didPresentFrame:)]) {

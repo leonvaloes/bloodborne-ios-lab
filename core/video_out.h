@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace bb {
@@ -81,6 +82,97 @@ struct HostFrameBuffer {
     std::vector<std::uint8_t> pixel_data; // Dados efetivamente lidos da memória guest
     std::uint32_t buffer_index = 0;
     std::uint64_t flip_sequence = 0;
+};
+
+// Formatos de pixel Orbis VideoOut canônicos
+constexpr std::uint32_t ORBIS_VIDEO_OUT_PIXEL_FORMAT_B8_G8_R8_A8_SRGB = 0x80000000;
+constexpr std::uint32_t ORBIS_VIDEO_OUT_PIXEL_FORMAT_B8_G8_R8_A8      = 0x00000000;
+constexpr std::uint32_t ORBIS_VIDEO_OUT_PIXEL_FORMAT_R8_G8_B8_A8_SRGB = 0x80000001;
+constexpr std::uint32_t ORBIS_VIDEO_OUT_PIXEL_FORMAT_R8_G8_B8_A8      = 0x00000001;
+constexpr std::uint32_t ORBIS_VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2   = 0x00000002;
+constexpr std::uint32_t ORBIS_VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_SRGB = 0x80000002;
+
+// Modos de tiling Orbis VideoOut
+constexpr std::uint32_t ORBIS_VIDEO_OUT_TILING_MODE_TILE   = 0; // Display2DThin micro-tile 8x8
+constexpr std::uint32_t ORBIS_VIDEO_OUT_TILING_MODE_LINEAR = 1; // Linear
+
+enum class VideoConversionStatus {
+    ok = 0,
+    unsupported_format = 1,
+    unsupported_tiling = 2,
+    invalid_dimensions = 3,
+    buffer_too_small = 4,
+    unmapped_memory = 5,
+    null_data = 6
+};
+
+const char* video_conversion_status_to_string(VideoConversionStatus status);
+
+// Frame convertido e linearizado pronto para upload em textura de apresentação Metal/display
+struct PresentationFrame {
+    bool valid = false;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t pitch = 0;                 // Passo de linha em pixels no buffer linear
+    std::uint32_t bytes_per_pixel = 4;
+    std::uint32_t pixel_format = ORBIS_VIDEO_OUT_PIXEL_FORMAT_B8_G8_R8_A8_SRGB; // BGRA8 final padrão
+    std::uint32_t original_format = 0;
+    std::uint32_t original_tiling_mode = 1;
+    bool was_tiled = false;
+    std::vector<std::uint8_t> pixel_data;     // Dados lineares BGRA8
+    std::uint32_t buffer_index = 0;
+    std::uint64_t flip_sequence = 0;
+    VideoConversionStatus status = VideoConversionStatus::ok;
+    std::string diagnostic;
+};
+
+// Conversor determinístico de layout (untiling Display2DThin / Morton 2D) e formatos de cor
+class VideoFrameConverter {
+public:
+    static VideoConversionStatus convert(const HostFrameBuffer& src, PresentationFrame& out);
+
+    static bool detile_display2d_thin(
+        const std::uint8_t* src,
+        std::uint8_t* dst,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t src_pitch_pixels,
+        std::uint32_t dst_pitch_pixels,
+        bool swap_rb = false
+    );
+
+    static bool detile_morton_8x8(
+        const std::uint8_t* src,
+        std::uint8_t* dst,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t src_pitch_pixels,
+        std::uint32_t dst_pitch_pixels,
+        bool swap_rb = false
+    );
+
+    static bool tile_display2d_thin(
+        const std::uint8_t* src,
+        std::uint8_t* dst,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t src_pitch_pixels,
+        std::uint32_t dst_pitch_pixels,
+        bool swap_rb = false
+    );
+
+    static bool tile_morton_8x8(
+        const std::uint8_t* src,
+        std::uint8_t* dst,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t src_pitch_pixels,
+        std::uint32_t dst_pitch_pixels,
+        bool swap_rb = false
+    );
+
+    static bool is_supported_pixel_format(std::uint32_t format);
+    static std::uint32_t get_pixel_format_bpp(std::uint32_t format);
 };
 
 // Gerenciador de saída de vídeo desacoplado do guest memory (para HostBridge)
@@ -230,6 +322,58 @@ public:
     const VideoOut* video_out() const { return video_out_.get(); }
     bool has_guest_memory() const { return video_out_ != nullptr; }
 
+    bool read_presentation_frame(PresentationFrame& out_frame) const {
+        out_frame = {};
+        HostFrameBuffer raw_frame;
+        if (!read_current_frame_pixels(raw_frame)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            out_frame.valid = false;
+            out_frame.status = (!video_out_ || !memory_) ? VideoConversionStatus::unmapped_memory : VideoConversionStatus::null_data;
+            out_frame.diagnostic = (!video_out_ || !memory_) ? "Guest memory desconectada ou indisponivel" : "Nenhum frame valido para apresentacao";
+            last_conversion_status_ = out_frame.status;
+            last_conversion_diagnostic_ = out_frame.diagnostic;
+            conversion_failure_count_++;
+            return false;
+        }
+        auto status = VideoFrameConverter::convert(raw_frame, out_frame);
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_conversion_status_ = status;
+        last_conversion_diagnostic_ = out_frame.diagnostic;
+        if (status == VideoConversionStatus::ok) {
+            conversion_success_count_++;
+            return true;
+        } else {
+            conversion_failure_count_++;
+            return false;
+        }
+    }
+
+    PresentationFrame current_presentation_frame() const {
+        PresentationFrame result;
+        read_presentation_frame(result);
+        return result;
+    }
+
+    VideoConversionStatus last_conversion_status() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_conversion_status_;
+    }
+
+    std::string last_conversion_diagnostic() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_conversion_diagnostic_;
+    }
+
+    std::uint64_t conversion_success_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return conversion_success_count_;
+    }
+
+    std::uint64_t conversion_failure_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return conversion_failure_count_;
+    }
+
 private:
     static VideoStatus frame_size(const VideoBuffer& buf, std::size_t& bytes) {
         if (!buf.width || !buf.height || !buf.bytes_per_pixel || buf.bytes_per_pixel > 16 ||
@@ -250,5 +394,9 @@ private:
     std::uint64_t internal_sequence_ = 0;
     FlipEvent internal_last_flip_{};
     mutable std::atomic<bool> internal_has_new_frame_{false};
+    mutable VideoConversionStatus last_conversion_status_{VideoConversionStatus::ok};
+    mutable std::string last_conversion_diagnostic_{};
+    mutable std::uint64_t conversion_success_count_{0};
+    mutable std::uint64_t conversion_failure_count_{0};
 };
 } // namespace bb

@@ -5,6 +5,7 @@
 #include "guest_memory.h"
 #include <cstring>
 #include <cmath>
+#include <limits>
 
 static void test_user_service_lifecycle() {
     using namespace bb;
@@ -98,6 +99,16 @@ static void test_user_service_queries() {
     char guest_name[32]{};
     CHECK(mem.load(0x1040, guest_name, sizeof(guest_name)) == MemoryError::ok);
     CHECK(std::strcmp(guest_name, "Hunter") == 0);
+
+    // T125: tamanho vindo do guest não pode determinar alocação host.
+    const std::size_t huge_size = std::numeric_limits<std::size_t>::max();
+    CHECK(user_service.sceUserServiceGetUserName(mem, uid, 0x1040, huge_size) == 0);
+    CHECK(mem.load(0x1040, guest_name, sizeof(guest_name)) == MemoryError::ok);
+    CHECK(std::strcmp(guest_name, "Hunter") == 0);
+    CHECK(user_service.sceUserServiceGetUserName(mem, uid, 0x9000, huge_size) == SCE_USER_SERVICE_ERROR_INVALID_ARG);
+    CHECK(user_service.sceUserServiceGetUserName(mem, uid, 0, huge_size) == SCE_USER_SERVICE_ERROR_INVALID_ARG);
+    CHECK(user_service.sceUserServiceGetUserName(mem, uid, 0x1040, 6) == SCE_USER_SERVICE_ERROR_BUFFER_TOO_SMALL);
+    CHECK(user_service.sceUserServiceGetUserName(mem, 99999, 0x1040, huge_size) == SCE_USER_SERVICE_ERROR_NO_USER);
 
     // Adição de segundo usuário e login
     const SceUserServiceUserId second_uid = 0x10000001;

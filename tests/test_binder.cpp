@@ -356,6 +356,70 @@ int main() { return run([] {
         CHECK(vfs.read_at("/dvdroot/unknown.bin", 0, small, sizeof(small), got) == VfsError::not_found);
         CHECK(vfs.read_at("/dvdroot/../unknown.bin", 0, small, sizeof(small), got) == VfsError::traversal_detected);
 
+        // T118: Precedência e sobreposição de BND4 sobreposto no mesmo mount point com BHD5
+        {
+            std::vector<std::uint8_t> bnd_overlap_raw(260, 0);
+            std::memcpy(bnd_overlap_raw.data(), "BND4", 4);
+            write_le32_buf(bnd_overlap_raw.data() + 12, 2);
+            write_le64_buf(bnd_overlap_raw.data() + 16, 64);
+            std::memcpy(bnd_overlap_raw.data() + 24, "07D7R6\0\0", 8);
+            write_le64_buf(bnd_overlap_raw.data() + 32, 36);
+            bnd_overlap_raw[0x28] = 2;
+
+            write_le64_buf(bnd_overlap_raw.data() + 72, 40);
+            write_le64_buf(bnd_overlap_raw.data() + 80, 40);
+            write_le32_buf(bnd_overlap_raw.data() + 88, 140);
+            write_le32_buf(bnd_overlap_raw.data() + 92, 100);
+            write_le32_buf(bnd_overlap_raw.data() + 96, 210);
+
+            write_le64_buf(bnd_overlap_raw.data() + 108, 30);
+            write_le64_buf(bnd_overlap_raw.data() + 116, 30);
+            write_le32_buf(bnd_overlap_raw.data() + 124, 180);
+            write_le32_buf(bnd_overlap_raw.data() + 128, 200);
+            write_le32_buf(bnd_overlap_raw.data() + 132, 222);
+
+            for (std::size_t i = 0; i < 40; ++i) bnd_overlap_raw[140 + i] = static_cast<std::uint8_t>(i + 1);
+            for (std::size_t i = 0; i < 30; ++i) bnd_overlap_raw[180 + i] = static_cast<std::uint8_t>(i + 50);
+
+            std::memcpy(bnd_overlap_raw.data() + 210, "data0.bin", 10);
+            std::memcpy(bnd_overlap_raw.data() + 222, "data1.bin", 10);
+
+            auto bnd_reader = std::make_shared<Bnd4Reader>();
+            CHECK(bnd_reader->load(bnd_overlap_raw.data(), bnd_overlap_raw.size()) == BinderError::ok);
+
+            CHECK(vfs.mount_bnd4("/dvdroot", bnd_reader));
+            // map/m10_00_00_00.msb existe no BHD5
+            std::size_t bhd_got = 0;
+            std::uint8_t bhd_buf[16] = {0};
+            CHECK(vfs.read_at("/dvdroot/map/m10_00_00_00.msb", 0, bhd_buf, sizeof(bhd_buf), bhd_got) == VfsError::ok);
+            CHECK(bhd_got == sizeof(bhd_buf));
+
+            // data0.bin NÃO existe no BHD5, mas existe no BND4 sobreposto
+            CHECK(vfs.has_archive_or_synthetic_file("/dvdroot/data0.bin"));
+            VfsStat bnd_st{};
+            CHECK(vfs.stat("/dvdroot/data0.bin", bnd_st) == VfsError::ok);
+            CHECK(bnd_st.size == 40);
+            std::vector<std::uint8_t> bnd_full;
+            CHECK(vfs.read_file("/dvdroot/data0.bin", bnd_full) == VfsError::ok);
+            CHECK(bnd_full.size() == 40);
+
+            // read_at deve alinhar com read_file e ler com sucesso do BND4 sobreposto
+            std::vector<std::uint8_t> bnd_read_at(40, 0);
+            std::size_t bnd_got_bytes = 0;
+            CHECK(vfs.read_at("/dvdroot/data0.bin", 0, bnd_read_at.data(), 40, bnd_got_bytes) == VfsError::ok);
+            CHECK(bnd_got_bytes == 40);
+            CHECK(bnd_read_at == bnd_full);
+
+            // Leitura incremental de 15 bytes a partir do offset 10
+            std::vector<std::uint8_t> bnd_slice(15, 0);
+            CHECK(vfs.read_at("/dvdroot/data0.bin", 10, bnd_slice.data(), 15, bnd_got_bytes) == VfsError::ok);
+            CHECK(bnd_got_bytes == 15);
+            CHECK(std::memcmp(bnd_slice.data(), bnd_full.data() + 10, 15) == 0);
+
+            // Arquivo que não existe em nenhum dos dois
+            CHECK(vfs.read_at("/dvdroot/neither.bin", 0, small, sizeof(small), got) == VfsError::not_found);
+        }
+
         // Desmontagem
         CHECK(vfs.unmount("/dvdroot"));
         CHECK(!vfs.is_mounted("/dvdroot"));

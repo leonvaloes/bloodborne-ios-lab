@@ -104,15 +104,23 @@ ShaderReflection ShaderTranslator::reflect(const uint32_t* words, size_t word_co
 
         switch (opcode) {
             case spirv::OpEntryPoint: {
-                if (op_count >= 2) {
+                if (op_count >= 3) {
                     uint32_t model = ops[0];
                     if (model == spirv::ExecutionModelVertex) refl.stage = SpirvShaderStage::Vertex;
                     else if (model == spirv::ExecutionModelFragment) refl.stage = SpirvShaderStage::Fragment;
                     else if (model == spirv::ExecutionModelGLCompute) refl.stage = SpirvShaderStage::Compute;
 
-                    // Entry point name is null-terminated string
+                    // Entry point name is null-terminated string bounded by op_count
                     const char* str = reinterpret_cast<const char*>(&ops[2]);
-                    refl.entry_point_name = str;
+                    size_t max_bytes = (op_count - 2) * sizeof(uint32_t);
+                    const void* term = std::memchr(str, '\0', max_bytes);
+                    if (term != nullptr) {
+                        refl.entry_point_name = str;
+                    } else {
+                        refl.entry_point_name.clear(); // Rejeitado: sem terminação NUL
+                    }
+                } else {
+                    refl.entry_point_name.clear();
                 }
                 break;
             }
@@ -120,7 +128,11 @@ ShaderReflection ShaderTranslator::reflect(const uint32_t* words, size_t word_co
                 if (op_count >= 2) {
                     uint32_t target_id = ops[0];
                     const char* str = reinterpret_cast<const char*>(&ops[1]);
-                    names[target_id] = str;
+                    size_t max_bytes = (op_count - 1) * sizeof(uint32_t);
+                    const void* term = std::memchr(str, '\0', max_bytes);
+                    if (term != nullptr) {
+                        names[target_id] = str;
+                    }
                 }
                 break;
             }
@@ -295,6 +307,60 @@ TranslationResult ShaderTranslator::translate_spirv_to_msl(const uint32_t* words
 
     result.reflection = reflect(words, word_count);
     const auto& refl = result.reflection;
+
+    if (refl.entry_point_name.empty() || refl.stage == SpirvShaderStage::Unknown) {
+        result.success = false;
+        result.error_message = "Invalid or truncated OpEntryPoint in SPIR-V";
+        return result;
+    }
+
+    // Validação semântica do corpo de instruções SPIR-V (T142)
+    bool in_function = false;
+    bool has_function = false;
+    for (size_t index = 5; index < word_count; ) {
+        uint32_t first = words[index];
+        uint32_t length = first >> 16;
+        uint32_t opcode = first & 0xFFFF;
+        if (length == 0 || index + length > word_count) break;
+
+        if (opcode == spirv::OpFunction) {
+            in_function = true;
+            has_function = true;
+        } else if (opcode == spirv::OpFunctionEnd) {
+            in_function = false;
+        } else if (in_function) {
+            switch (opcode) {
+                case spirv::OpFunctionParameter:
+                case spirv::OpLabel:
+                case spirv::OpReturn:
+                case spirv::OpReturnValue:
+                case spirv::OpVariable:
+                case spirv::OpLoad:
+                case spirv::OpStore:
+                case spirv::OpAccessChain:
+                case spirv::OpCompositeConstruct:
+                case spirv::OpCompositeExtract:
+                case spirv::OpFMul:
+                case spirv::OpFAdd:
+                case spirv::OpFSub:
+                case spirv::OpVectorTimesScalar:
+                case spirv::OpMatrixTimesVector:
+                case spirv::OpDot:
+                    break;
+                default:
+                    result.success = false;
+                    result.error_message = "Unsupported SPIR-V instruction in function body: opcode " + std::to_string(opcode);
+                    return result;
+            }
+        }
+        index += length;
+    }
+
+    if (!has_function) {
+        result.success = false;
+        result.error_message = "No valid OpFunction found in SPIR-V module";
+        return result;
+    }
 
     std::ostringstream ss;
     ss << "// ----------------------------------------------------------------------------\n";

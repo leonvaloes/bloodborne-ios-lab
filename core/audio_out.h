@@ -70,6 +70,7 @@ struct SceAudioOutPortInfo {
     std::int32_t volume_left{SCE_AUDIO_OUT_VOLUME_0dB};
     std::int32_t volume_right{SCE_AUDIO_OUT_VOLUME_0dB};
     std::uint64_t total_frames_output{0};    // Total de frames emitidos com sucesso
+    std::uint64_t dropped_frames{0};         // Total de frames descartados por pressão/overflow
     std::uint32_t underflow_count{0};        // Contagem de underflows do buffer
     std::uint32_t overflow_count{0};         // Contagem de overflows do buffer
     std::uint64_t last_output_time_us{0};    // Timestamp monotônico (microssegundos)
@@ -95,6 +96,7 @@ public:
     bool is_port_open(std::int32_t handle) const;
     std::size_t open_ports_count() const;
     void close_all_ports();
+    void purge_inactive_buffers();
 
     // Submissão de saída de áudio (PCM16)
     // Buffer host:
@@ -148,6 +150,7 @@ private:
         std::int32_t volume_left{SCE_AUDIO_OUT_VOLUME_0dB};
         std::int32_t volume_right{SCE_AUDIO_OUT_VOLUME_0dB};
         std::uint64_t total_frames_output{0};
+        std::uint64_t dropped_frames{0};
         std::uint64_t last_output_time_us{0};
         bool is_open{false};
         std::unique_ptr<AudioRingBuffer> ring_buffer;

@@ -134,6 +134,36 @@ static void test_rtc_clock_and_conversions() {
     rtc.reset();
 }
 
+static void test_rtc_local_clock() {
+    using namespace bb;
+
+    RtcManager rtc;
+    GuestMemory mem(65536);
+    constexpr uint64_t addr = 0x1000;
+    CHECK(mem.map(addr, 4096, Permission::read | Permission::write) == MemoryError::ok);
+
+    // Epoch fixo: 2024-01-01 00:00 UTC. Exercita ambas as variantes sem depender do relógio real.
+    constexpr uint64_t epoch_us = 1704067200000000ULL;
+    rtc.set_time_provider([] { return epoch_us; });
+    rtc.set_timezone_offset_minutes(90);
+    SceRtcDateTime local{};
+    CHECK(rtc.sceRtcGetCurrentClockLocalTime(&local) == SCE_RTC_OK);
+    CHECK(local.year == 2024 && local.month == 1 && local.day == 1);
+    CHECK(local.hour == 1 && local.minute == 30 && local.second == 0);
+    CHECK(rtc.sceRtcGetCurrentClockLocalTime(mem, addr) == SCE_RTC_OK);
+    SceRtcDateTime guest{};
+    CHECK(mem.load(addr, &guest, sizeof(guest)) == MemoryError::ok);
+    CHECK(std::memcmp(&guest, &local, sizeof(local)) == 0);
+    CHECK(rtc.sceRtcGetCurrentClockLocalTime(nullptr) == SCE_RTC_ERROR_INVALID_POINTER);
+    CHECK(rtc.sceRtcGetCurrentClockLocalTime(mem, 0) == SCE_RTC_ERROR_INVALID_POINTER);
+    CHECK(rtc.sceRtcGetCurrentClockLocalTime(mem, 0xFFFFFFFFFFFFFFFFULL) == SCE_RTC_ERROR_INVALID_POINTER);
+
+    rtc.set_timezone_offset_minutes(-120);
+    CHECK(rtc.sceRtcGetCurrentClockLocalTime(&local) == SCE_RTC_OK);
+    CHECK(local.year == 2023 && local.month == 12 && local.day == 31);
+    CHECK(local.hour == 22 && local.minute == 0);
+}
+
 static void test_rtc_network_tick_and_resolution() {
     using namespace bb;
 
@@ -398,6 +428,7 @@ static void test_global_wrappers() {
 int main() {
     test_rtc_monotonic_ticks();
     test_rtc_clock_and_conversions();
+    test_rtc_local_clock();
     test_rtc_network_tick_and_resolution();
     test_net_lifecycle();
     test_net_ctl_state_and_info();

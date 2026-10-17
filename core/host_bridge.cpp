@@ -1,6 +1,7 @@
 #include "host_bridge.h"
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <sstream>
 #include <iomanip>
 #include <limits>
@@ -178,12 +179,56 @@ HostBridgeDiagnostics HostBridge::diagnostics() const {
     diag.audio_frames_drained = 0;
     diag.audio_underflows = 0;
     diag.active_touches = touch_controls_.active_touch_count();
+    diag.intro_video_status = intro_video_status_;
 
     return diag;
 }
 
 std::string HostBridge::last_error() const {
     return boot_coordinator_.last_error();
+}
+
+bool HostBridge::play_intro_video_or_fallback(const std::string& video_path) {
+    if (video_path.empty()) {
+        intro_video_status_ = "offline_fallback_missing_media";
+        return false;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(video_path, ec) || std::filesystem::is_directory(video_path, ec)) {
+        intro_video_status_ = "offline_fallback_missing_media";
+        return false;
+    }
+    auto fsize = std::filesystem::file_size(video_path, ec);
+    if (ec || fsize < 16) {
+        intro_video_status_ = "offline_fallback_unreadable_media";
+        return false;
+    }
+    intro_video_status_ = "ready_or_playing";
+    return true;
+}
+
+void HostBridge::finish_intro_and_boot(IntroFallbackReason reason) {
+    switch (reason) {
+        case IntroFallbackReason::Finished:
+            intro_video_status_ = "finished";
+            break;
+        case IntroFallbackReason::MissingMedia:
+            intro_video_status_ = "offline_fallback_missing_media";
+            break;
+        case IntroFallbackReason::PlaybackFailed:
+            intro_video_status_ = "offline_fallback_playback_failed";
+            break;
+        case IntroFallbackReason::UnreadableMedia:
+            intro_video_status_ = "offline_fallback_unreadable_media";
+            break;
+        case IntroFallbackReason::UserCancelled:
+            intro_video_status_ = "offline_fallback_user_cancelled";
+            break;
+    }
+}
+
+std::string HostBridge::intro_video_status() const {
+    return intro_video_status_;
 }
 
 void HostBridge::reset() {
@@ -197,6 +242,7 @@ void HostBridge::reset() {
     initialized_ = false;
     frame_count_ = 0;
     total_steps_ = 0;
+    intro_video_status_ = "not_started";
 }
 
 void HostBridge::shutdown() {
@@ -266,6 +312,7 @@ std::string HostBridgeDiagnostics::summary() const {
     if (video_has_new_frame) ss << " (new frame)";
     ss << " [buf=" << video_current_buffer_index << ", " << video_width << "x" << video_height << "]\n";
     ss << "Active Touches: " << active_touches << "\n";
+    ss << "Intro Video Status: " << intro_video_status << "\n";
     if (entry_point != 0) ss << "Entry Point: 0x" << std::hex << entry_point << std::dec << "\n";
     if (tcb_address != 0) ss << "TCB Address: 0x" << std::hex << tcb_address << std::dec << "\n";
     if (current_rip != 0) ss << "Current RIP: 0x" << std::hex << current_rip << std::dec << "\n";

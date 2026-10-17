@@ -52,6 +52,52 @@ bool VirtualFileSystem::has_synthetic_file(const std::string &virtual_path) cons
     return synthetic_files_.find(norm) != synthetic_files_.end();
 }
 
+bool VirtualFileSystem::has_archive_file(const std::string &virtual_path) const {
+    std::string norm = normalize_path(virtual_path);
+    if (contains_traversal(norm)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto &m : bhd5_mounts_) {
+        const std::string &mp = m.mount_point;
+        if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
+            std::string rel = norm.substr(mp.size());
+            if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+            if (m.reader && m.reader->has_file(rel)) return true;
+        }
+    }
+    for (const auto &pair : bnd4_mounts_) {
+        const std::string &m = pair.first;
+        if (norm == m || norm.rfind(m + "/", 0) == 0) {
+            std::string rel = norm.substr(m.size());
+            if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+            if (pair.second && pair.second->has_file(rel)) return true;
+        }
+    }
+    return false;
+}
+
+bool VirtualFileSystem::has_archive_or_synthetic_file(const std::string &virtual_path) const {
+    std::string norm = normalize_path(virtual_path);
+    if (contains_traversal(norm)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto &m : bhd5_mounts_) {
+        const std::string &mp = m.mount_point;
+        if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
+            std::string rel = norm.substr(mp.size());
+            if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+            if (m.reader && m.reader->has_file(rel)) return true;
+        }
+    }
+    for (const auto &pair : bnd4_mounts_) {
+        const std::string &m = pair.first;
+        if (norm == m || norm.rfind(m + "/", 0) == 0) {
+            std::string rel = norm.substr(m.size());
+            if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+            if (pair.second && pair.second->has_file(rel)) return true;
+        }
+    }
+    return synthetic_files_.find(norm) != synthetic_files_.end();
+}
+
 bool VirtualFileSystem::remove_synthetic_file(const std::string &virtual_path) {
     std::string norm = normalize_path(virtual_path);
     std::lock_guard<std::mutex> lock(mutex_);
@@ -296,7 +342,6 @@ bool VirtualFileSystem::exists(const std::string &virtual_path) const {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (synthetic_files_.find(norm) != synthetic_files_.end()) return true;
         for (const auto &m : bhd5_mounts_) {
             const std::string &mp = m.mount_point;
             if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
@@ -317,27 +362,30 @@ bool VirtualFileSystem::exists(const std::string &virtual_path) const {
 
     std::string host_path;
     bool ro = false;
-    if (resolve(virtual_path, host_path, ro) != VfsError::ok) return false;
-    std::error_code ec;
-    return std::filesystem::exists(host_path, ec);
+    if (resolve(virtual_path, host_path, ro) == VfsError::ok) {
+        std::error_code ec;
+        if (std::filesystem::exists(host_path, ec)) return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (synthetic_files_.find(norm) != synthetic_files_.end()) return true;
+    }
+
+    return false;
 }
 
 VfsError VirtualFileSystem::stat(const std::string &virtual_path, VfsStat &out_stat) const {
     std::string norm = normalize_path(virtual_path);
     if (contains_traversal(norm)) return VfsError::traversal_detected;
 
+    bool under_archive_mount = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto syn_it = synthetic_files_.find(norm);
-        if (syn_it != synthetic_files_.end()) {
-            out_stat.size = syn_it->second.size();
-            out_stat.is_directory = false;
-            out_stat.is_readonly = true;
-            return VfsError::ok;
-        }
         for (const auto &m : bhd5_mounts_) {
             const std::string &mp = m.mount_point;
             if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
+                under_archive_mount = true;
                 std::string rel = norm.substr(mp.size());
                 if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
                 if (m.reader) {
@@ -354,6 +402,7 @@ VfsError VirtualFileSystem::stat(const std::string &virtual_path, VfsStat &out_s
         for (const auto &pair : bnd4_mounts_) {
             const std::string &m = pair.first;
             if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                under_archive_mount = true;
                 std::string rel = norm.substr(m.size());
                 if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
                 if (pair.second) {
@@ -372,39 +421,48 @@ VfsError VirtualFileSystem::stat(const std::string &virtual_path, VfsStat &out_s
     std::string host_path;
     bool ro = false;
     VfsError err = resolve(virtual_path, host_path, ro);
-    if (err != VfsError::ok) return err;
-
-    std::error_code ec;
-    const auto status = std::filesystem::status(host_path, ec);
-    if (ec == std::errc::no_such_file_or_directory) return VfsError::not_found;
-    if (ec) return VfsError::io_error;
-    if (!std::filesystem::exists(status)) return VfsError::not_found;
-
-    VfsStat result{};
-    result.is_directory = std::filesystem::is_directory(status);
-    result.is_readonly = ro;
-    if (!result.is_directory) {
-        result.size = std::filesystem::file_size(host_path, ec);
-        if (ec) return VfsError::io_error;
+    if (err == VfsError::ok) {
+        std::error_code ec;
+        const auto status = std::filesystem::status(host_path, ec);
+        if (!ec && std::filesystem::exists(status)) {
+            VfsStat result{};
+            result.is_directory = std::filesystem::is_directory(status);
+            result.is_readonly = ro;
+            if (!result.is_directory) {
+                result.size = std::filesystem::file_size(host_path, ec);
+                if (ec) return VfsError::io_error;
+            }
+            out_stat = result;
+            return VfsError::ok;
+        }
     }
-    out_stat = result;
-    return VfsError::ok;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto syn_it = synthetic_files_.find(norm);
+        if (syn_it != synthetic_files_.end()) {
+            out_stat.size = syn_it->second.size();
+            out_stat.is_directory = false;
+            out_stat.is_readonly = true;
+            return VfsError::ok;
+        }
+    }
+
+    if (err != VfsError::ok && !under_archive_mount) return err;
+    return VfsError::not_found;
 }
 
 VfsError VirtualFileSystem::read_file(const std::string &virtual_path, std::vector<std::uint8_t> &out_data) const {
     std::string norm = normalize_path(virtual_path);
     if (contains_traversal(norm)) return VfsError::traversal_detected;
 
+    bool under_archive_mount = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto syn_it = synthetic_files_.find(norm);
-        if (syn_it != synthetic_files_.end()) {
-            out_data = syn_it->second;
-            return VfsError::ok;
-        }
         for (const auto &m : bhd5_mounts_) {
             const std::string &mp = m.mount_point;
             if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
+                under_archive_mount = true;
                 std::string rel = norm.substr(mp.size());
                 if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
                 if (m.reader && m.reader->has_file(rel)) {
@@ -417,6 +475,7 @@ VfsError VirtualFileSystem::read_file(const std::string &virtual_path, std::vect
         for (const auto &pair : bnd4_mounts_) {
             const std::string &m = pair.first;
             if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                under_archive_mount = true;
                 std::string rel = norm.substr(m.size());
                 if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
                 if (pair.second && pair.second->has_file(rel)) {
@@ -431,22 +490,49 @@ VfsError VirtualFileSystem::read_file(const std::string &virtual_path, std::vect
     std::string host_path;
     bool ro = false;
     VfsError err = resolve(virtual_path, host_path, ro);
-    if (err != VfsError::ok) return err;
-
-    std::ifstream file(std::filesystem::u8path(host_path), std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        return VfsError::not_found;
+    if (err == VfsError::ok) {
+        std::error_code ec;
+        auto fs_path = std::filesystem::u8path(host_path);
+        auto status = std::filesystem::status(fs_path, ec);
+        if (ec) {
+            if (ec == std::errc::no_such_file_or_directory) {
+                ec.clear();
+            } else {
+                // T176: Falha de acesso ou de I/O ao consultar status do arquivo físico host;
+                // não mascarar recorrendo a synthetic_files_.
+                return VfsError::io_error;
+            }
+        } else if (std::filesystem::exists(status)) {
+            if (std::filesystem::is_directory(status)) {
+                return VfsError::io_error;
+            }
+            std::ifstream file(fs_path, std::ios::binary | std::ios::ate);
+            if (!file.is_open()) {
+                // T176: O arquivo host existe mas não pôde ser aberto; propaga io_error.
+                return VfsError::io_error;
+            }
+            const auto size = file.tellg();
+            if (size < 0) return VfsError::io_error;
+            out_data.resize(static_cast<std::size_t>(size));
+            file.seekg(0, std::ios::beg);
+            if (size > 0 && !file.read(reinterpret_cast<char *>(out_data.data()), size)) {
+                return VfsError::io_error;
+            }
+            return VfsError::ok;
+        }
     }
 
-    const auto size = file.tellg();
-    if (size < 0) return VfsError::io_error;
-
-    out_data.resize(static_cast<std::size_t>(size));
-    file.seekg(0, std::ios::beg);
-    if (size > 0 && !file.read(reinterpret_cast<char *>(out_data.data()), size)) {
-        return VfsError::io_error;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto syn_it = synthetic_files_.find(norm);
+        if (syn_it != synthetic_files_.end()) {
+            out_data = syn_it->second;
+            return VfsError::ok;
+        }
     }
-    return VfsError::ok;
+
+    if (err != VfsError::ok && !under_archive_mount) return err;
+    return VfsError::not_found;
 }
 
 VfsError VirtualFileSystem::read_at(const std::string &virtual_path, std::uint64_t offset,
@@ -455,6 +541,99 @@ VfsError VirtualFileSystem::read_at(const std::string &virtual_path, std::uint64
     if (bytes_to_read && !dest) return VfsError::invalid_path;
     const std::string norm = normalize_path(virtual_path);
     if (contains_traversal(norm)) return VfsError::traversal_detected;
+
+    // Archive mounts take precedence over host directories with the same path.
+    // Copy the reader under the lock, then perform potentially slow I/O unlocked.
+    std::shared_ptr<Bhd5Reader> archive;
+    std::string archive_rel;
+    std::shared_ptr<Bnd4Reader> bnd4_archive;
+    std::string bnd4_rel;
+    bool under_archive_mount = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &m : bhd5_mounts_) {
+            const std::string &mp = m.mount_point;
+            if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
+                under_archive_mount = true;
+                std::string rel = norm.substr(mp.size());
+                if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+                if (m.reader && m.reader->has_file(rel)) {
+                    archive = m.reader;
+                    archive_rel = rel;
+                    break;
+                }
+            }
+        }
+        if (!archive) {
+            for (const auto &pair : bnd4_mounts_) {
+                const auto &m = pair.first;
+                if (norm == m || norm.rfind(m + "/", 0) == 0) {
+                    under_archive_mount = true;
+                    std::string rel = norm.substr(m.size());
+                    if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+                    if (pair.second && pair.second->has_file(rel)) {
+                        bnd4_archive = pair.second;
+                        bnd4_rel = rel;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (archive) {
+        if (!bytes_to_read) return VfsError::ok;
+        const BinderError err = archive->stream_file(archive_rel, offset, dest, bytes_to_read, out_bytes_read);
+        if (err == BinderError::ok) return VfsError::ok;
+        if (err == BinderError::file_not_found) return VfsError::not_found;
+        return VfsError::io_error;
+    }
+    if (bnd4_archive) {
+        if (!bytes_to_read) return VfsError::ok;
+        const BinderError err = bnd4_archive->stream_file(bnd4_rel, offset, dest, bytes_to_read, out_bytes_read);
+        if (err == BinderError::ok) return VfsError::ok;
+        if (err == BinderError::file_not_found) return VfsError::not_found;
+        return VfsError::io_error;
+    }
+    // T170: Se o arquivo não existe dentro dos archives BHD5/BND4, manter alinhamento
+    // com stat/read_file consultando os diretórios do host e arquivos sintéticos.
+    std::string host_path;
+    bool readonly = false;
+    const auto err = resolve(virtual_path, host_path, readonly);
+    if (err == VfsError::ok) {
+        std::error_code ec;
+        auto fs_path = std::filesystem::u8path(host_path);
+        auto status = std::filesystem::status(fs_path, ec);
+        if (ec) {
+            if (ec == std::errc::no_such_file_or_directory) {
+                ec.clear();
+            } else {
+                // T176: Erro de acesso ou de I/O ao consultar status do arquivo host; propaga io_error.
+                return VfsError::io_error;
+            }
+        } else if (std::filesystem::exists(status)) {
+            if (std::filesystem::is_directory(status)) {
+                return VfsError::io_error;
+            }
+            std::ifstream file(fs_path, std::ios::binary | std::ios::ate);
+            if (!file.is_open()) {
+                // T176: O arquivo host existe mas não pôde ser aberto; propaga io_error.
+                return VfsError::io_error;
+            }
+            const auto end = file.tellg();
+            if (end < 0) return VfsError::io_error;
+            const auto size = static_cast<std::uint64_t>(end);
+            if (offset >= size || bytes_to_read == 0) return VfsError::ok;
+
+            const auto count = static_cast<std::streamsize>(std::min<std::uint64_t>(
+                {size - offset, static_cast<std::uint64_t>(bytes_to_read),
+                 static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())}));
+            file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+            if (!file) return VfsError::io_error;
+            file.read(static_cast<char *>(dest), count);
+            out_bytes_read = static_cast<std::size_t>(file.gcount());
+            return file.bad() || (file.fail() && !file.eof()) ? VfsError::io_error : VfsError::ok;
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -474,67 +653,8 @@ VfsError VirtualFileSystem::read_at(const std::string &virtual_path, std::uint64
         }
     }
 
-    // Archive mounts take precedence over host directories with the same path.
-    // Copy the reader under the lock, then perform potentially slow BDT I/O unlocked.
-    std::shared_ptr<Bhd5Reader> archive;
-    std::string archive_rel;
-    bool matched_bhd_mount = false;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto &m : bhd5_mounts_) {
-            const std::string &mp = m.mount_point;
-            if (norm == mp || norm.rfind(mp + "/", 0) == 0) {
-                matched_bhd_mount = true;
-                std::string rel = norm.substr(mp.size());
-                if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
-                if (m.reader && m.reader->has_file(rel)) {
-                    archive = m.reader;
-                    archive_rel = rel;
-                    break;
-                }
-            }
-        }
-        if (!archive && !matched_bhd_mount) {
-            for (const auto &pair : bnd4_mounts_) {
-                const auto &m = pair.first;
-                if (norm == m || norm.rfind(m + "/", 0) == 0) {
-                    return VfsError::access_denied;
-                }
-            }
-        }
-    }
-    if (archive) {
-        if (!bytes_to_read) return VfsError::ok;
-        const BinderError err = archive->stream_file(archive_rel, offset, dest, bytes_to_read, out_bytes_read);
-        if (err == BinderError::ok) return VfsError::ok;
-        if (err == BinderError::file_not_found) return VfsError::not_found;
-        return VfsError::io_error;
-    }
-    if (matched_bhd_mount) {
-        return VfsError::not_found;
-    }
-
-    std::string host_path;
-    bool readonly = false;
-    const auto err = resolve(virtual_path, host_path, readonly);
-    if (err != VfsError::ok) return err;
-
-    std::ifstream file(std::filesystem::u8path(host_path), std::ios::binary | std::ios::ate);
-    if (!file.is_open()) return VfsError::not_found;
-    const auto end = file.tellg();
-    if (end < 0) return VfsError::io_error;
-    const auto size = static_cast<std::uint64_t>(end);
-    if (offset >= size || bytes_to_read == 0) return VfsError::ok;
-
-    const auto count = static_cast<std::streamsize>(std::min<std::uint64_t>(
-        {size - offset, static_cast<std::uint64_t>(bytes_to_read),
-         static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())}));
-    file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    if (!file) return VfsError::io_error;
-    file.read(static_cast<char *>(dest), count);
-    out_bytes_read = static_cast<std::size_t>(file.gcount());
-    // EOF can occur when the file shrinks after tellg; report the short read.
-    return file.bad() || (file.fail() && !file.eof()) ? VfsError::io_error : VfsError::ok;
+    if (err != VfsError::ok && !under_archive_mount) return err;
+    return VfsError::not_found;
 }
 
 VfsError VirtualFileSystem::write_file(const std::string &virtual_path, const void *data, std::size_t size, bool atomic) {
@@ -544,14 +664,20 @@ VfsError VirtualFileSystem::write_file(const std::string &virtual_path, const vo
     if (err != VfsError::ok) return err;
     if (ro) return VfsError::access_denied;
 
+    // T177: Rejeitar data == nullptr com size > 0 antes de modificar qualquer arquivo ou filesystem
+    if (size > 0 && data == nullptr) {
+        return VfsError::io_error;
+    }
+
     std::filesystem::path p(host_path);
     std::error_code ec;
     if (p.has_parent_path()) {
         std::filesystem::create_directories(p.parent_path(), ec);
+        if (ec) return VfsError::io_error;
     }
 
     if (atomic) {
-        // Escrita at?mica via arquivo tempor?rio + rename
+        // Escrita atômica via arquivo temporário + backup/rollback
         auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
         std::string tmp_path = host_path + ".tmp." + std::to_string(now_ns);
         {
@@ -566,12 +692,40 @@ VfsError VirtualFileSystem::write_file(const std::string &virtual_path, const vo
                 return VfsError::io_error;
             }
         }
-        std::filesystem::rename(tmp_path, host_path, ec);
-        if (ec) {
-            // Em caso de falha de rename (ex: destino j? existente no Windows), tenta remover e renomear
-            std::filesystem::remove(host_path, ec);
-            std::filesystem::rename(tmp_path, host_path, ec);
-            if (ec) {
+
+        auto do_rename = [&](const std::filesystem::path &from, const std::filesystem::path &to, std::error_code &err_c) -> bool {
+            RenameHook hook;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                hook = rename_hook_;
+            }
+            if (hook) {
+                err_c = hook(from, to);
+                return !err_c;
+            }
+            std::filesystem::rename(from, to, err_c);
+            return !err_c;
+        };
+
+        bool dest_existed = std::filesystem::exists(host_path, ec);
+        if (dest_existed) {
+            std::string bak_path = host_path + ".bak." + std::to_string(now_ns);
+            // Move original para backup garantindo que o destino pode ser substituído e restaurado
+            if (!do_rename(host_path, bak_path, ec)) {
+                std::filesystem::remove(tmp_path, ec);
+                return VfsError::io_error;
+            }
+            if (!do_rename(tmp_path, host_path, ec)) {
+                // Falha na substituição: restaura o arquivo original a partir do backup
+                std::error_code roll_ec;
+                do_rename(bak_path, host_path, roll_ec);
+                std::filesystem::remove(tmp_path, ec);
+                return VfsError::io_error;
+            }
+            // Sucesso: remove o backup
+            std::filesystem::remove(bak_path, ec);
+        } else {
+            if (!do_rename(tmp_path, host_path, ec)) {
                 std::filesystem::remove(tmp_path, ec);
                 return VfsError::io_error;
             }
@@ -596,7 +750,14 @@ VfsError VirtualFileSystem::remove_file(const std::string &virtual_path) {
     if (ro) return VfsError::access_denied;
 
     std::error_code ec;
-    if (!std::filesystem::remove(host_path, ec)) {
+    bool removed = std::filesystem::remove(host_path, ec);
+    if (ec) {
+        if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) {
+            return VfsError::access_denied;
+        }
+        return VfsError::io_error;
+    }
+    if (!removed) {
         return VfsError::not_found;
     }
     return VfsError::ok;

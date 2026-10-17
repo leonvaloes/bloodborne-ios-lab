@@ -7,6 +7,8 @@
 #include <vector>
 #include <array>
 #include <mutex>
+#include <filesystem>
+#include <unordered_map>
 
 namespace bb {
 
@@ -17,6 +19,7 @@ constexpr int32_t SCE_SAVEDATA_OK                     = 0;
 constexpr int32_t SCE_SAVEDATA_ERROR_PARAMETER        = static_cast<int32_t>(0x809F0000);
 constexpr int32_t SCE_SAVEDATA_ERROR_NOT_INITIALIZED  = static_cast<int32_t>(0x809F0001);
 constexpr int32_t SCE_SAVEDATA_ERROR_NOT_MOUNTED      = static_cast<int32_t>(0x809F0004);
+constexpr int32_t SCE_SAVEDATA_ERROR_BROKEN           = static_cast<int32_t>(0x809F0005);
 constexpr int32_t SCE_SAVEDATA_ERROR_EXISTS           = static_cast<int32_t>(0x809F0007);
 constexpr int32_t SCE_SAVEDATA_ERROR_NOT_FOUND        = static_cast<int32_t>(0x809F0008);
 constexpr int32_t SCE_SAVEDATA_ERROR_INTERNAL         = static_cast<int32_t>(0x809F000B);
@@ -167,6 +170,11 @@ static_assert(sizeof(SceSaveDataInitParams) == 64, "SceSaveDataInitParams layout
 
 struct SaveSlotInfo {
     bool used{false};
+    bool created_slot{false};
+    bool original_param_exists{false};
+    SceSaveDataParam original_param{};
+    bool original_icon_exists{false};
+    std::vector<uint8_t> original_icon{};
     int32_t user{0};
     std::string title_id;
     std::string dir_name;
@@ -184,6 +192,14 @@ struct SaveSearchEntry {
     SceSaveDataParam param{};
     uint64_t blocks{32768};
     uint64_t free_blocks{16384};
+};
+
+// Operacoes injetaveis para testar falhas de exclusao sem depender de ACL do host.
+class SaveDeleteFilesystem {
+public:
+    virtual ~SaveDeleteFilesystem() = default;
+    virtual bool exists(const std::filesystem::path &path, std::error_code &ec) = 0;
+    virtual std::uintmax_t remove_all(const std::filesystem::path &path, std::error_code &ec) = 0;
 };
 
 class SaveDataManager {
@@ -218,6 +234,11 @@ public:
                   uint64_t blocks, std::string &out_mount_point, uint32_t &out_status);
     int32_t umount(const std::string &mount_point, bool commit = true);
     int32_t delete_save(int32_t user, const char *title, const char *dir_name);
+    // nullptr restaura as operacoes padrao; o chamador mantem a instancia viva.
+    void set_delete_filesystem_for_testing(SaveDeleteFilesystem *filesystem);
+    enum class WriteFailurePhase { None, TmpWrite, Checksum, Backup, Replacement, MetadataUpdate };
+    void set_test_write_failure_phase(WriteFailurePhase phase) { test_write_failure_phase_ = phase; }
+    WriteFailurePhase get_test_write_failure_phase() const { return test_write_failure_phase_; }
     int32_t dir_name_search(int32_t user, const char *title, const char *pattern,
                             uint32_t sort_key, uint32_t sort_order,
                             std::vector<SaveSearchEntry> &out_entries);
@@ -251,28 +272,42 @@ public:
     static bool is_valid_title_id(const char *title, std::size_t max_len = 16);
     static bool contains_traversal(const std::string &path);
     static bool pattern_matches(const std::string &str, const std::string &pattern);
+    std::filesystem::path resolve_savedata_root() const;
+    bool is_confined_to_savedata_root(const std::filesystem::path &target) const;
+    bool check_work_quota(const std::string &file_path, std::int64_t current_file_size, std::int64_t new_file_size) const;
+    void recover_interrupted_commits();
 
-    // Flag de audio de Bloodborne (sound hack)
+    // Ajuste legado opt-in; montagens normais preservam integralmente o save.
+    void set_sound_hack_enabled(bool enabled);
     void apply_bloodborne_sound_hack(const std::string &work_path);
 
 private:
     mutable std::mutex mutex_;
+    SaveDeleteFilesystem *delete_filesystem_for_testing_{nullptr};
     bool initialized_{false};
+    bool sound_hack_enabled_{false};
+    WriteFailurePhase test_write_failure_phase_{WriteFailurePhase::None};
     std::string base_dir_;
     std::string default_title_id_{"CUSA03173"};
     std::size_t max_quota_per_slot_{DEFAULT_MAX_QUOTA_PER_SLOT};
     VirtualFileSystem *vfs_{nullptr};
     std::array<SaveSlotInfo, MAX_SLOTS> slots_{};
 
-    // SaveDataMemory
-    std::string memory_path_;
-    uint64_t memory_size_{0};
+    // SaveDataMemory per-user
+    struct UserMemoryState {
+        std::string path;
+        uint64_t size{0};
+    };
+    std::unordered_map<int32_t, UserMemoryState> user_memories_;
 
     std::string resolve_save_dir(int32_t user, const char *title, const char *dir_name) const;
     std::string resolve_meta_dir(int32_t user, const char *title, const char *dir_name) const;
     bool atomic_commit_directory(const std::string &staging_dir, const std::string &dest_dir);
-    void write_meta_param(const std::string &meta_dir, const SceSaveDataParam &param);
+    bool write_meta_param(const std::string &meta_dir, const SceSaveDataParam &param);
     bool read_meta_param(const std::string &meta_dir, SceSaveDataParam &param) const;
+    static std::string compute_directory_sha256(const std::filesystem::path &dir_path);
+    static bool write_checksum(const std::filesystem::path &meta_dir, const std::string &checksum);
+    static bool verify_checksum(const std::filesystem::path &host_dir, const std::filesystem::path &meta_dir);
 };
 
 } // namespace bb

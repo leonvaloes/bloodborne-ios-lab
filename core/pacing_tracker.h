@@ -9,6 +9,34 @@ namespace bb {
 // Constante alvo de 30 FPS para o pacing de Bloodborne no iOS (33.3333 ms por quadro)
 constexpr double TARGET_FRAME_TIME_MS_30FPS = 1000.0 / 30.0;
 
+// Níveis de pressão térmica e parametrização de carga para CPU guest e FPS (T182 / US5/AC1)
+enum class ThermalThrottlingLevel {
+    Nominal,
+    Fair,
+    Serious,
+    Critical
+};
+
+struct ThermalThrottlingConfig {
+    double target_fps = 30.0;
+    std::uint32_t cpu_step_budget = 50000;
+    std::uint32_t reschedule_delay_ms = 0;
+};
+
+inline ThermalThrottlingConfig get_thermal_throttling_config(ThermalThrottlingLevel level) {
+    switch (level) {
+        case ThermalThrottlingLevel::Critical:
+            return {20.0, 15000, 15};
+        case ThermalThrottlingLevel::Serious:
+            return {24.0, 25000, 5};
+        case ThermalThrottlingLevel::Fair:
+            return {30.0, 40000, 0};
+        case ThermalThrottlingLevel::Nominal:
+        default:
+            return {30.0, 50000, 0};
+    }
+}
+
 class PacingTracker : public FramePacingTracker {
 public:
     explicit PacingTracker(std::size_t window_size = 120, double target_fps = 30.0)

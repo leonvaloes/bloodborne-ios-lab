@@ -9,6 +9,22 @@
 eboot.bin
 *.prx
 *.pkg
+*.elf
+*.self
+*.sprx
+game/
+dumps/
+secrets/
+*.exe
+*.dll
+*.o
+*.a
+*.so
+*.swp
+Thumbs.db
+.vscode/
+.idea/
+.env*
 *.xcuserstate
 .DS_Store
 

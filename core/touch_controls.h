@@ -49,7 +49,8 @@ enum class VirtualControlId {
     ButtonR2,
     ButtonOptions,
     ButtonR3,   // Lock-on (R3)
-    ButtonL3
+    ButtonL3,
+    ButtonTouchPad
 };
 
 // Modo de operação dos analógicos virtuais

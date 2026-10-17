@@ -1,5 +1,6 @@
 #include "fios2_hle.h"
 #include "binder.h"
+#include "save_data.h"
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
@@ -409,6 +410,12 @@ std::int64_t Fios2Manager::sceFiosFHWriteSync(SceFiosFH fh, const void* data, st
         return SCE_FIOS_ERROR_ACCESS_DENIED;
     }
 
+    const std::uint64_t prospective_size = (entry->flags & SCE_FIOS_O_APPEND) ? (entry->file_size + size) : std::max(entry->file_size, entry->cursor + size);
+    if (SaveDataManager::instance().is_initialized() &&
+        !SaveDataManager::instance().check_work_quota(entry->host_path, entry->file_size, prospective_size)) {
+        return SCE_FIOS_ERROR_DISK_FULL;
+    }
+
     if (entry->flags & SCE_FIOS_O_APPEND) {
         entry->host_stream->seekp(0, std::ios::end);
         entry->cursor = static_cast<std::uint64_t>(entry->host_stream->tellp());
@@ -417,6 +424,7 @@ std::int64_t Fios2Manager::sceFiosFHWriteSync(SceFiosFH fh, const void* data, st
     }
 
     entry->host_stream->write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    entry->host_stream->flush();
     if (!entry->host_stream->good()) {
         entry->host_stream->clear();
         return SCE_FIOS_ERROR_IO;
@@ -535,6 +543,80 @@ std::int32_t Fios2Manager::sceFiosFHSyncSync(SceFiosFH fh) {
 std::int32_t Fios2Manager::sceFiosFHSyncSync(SceFiosOp* op, SceFiosFH fh) {
     std::int32_t res = sceFiosFHSyncSync(fh);
     impl_->update_op(op, res == SCE_FIOS_OK ? 1 : 0, res);
+    return res;
+}
+
+std::int32_t Fios2Manager::sceFiosFHTruncateSync(SceFiosFH fh, std::int64_t length) {
+    if (length < 0) return SCE_FIOS_ERROR_INVALID_ARGUMENT;
+    std::shared_ptr<FileHandleEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto it = impl_->file_handles.find(fh);
+        if (it == impl_->file_handles.end()) return SCE_FIOS_ERROR_INVALID_HANDLE;
+        entry = it->second;
+    }
+    std::lock_guard<std::mutex> hlock(entry->handle_mutex);
+    if (entry->is_readonly || !entry->host_stream) return SCE_FIOS_ERROR_ACCESS_DENIED;
+
+    if (SaveDataManager::instance().is_initialized() &&
+        !SaveDataManager::instance().check_work_quota(entry->host_path, entry->file_size, length)) {
+        return SCE_FIOS_ERROR_DISK_FULL;
+    }
+
+    std::error_code ec;
+    entry->host_stream->flush();
+    std::filesystem::resize_file(entry->host_path, static_cast<std::uintmax_t>(length), ec);
+    if (ec) return SCE_FIOS_ERROR_IO;
+
+    entry->file_size = static_cast<std::uint64_t>(length);
+    if (entry->cursor > entry->file_size) entry->cursor = entry->file_size;
+    return SCE_FIOS_OK;
+}
+
+std::int32_t Fios2Manager::sceFiosFHTruncateSync(SceFiosOp* op, SceFiosFH fh, std::int64_t length) {
+    std::int32_t res = sceFiosFHTruncateSync(fh, length);
+    impl_->update_op(op, res == SCE_FIOS_OK ? length : 0, res);
+    return res;
+}
+
+std::int32_t Fios2Manager::sceFiosFileTruncateSync(const std::string& path, std::int64_t length) {
+    if (length < 0) return SCE_FIOS_ERROR_INVALID_ARGUMENT;
+    if (!impl_->vfs) return SCE_FIOS_ERROR_NOT_INITIALIZED;
+    if (path.empty() || path.size() > SCE_FIOS_MAX_PATH) return SCE_FIOS_ERROR_INVALID_ARGUMENT;
+
+    std::string norm = VirtualFileSystem::normalize_path(path);
+    if (VirtualFileSystem::contains_traversal(norm)) return SCE_FIOS_ERROR_PATH_TRAVERSAL;
+
+    std::string resolved = impl_->resolve_overlay(norm, true);
+    std::string host_path;
+    bool is_ro = true;
+    VfsError v_err = impl_->vfs->resolve(resolved, host_path, is_ro);
+    if (v_err == VfsError::traversal_detected) return SCE_FIOS_ERROR_PATH_TRAVERSAL;
+    if (v_err == VfsError::not_mounted) return SCE_FIOS_ERROR_NOT_MOUNTED;
+    if (v_err != VfsError::ok) return SCE_FIOS_ERROR_IO;
+    if (is_ro) return SCE_FIOS_ERROR_ACCESS_DENIED;
+
+    std::error_code ec;
+    if (!std::filesystem::exists(host_path, ec)) return SCE_FIOS_ERROR_NOT_FOUND;
+    if (std::filesystem::is_directory(host_path, ec)) return SCE_FIOS_ERROR_IS_A_DIRECTORY;
+
+    std::uint64_t cur_sz = std::filesystem::file_size(host_path, ec);
+    if (ec) return SCE_FIOS_ERROR_IO;
+
+    if (SaveDataManager::instance().is_initialized() &&
+        !SaveDataManager::instance().check_work_quota(host_path, cur_sz, length)) {
+        return SCE_FIOS_ERROR_DISK_FULL;
+    }
+
+    std::filesystem::resize_file(host_path, static_cast<std::uintmax_t>(length), ec);
+    if (ec) return SCE_FIOS_ERROR_IO;
+    return SCE_FIOS_OK;
+}
+
+std::int32_t Fios2Manager::sceFiosFileTruncateSync(SceFiosOp* op, const char* path, std::int64_t length) {
+    if (!path) return SCE_FIOS_ERROR_INVALID_ARGUMENT;
+    std::int32_t res = sceFiosFileTruncateSync(path, length);
+    impl_->update_op(op, res == SCE_FIOS_OK ? length : 0, res);
     return res;
 }
 
@@ -858,14 +940,30 @@ std::int32_t Fios2Manager::sceFiosRenameSync(const std::string& old_path, const 
     std::filesystem::path new_p(new_host);
     if (new_p.has_parent_path()) {
         std::filesystem::create_directories(new_p.parent_path(), ec);
+        if (ec) return SCE_FIOS_ERROR_IO;
     }
 
-    if (std::filesystem::exists(new_host, ec)) {
-        std::filesystem::remove(new_host, ec);
+    std::filesystem::path bak_host;
+    bool has_existing = std::filesystem::exists(new_host, ec);
+    if (has_existing) {
+        auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        bak_host = new_p.string() + ".fios_bak." + std::to_string(now_ns);
+        std::filesystem::rename(new_host, bak_host, ec);
+        if (ec) return SCE_FIOS_ERROR_IO;
     }
 
     std::filesystem::rename(old_host, new_host, ec);
-    if (ec) return SCE_FIOS_ERROR_IO;
+    if (ec) {
+        if (has_existing) {
+            std::error_code r_ec;
+            std::filesystem::rename(bak_host, new_host, r_ec);
+        }
+        return SCE_FIOS_ERROR_IO;
+    }
+
+    if (has_existing) {
+        std::filesystem::remove(bak_host, ec);
+    }
     return SCE_FIOS_OK;
 }
 
@@ -1001,16 +1099,15 @@ std::int32_t Fios2Manager::sceFiosArchiveMountSync(const std::string& archive_pa
 
     std::string host_arc;
     bool is_ro = true;
-    if (impl_->vfs->resolve(norm_arc, host_arc, is_ro) != VfsError::ok) {
-        host_arc = norm_arc;
+    VfsError v_err = impl_->vfs->resolve(norm_arc, host_arc, is_ro);
+    if (v_err != VfsError::ok) {
+        return SCE_FIOS_ERROR_NOT_FOUND;
     }
 
     std::error_code ec;
     bool exists = std::filesystem::exists(host_arc, ec);
     if (!exists) {
-        if (!impl_->vfs->exists(norm_arc)) {
-            return SCE_FIOS_ERROR_NOT_FOUND;
-        }
+        return SCE_FIOS_ERROR_NOT_FOUND;
     }
 
     if (std::filesystem::is_directory(host_arc, ec)) {

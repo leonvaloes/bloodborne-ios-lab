@@ -230,7 +230,8 @@ static void test_all_buttons_and_triggers() {
         {VirtualControlId::ButtonR1,       PAD_R1},
         {VirtualControlId::ButtonOptions,  PAD_OPTIONS},
         {VirtualControlId::ButtonR3,       PAD_R3},
-        {VirtualControlId::ButtonL3,       PAD_L3}
+        {VirtualControlId::ButtonL3,       PAD_L3},
+        {VirtualControlId::ButtonTouchPad, PAD_TOUCH_PAD}
     };
 
     std::uint64_t touch_id = 30;
@@ -376,6 +377,61 @@ static void test_max_simultaneous_touches() {
     CHECK(overlay.active_touch_count() == 0);
 }
 
+static void test_screen_layout_validation_and_preservation() {
+    using namespace bb;
+    InputManager input;
+    TouchControlsOverlay overlay(&input);
+
+    const auto initial_layout = overlay.get_screen_layout();
+    CHECK(initial_layout.width > 0.0f);
+    CHECK(initial_layout.height > 0.0f);
+    const auto initial_left_bounds = overlay.get_left_stick_bounds();
+
+    // 1. Rejeição de largura não positiva
+    ScreenLayoutConfig bad_width = initial_layout;
+    bad_width.width = 0.0f;
+    overlay.set_screen_layout(bad_width);
+    CHECK(overlay.get_screen_layout().width == initial_layout.width);
+    CHECK(overlay.get_left_stick_bounds().center_x == initial_left_bounds.center_x);
+
+    bad_width.width = -100.0f;
+    overlay.set_screen_layout(bad_width);
+    CHECK(overlay.get_screen_layout().width == initial_layout.width);
+
+    // 2. Rejeição de altura não positiva
+    ScreenLayoutConfig bad_height = initial_layout;
+    bad_height.height = -50.0f;
+    overlay.set_screen_layout(bad_height);
+    CHECK(overlay.get_screen_layout().height == initial_layout.height);
+
+    // 3. Rejeição de valores não finitos (NaN e Infinito)
+    ScreenLayoutConfig nan_layout = initial_layout;
+    nan_layout.width = std::numeric_limits<float>::quiet_NaN();
+    overlay.set_screen_layout(nan_layout);
+    CHECK(overlay.get_screen_layout().width == initial_layout.width);
+
+    ScreenLayoutConfig inf_layout = initial_layout;
+    inf_layout.height = std::numeric_limits<float>::infinity();
+    overlay.set_screen_layout(inf_layout);
+    CHECK(overlay.get_screen_layout().height == initial_layout.height);
+
+    // 4. Rejeição de safe insets inválidos (safe_left + safe_right >= width)
+    ScreenLayoutConfig bad_insets = initial_layout;
+    bad_insets.safe_left = initial_layout.width * 0.6f;
+    bad_insets.safe_right = initial_layout.width * 0.5f;
+    overlay.set_screen_layout(bad_insets);
+    CHECK(overlay.get_screen_layout().safe_left == initial_layout.safe_left);
+
+    // 5. Aplicação bem-sucedida de nova configuração válida (ex: iPhone 15 Pro Max 932x430)
+    ScreenLayoutConfig valid_max = initial_layout;
+    valid_max.width = 932.0f;
+    valid_max.height = 430.0f;
+    overlay.set_screen_layout(valid_max);
+    CHECK(overlay.get_screen_layout().width == 932.0f);
+    CHECK(overlay.get_screen_layout().height == 430.0f);
+    CHECK(overlay.get_left_stick_bounds().center_x > 0.0f);
+}
+
 int main() {
     return run([] {
         test_multitouch_hunting_actions();
@@ -386,5 +442,6 @@ int main() {
         test_camera_sensitivity_and_deadzone();
         test_floating_stick_mode();
         test_max_simultaneous_touches();
+        test_screen_layout_validation_and_preservation();
     });
 }

@@ -14,6 +14,12 @@ static inline std::int16_t clamp_s16(float val) {
     return static_cast<std::int16_t>(std::round(val));
 }
 
+static inline std::int16_t clamp_s16(std::int32_t val) {
+    if (val > 32767) return 32767;
+    if (val < -32768) return -32768;
+    return static_cast<std::int16_t>(val);
+}
+
 AudioOutManager::AudioOutManager() = default;
 
 AudioOutManager::~AudioOutManager() {
@@ -173,9 +179,22 @@ void AudioOutManager::close_all_ports() {
     ports_.clear();
 }
 
+void AudioOutManager::purge_inactive_buffers() {
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    for (auto &kv : ports_) {
+        if (kv.second && kv.second->ring_buffer) {
+            std::lock_guard<std::mutex> port_lock(kv.second->mutex);
+            if (!kv.second->is_open || paused_) {
+                kv.second->ring_buffer->reset();
+            }
+        }
+    }
+}
+
 std::int32_t AudioOutManager::output(std::int32_t handle, const void *ptr, std::size_t frames) {
     if (!ptr) return SCE_AUDIO_OUT_ERROR_INVALID_POINTER;
     if (handle <= 0) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
+    if (frames > MAX_SAMPLES_PER_BLOCK) return SCE_AUDIO_OUT_ERROR_INVALID_PARAM;
 
     std::lock_guard<std::mutex> lock(manager_mutex_);
     if (paused_) {
@@ -192,6 +211,7 @@ std::int32_t AudioOutManager::output(std::int32_t handle, const void *ptr, std::
     }
 
     std::size_t count = (frames > 0) ? frames : static_cast<std::size_t>(port->len);
+    if (count > MAX_SAMPLES_PER_BLOCK) return SCE_AUDIO_OUT_ERROR_INVALID_PARAM;
     if (count == 0) return SCE_OK;
 
     const auto *src = static_cast<const std::int16_t*>(ptr);
@@ -199,11 +219,12 @@ std::int32_t AudioOutManager::output(std::int32_t handle, const void *ptr, std::
     std::int32_t vl = port->volume_left;
     std::int32_t vr = port->volume_right;
 
+    std::size_t written = 0;
     if (vl == SCE_AUDIO_OUT_VOLUME_0dB && vr == SCE_AUDIO_OUT_VOLUME_0dB) {
-        port->ring_buffer->write(src, count);
+        written = port->ring_buffer->write(src, count);
     } else if (vl <= 0 && vr <= 0) {
         std::vector<std::int16_t> silence(count * ch, static_cast<std::int16_t>(0));
-        port->ring_buffer->write(silence.data(), count);
+        written = port->ring_buffer->write(silence.data(), count);
     } else {
         float gain_l = static_cast<float>(vl) / static_cast<float>(SCE_AUDIO_OUT_VOLUME_0dB);
         float gain_r = static_cast<float>(vr) / static_cast<float>(SCE_AUDIO_OUT_VOLUME_0dB);
@@ -228,10 +249,13 @@ std::int32_t AudioOutManager::output(std::int32_t handle, const void *ptr, std::
                 }
             }
         }
-        port->ring_buffer->write(scaled.data(), count);
+        written = port->ring_buffer->write(scaled.data(), count);
     }
 
-    port->total_frames_output += count;
+    port->total_frames_output += written;
+    if (written < count) {
+        port->dropped_frames += (count - written);
+    }
     port->last_output_time_us = get_current_time_us();
     return SCE_OK;
 }
@@ -239,6 +263,7 @@ std::int32_t AudioOutManager::output(std::int32_t handle, const void *ptr, std::
 std::int32_t AudioOutManager::output_hle(std::int32_t handle, const GuestMemory &mem, std::uint64_t guest_addr, std::size_t frames) {
     if (guest_addr == 0) return SCE_AUDIO_OUT_ERROR_INVALID_POINTER;
     if (handle <= 0) return SCE_AUDIO_OUT_ERROR_INVALID_PORT;
+    if (frames > MAX_SAMPLES_PER_BLOCK) return SCE_AUDIO_OUT_ERROR_INVALID_PARAM;
 
     std::size_t count = 0;
     std::uint32_t ch = 2;
@@ -252,6 +277,7 @@ std::int32_t AudioOutManager::output_hle(std::int32_t handle, const GuestMemory 
         ch = it->second->channels;
     }
 
+    if (count > MAX_SAMPLES_PER_BLOCK) return SCE_AUDIO_OUT_ERROR_INVALID_PARAM;
     if (count == 0) return SCE_OK;
     std::size_t bytes = count * ch * sizeof(std::int16_t);
     std::vector<std::int16_t> temp(count * ch);
@@ -388,6 +414,7 @@ std::int32_t AudioOutManager::get_port_info(std::int32_t handle, SceAudioOutPort
     info->volume_left = port->volume_left;
     info->volume_right = port->volume_right;
     info->total_frames_output = port->total_frames_output;
+    info->dropped_frames = port->dropped_frames;
     if (port->ring_buffer) {
         auto stats = port->ring_buffer->get_stats();
         info->underflow_count = stats.underflow_count;
@@ -451,24 +478,69 @@ std::size_t AudioOutManager::drain_main_port_pcm16(std::int16_t *out_samples, st
         std::memset(out_samples, 0, frames * 2 * sizeof(std::int16_t));
         return 0;
     }
+
+    std::vector<std::int32_t> mixed(frames * 2, 0);
+    std::size_t max_received = 0;
+    bool any_port_drained = false;
+
     for (const auto& kv : ports_) {
-        if (!kv.second || !kv.second->is_open ||
-            kv.second->type != SCE_AUDIO_OUT_PORT_TYPE_MAIN) continue;
+        if (!kv.second || !kv.second->is_open) continue;
+        if (kv.second->type != SCE_AUDIO_OUT_PORT_TYPE_MAIN &&
+            kv.second->type != SCE_AUDIO_OUT_PORT_TYPE_BGM) continue;
+
         auto& port = *kv.second;
         std::lock_guard<std::mutex> port_lock(port.mutex);
         if (!port.is_open || !port.ring_buffer) continue;
-        if (port.channels == 2) return port.ring_buffer->read(out_samples, frames);
-        if (port.channels != 1 && port.channels != 8) continue;
-        if (frames > std::vector<std::int16_t>().max_size() / port.channels) return 0;
-        std::vector<std::int16_t> input(frames * port.channels);
-        const auto received = port.ring_buffer->read(input.data(), frames);
-        for (std::size_t i = 0; i < received; ++i) {
-            out_samples[2 * i] = input[i * port.channels];
-            out_samples[2 * i + 1] = input[i * port.channels + (port.channels == 1 ? 0 : 1)];
+
+        if (port.channels == 2) {
+            std::vector<std::int16_t> input(frames * 2);
+            const auto received = port.ring_buffer->read(input.data(), frames);
+            if (received > 0) {
+                any_port_drained = true;
+                max_received = std::max(max_received, received);
+                for (std::size_t i = 0; i < received; ++i) {
+                    mixed[2 * i] += input[2 * i];
+                    mixed[2 * i + 1] += input[2 * i + 1];
+                }
+            }
+        } else if (port.channels == 1) {
+            std::vector<std::int16_t> input(frames);
+            const auto received = port.ring_buffer->read(input.data(), frames);
+            if (received > 0) {
+                any_port_drained = true;
+                max_received = std::max(max_received, received);
+                for (std::size_t i = 0; i < received; ++i) {
+                    mixed[2 * i] += input[i];
+                    mixed[2 * i + 1] += input[i];
+                }
+            }
+        } else if (port.channels == 8) {
+            std::vector<std::int16_t> input(frames * 8);
+            const auto received = port.ring_buffer->read(input.data(), frames);
+            if (received > 0) {
+                any_port_drained = true;
+                max_received = std::max(max_received, received);
+                for (std::size_t i = 0; i < received; ++i) {
+                    mixed[2 * i] += input[8 * i];
+                    mixed[2 * i + 1] += input[8 * i + 1];
+                }
+            }
         }
-        return received;
     }
-    return 0;
+
+    if (!any_port_drained || max_received == 0) {
+        std::memset(out_samples, 0, frames * 2 * sizeof(std::int16_t));
+        return 0;
+    }
+
+    for (std::size_t i = 0; i < max_received * 2; ++i) {
+        out_samples[i] = clamp_s16(mixed[i]);
+    }
+    if (max_received < frames) {
+        std::memset(out_samples + max_received * 2, 0, (frames - max_received) * 2 * sizeof(std::int16_t));
+    }
+
+    return max_received;
 }
 
 AudioRingBuffer* AudioOutManager::get_port_ring_buffer(std::int32_t handle) {

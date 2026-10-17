@@ -66,6 +66,7 @@ struct HostBridgeDiagnostics {
     std::uint32_t video_current_buffer_index{0};
     std::uint32_t video_width{0};
     std::uint32_t video_height{0};
+    std::string intro_video_status{"not_started"};
 
     // Estatísticas de áudio
     std::size_t audio_frames_drained{0};
@@ -139,6 +140,19 @@ public:
     void set_steps_per_second(double sps) { steps_per_second_ = sps; }
     double steps_per_second() const { return steps_per_second_; }
 
+    // Rastreamento e reprodução de introdução cinematográfica (T059 / T114)
+    enum class IntroFallbackReason {
+        Finished,
+        MissingMedia,
+        PlaybackFailed,
+        UnreadableMedia,
+        UserCancelled
+    };
+
+    bool play_intro_video_or_fallback(const std::string& video_path);
+    void finish_intro_and_boot(IntroFallbackReason reason);
+    std::string intro_video_status() const;
+
     // Callback opcional para eventos de frame (para integração com run loop do host)
     using FrameCallback = std::function<void(const HostFrameBuffer&)>;
     void set_frame_callback(FrameCallback cb) { frame_callback_ = std::move(cb); }
@@ -164,6 +178,7 @@ private:
     std::uint64_t frame_count_{0};
     std::uint64_t total_steps_{0};
     bool initialized_{false};
+    std::string intro_video_status_{"not_started"};
     FrameCallback frame_callback_;
 
     // Helpers internos

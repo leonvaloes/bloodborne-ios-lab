@@ -1,6 +1,8 @@
 #include "orbis_runtime.h"
 #include "kernel_threads.h"
 #include "dialog_hle.h"
+#include "ajm_hle.h"
+#include "app_content.h"
 #include "gnm_context.h"
 #include "vfs.h"
 #include <algorithm>
@@ -39,6 +41,16 @@ FILE* portable_fopen(const std::string& path, const char* mode) {
     return _wfopen(p.c_str(), wmode.c_str());
 #else
     return std::fopen(path.c_str(), mode);
+#endif
+}
+
+FILE* portable_freopen(const std::string& path, const char* mode, FILE* stream) {
+#if defined(_WIN32)
+    std::filesystem::path p = std::filesystem::u8path(path);
+    std::wstring wmode(mode, mode + std::strlen(mode));
+    return _wfreopen(p.c_str(), wmode.c_str(), stream);
+#else
+    return std::freopen(path.c_str(), mode, stream);
 #endif
 }
 // SHA-1 de FIPS 180-4, somente 8 bytes do resultado são usados pelo NID.
@@ -105,7 +117,13 @@ std::string orbis_nid(const std::string& symbol) {
     return result;
 }
 OrbisRuntime::OrbisRuntime(GuestMemory& memory)
-    : mem_(memory), user_mgr_(), pad_mgr_(nullptr, &user_mgr_), gnm_context_(std::make_unique<GnmContext>(memory)) {
+    : mem_(memory), user_mgr_(), pad_mgr_(nullptr, &user_mgr_), gnm_context_(std::make_unique<GnmContext>(memory)),
+      owned_vfs_(std::make_unique<VirtualFileSystem>()), vfs_(owned_vfs_.get()) {
+    auto tmp_base = (std::filesystem::temp_directory_path() / "antigravity").lexically_normal();
+    std::error_code ec;
+    std::filesystem::create_directories(tmp_base, ec);
+    vfs_->mount("/temp", tmp_base.string(), false);
+    vfs_->mount("/tmp", tmp_base.string(), false);
     static const char* const symbols[] = {
 #include "orbis_import_names.h"
         "scePthreadMutexattrInit", "scePthreadMutexattrSettype", "scePthreadMutexattrDestroy",
@@ -134,7 +152,7 @@ OrbisRuntime::OrbisRuntime(GuestMemory& memory)
         // Conversions & stdlib
         "strtol", "strtoul", "strtoll", "strtoull", "strtod", "strtof", "qsort", "bsearch",
         // Formatting
-        "snprintf", "vsnprintf",
+        "snprintf", "vsnprintf", "sprintf", "vsprintf", "fprintf", "vfprintf",
         // Kernel semaphores
         "sceKernelCreateSema", "sceKernelDeleteSema", "sceKernelWaitSema", "sceKernelPollSema", "sceKernelSignalSema",
         "sceKernelGetSemaInfo",
@@ -219,6 +237,19 @@ std::uint64_t OrbisRuntime::get_errno_addr(GuestScheduler::Id tid) {
     const std::uint64_t offset = (static_cast<std::uint64_t>(tid) % 1024) * 64;
     return errno_page_ + offset;
 }
+std::uint64_t OrbisRuntime::get_static_libc_buf(std::size_t offset, std::size_t size) {
+    (void)size;
+    if (!static_libc_page_) {
+        static_libc_page_ = next_virtual_;
+        next_virtual_ += 0x10000;
+        auto err = mem_.map(static_libc_page_, 0x10000, read | write);
+        if (err != MemoryError::ok) {
+            std::printf("[HLE] failed to map static libc page at 0x%llx\n", (unsigned long long)static_libc_page_);
+        }
+        mappings_[static_libc_page_] = 0x10000;
+    }
+    return static_libc_page_ + offset;
+}
 OrbisRuntime::PthreadAttrDefaults* OrbisRuntime::find_attr(std::uint64_t slot_addr) {
     if (!slot_addr) return nullptr;
     auto it = attr_defaults_.find(slot_addr);
@@ -231,90 +262,238 @@ OrbisRuntime::PthreadAttrDefaults* OrbisRuntime::find_attr(std::uint64_t slot_ad
     return &attr_defaults_[slot_addr];
 }
 
-#pragma pack(push, 1)
-struct SceKernelStat {
-    std::uint32_t st_dev;
-    std::uint32_t st_ino;
-    std::uint16_t st_mode;
-    std::uint16_t st_nlink;
-    std::uint32_t st_uid;
-    std::uint32_t st_gid;
-    std::uint32_t st_rdev;
-    std::int64_t  st_atime_sec;
-    std::int64_t  st_atime_nsec;
-    std::int64_t  st_mtime_sec;
-    std::int64_t  st_mtime_nsec;
-    std::int64_t  st_ctime_sec;
-    std::int64_t  st_ctime_nsec;
-    std::int64_t  st_size;
-    std::int64_t  st_blocks;
-    std::uint32_t st_blksize;
-    std::uint32_t st_flags;
-    std::uint32_t st_gen;
-    std::int32_t  st_lspare;
-    std::int64_t  st_birthtime_sec;
-    std::int64_t  st_birthtime_nsec;
-};
-#pragma pack(pop)
-static_assert(sizeof(SceKernelStat) == 120, "SceKernelStat size must be 120 bytes");
+void OrbisRuntime::attach_vfs(VirtualFileSystem* vfs) {
+    if (vfs) {
+        vfs_ = vfs;
+    } else {
+        vfs_ = owned_vfs_.get();
+    }
+    if (vfs_ && !app0_dir_.empty()) {
+        vfs_->mount("/app0", app0_dir_.string(), true);
+    }
+    if (vfs_ && !vfs_->is_mounted("/temp")) {
+        auto tmp_base = (std::filesystem::temp_directory_path() / "antigravity").lexically_normal();
+        std::error_code ec;
+        std::filesystem::create_directories(tmp_base, ec);
+        vfs_->mount("/temp", tmp_base.string(), false);
+        vfs_->mount("/tmp", tmp_base.string(), false);
+    }
+}
 
-std::string OrbisRuntime::resolve_guest_path(const std::string& guest_path) const {
+void OrbisRuntime::set_app0_dir(const std::filesystem::path& dir) {
+    app0_dir_ = dir;
+    if (vfs_) {
+        vfs_->mount("/app0", dir.string(), true);
+    }
+}
+
+std::string OrbisRuntime::resolve_guest_virtual_path(const std::string& guest_path) const {
     if (guest_path.empty()) return "";
     std::string norm = guest_path;
     for (char& c : norm) {
         if (c == '\\') c = '/';
     }
-    std::string rel;
-    if (norm.rfind("/app0/", 0) == 0) {
-        rel = norm.substr(6);
+
+    // Rejeição estrita de travessias com .. per FR-005
+    if (VirtualFileSystem::contains_traversal(norm)) {
+        return "";
+    }
+
+    // Apenas caminhos virtuais conhecidos podem ser absolutos; caminhos de host
+    // (incluindo drive letters Windows) jamais são traduzidos para um mount.
+    if (norm.find(':') != std::string::npos &&
+        norm.rfind("app0:", 0) != 0 && norm.rfind("savedata:", 0) != 0 &&
+        norm.rfind("temp:", 0) != 0) return "";
+
+    if (norm.rfind("/app0/", 0) == 0 || norm == "/app0") {
+        return norm;
     } else if (norm.rfind("app0:/", 0) == 0) {
-        rel = norm.substr(7);
+        return "/app0/" + norm.substr(7);
     } else if (norm.rfind("app0:", 0) == 0) {
-        rel = norm.substr(5);
-    } else if (norm == "/app0" || norm == "app0") {
-        rel = "";
-    } else if (norm.rfind("/app0", 0) == 0) {
-        rel = norm.substr(5);
-    } else if (norm.rfind("/temp/", 0) == 0 || norm.rfind("/tmp/", 0) == 0) {
-        auto tmp_base = std::filesystem::temp_directory_path() / "antigravity";
+        return "/app0/" + norm.substr(5);
+    } else if (norm == "app0") {
+        return "/app0";
+    } else if (norm.rfind("/savedata/", 0) == 0 || norm == "/savedata") {
+        return norm;
+    } else if (norm.rfind("savedata:/", 0) == 0) {
+        return "/savedata/" + norm.substr(11);
+    } else if (norm.rfind("savedata:", 0) == 0) {
+        return "/savedata/" + norm.substr(9);
+    } else if (norm.rfind("/temp/", 0) == 0) {
+        return norm;
+    } else if (norm.rfind("/tmp/", 0) == 0) {
+        return "/temp/" + norm.substr(5);
+    } else if (norm.rfind("temp:/", 0) == 0) {
+        return "/temp/" + norm.substr(6);
+    } else if (norm.rfind("/hostapp/", 0) == 0) {
+        return norm;
+    } else if (norm[0] != '/') {
+        // Caminhos relativos de guest residem em /app0
+        return "/app0/" + norm;
+    } else {
+        return norm;
+    }
+}
+
+std::string OrbisRuntime::resolve_guest_path(const std::string& guest_path, bool* out_readonly) const {
+    if (out_readonly) *out_readonly = false;
+    if (guest_path.empty()) return "";
+    std::string norm = guest_path;
+    for (char& c : norm) {
+        if (c == '\\') c = '/';
+    }
+
+    // Rejeição estrita de travessias com .. per FR-005
+    if (VirtualFileSystem::contains_traversal(norm)) {
+        return "";
+    }
+
+    auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+    if (!active_vfs) return "";
+
+    if (!app0_dir_.empty() && !active_vfs->is_mounted("/app0")) {
+        const_cast<VirtualFileSystem*>(active_vfs)->mount("/app0", app0_dir_.string(), true);
+    }
+    if (!active_vfs->is_mounted("/temp")) {
+        auto tmp_base = (std::filesystem::temp_directory_path() / "antigravity").lexically_normal();
         std::error_code ec;
         std::filesystem::create_directories(tmp_base, ec);
-        std::string sub = (norm.rfind("/temp/", 0) == 0) ? norm.substr(6) : norm.substr(5);
-        return (tmp_base / sub).lexically_normal().string();
-    } else if (norm.rfind("/savedata/", 0) == 0 || norm.rfind("savedata:/", 0) == 0) {
+        const_cast<VirtualFileSystem*>(active_vfs)->mount("/temp", tmp_base.string(), false);
+        const_cast<VirtualFileSystem*>(active_vfs)->mount("/tmp", tmp_base.string(), false);
+    }
+    if (!active_vfs->is_mounted("/savedata")) {
         auto save_base = app0_dir_.empty() ? (std::filesystem::current_path() / "savedata")
                                            : (app0_dir_.parent_path() / "savedata");
         std::error_code ec;
         std::filesystem::create_directories(save_base, ec);
-        std::string sub = (norm.rfind("/savedata/", 0) == 0) ? norm.substr(10) : norm.substr(11);
-        return (save_base / sub).lexically_normal().string();
-    } else if (norm[0] == '/') {
-        std::error_code ec;
-        std::filesystem::path p(norm);
-        if (app0_dir_.empty() || std::filesystem::exists(p, ec) || std::filesystem::exists(p.parent_path(), ec)) {
-            return p.lexically_normal().string();
-        }
-        rel = norm.substr(1);
-    } else {
-        rel = norm;
+        const_cast<VirtualFileSystem*>(active_vfs)->mount("/savedata", save_base.string(), false);
     }
 
-    if (!app0_dir_.empty()) {
-        auto cand = (app0_dir_ / rel).lexically_normal();
-        std::error_code ec;
-        if (std::filesystem::exists(cand, ec)) {
-            return cand.string();
-        }
-        if (std::filesystem::exists(rel, ec)) {
-            return std::filesystem::path(rel).lexically_normal().string();
-        }
-        return cand.string();
+    std::string vpath = resolve_guest_virtual_path(norm);
+    if (vpath.empty()) return "";
+
+    std::string host_path;
+    bool readonly = false;
+    VfsError err = active_vfs->resolve(vpath, host_path, readonly);
+    if (err == VfsError::ok) {
+        if (out_readonly) *out_readonly = readonly;
+        return host_path;
     }
-    return rel;
+
+    // Tentativas de escape ou caminhos fora dos mounts autorizados são rejeitados
+    return "";
+}
+
+FILE* OrbisRuntime::get_file(std::uint64_t handle) const {
+    if (handle == 1) return stdout;
+    if (handle == 2) return stderr;
+    auto it = open_files_.find(handle);
+    return it != open_files_.end() ? it->second : nullptr;
+}
+
+bool OrbisRuntime::format_printf(const std::string& format,
+                                const std::function<std::uint64_t()>& get_int_arg,
+                                const std::function<double()>& get_float_arg,
+                                std::string& out) {
+    out.clear();
+    for (std::size_t i = 0; i < format.size(); ) {
+        if (format[i] != '%') {
+            out.push_back(format[i++]);
+            continue;
+        }
+        if (i + 1 < format.size() && format[i + 1] == '%') {
+            out.push_back('%');
+            i += 2;
+            continue;
+        }
+        ++i;
+        std::string flags_width_prec;
+        while (i < format.size() && (std::strchr("-+ #0123456789.", format[i]) != nullptr)) {
+            flags_width_prec.push_back(format[i++]);
+        }
+        std::string length_mod;
+        while (i < format.size() && (format[i] == 'l' || format[i] == 'z' || format[i] == 'h' || format[i] == 'j' || format[i] == 't')) {
+            length_mod.push_back(format[i++]);
+        }
+        if (i >= format.size()) {
+            return false;
+        }
+        char spec = format[i++];
+        char piece[512] = {};
+        if (spec == 'd' || spec == 'i') {
+            std::int64_t val = static_cast<std::int64_t>(get_int_arg());
+            if (length_mod == "hh") val = static_cast<signed char>(val);
+            else if (length_mod == "h") val = static_cast<short>(val);
+            else if (length_mod.empty()) val = static_cast<int>(val);
+            std::string subspec = "%" + flags_width_prec + "lld";
+            std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<long long>(val));
+            out.append(piece);
+        } else if (spec == 'u') {
+            std::uint64_t val = get_int_arg();
+            if (length_mod == "hh") val = static_cast<unsigned char>(val);
+            else if (length_mod == "h") val = static_cast<unsigned short>(val);
+            else if (length_mod.empty()) val = static_cast<unsigned int>(val);
+            std::string subspec = "%" + flags_width_prec + "llu";
+            std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<unsigned long long>(val));
+            out.append(piece);
+        } else if (spec == 'x' || spec == 'X') {
+            std::uint64_t val = get_int_arg();
+            if (length_mod == "hh") val = static_cast<unsigned char>(val);
+            else if (length_mod == "h") val = static_cast<unsigned short>(val);
+            else if (length_mod.empty()) val = static_cast<unsigned int>(val);
+            std::string subspec = "%" + flags_width_prec + (spec == 'x' ? "llx" : "llX");
+            std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<unsigned long long>(val));
+            out.append(piece);
+        } else if (spec == 'o') {
+            std::uint64_t val = get_int_arg();
+            if (length_mod == "hh") val = static_cast<unsigned char>(val);
+            else if (length_mod == "h") val = static_cast<unsigned short>(val);
+            else if (length_mod.empty()) val = static_cast<unsigned int>(val);
+            std::string subspec = "%" + flags_width_prec + "llo";
+            std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<unsigned long long>(val));
+            out.append(piece);
+        } else if (spec == 's') {
+            std::uint64_t s_addr = get_int_arg();
+            std::string s_val;
+            if (s_addr) {
+                for (std::size_t k = 0; k < 4096; ++k) {
+                    char ch = 0;
+                    if (mem_.load(s_addr + k, &ch, 1) != MemoryError::ok || ch == '\0') break;
+                    s_val.push_back(ch);
+                }
+            } else {
+                s_val = "(null)";
+            }
+            std::string subspec = "%" + flags_width_prec + "s";
+            if (flags_width_prec.empty()) {
+                out.append(s_val);
+            } else {
+                std::vector<char> s_piece(s_val.size() + 128);
+                std::snprintf(s_piece.data(), s_piece.size(), subspec.c_str(), s_val.c_str());
+                out.append(s_piece.data());
+            }
+        } else if (spec == 'f' || spec == 'F' || spec == 'g' || spec == 'G' || spec == 'e' || spec == 'E') {
+            double d = get_float_arg();
+            std::string subspec = "%" + flags_width_prec + spec;
+            std::snprintf(piece, sizeof(piece), subspec.c_str(), d);
+            out.append(piece);
+        } else if (spec == 'p') {
+            std::uint64_t ptr_val = get_int_arg();
+            std::snprintf(piece, sizeof(piece), "%p", reinterpret_cast<void*>(static_cast<uintptr_t>(ptr_val)));
+            out.append(piece);
+        } else if (spec == 'c') {
+            char c_val = static_cast<char>(get_int_arg());
+            out.push_back(c_val);
+        } else {
+            return false;
+        }
+    }
+    return true;
 }
 
 OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& import, CpuState& cpu,
                                                            GuestScheduler::Id tid, std::uint64_t return_trap) {
+    current_tid_ = tid;
     if (!scheduler_) {
         return InvocationResult{InvocationResult::Action::returned, handle(resolve(import), cpu), 0, 0};
     }
@@ -337,34 +516,85 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         std::size_t thread_stack_size = (mem_.budget() > (16ULL << 20)) ? (2 * 1024 * 1024) : 0x10000;
         if (a(1)) {
             auto* at = find_attr(a(1));
-            if (at && at->stack_size >= 0x10000 && at->stack_size <= (mem_.budget() / 2)) {
-                thread_stack_size = static_cast<std::size_t>(at->stack_size);
+            if (!at || at->stack_size < 0x10000 || at->stack_size > (mem_.budget() / 2) || (at->stack_size & 0xFFF) != 0) {
+                return result(invalid);
             }
+            thread_stack_size = static_cast<std::size_t>(at->stack_size);
         }
-        if (!a(0) || !a(2) || !return_trap || thread_stack_next_ > UINT64_MAX - thread_stack_size) {
-            std::printf("[PTHREAD] invalid args in scePthreadCreate: a0=0x%llx a2=0x%llx ret_trap=0x%llx\n",
-                        (unsigned long long)a(0), (unsigned long long)a(2), (unsigned long long)return_trap);
+        if (!a(0) || !a(2) || a(2) < 0x1000 || !return_trap || thread_stack_next_ > UINT64_MAX - thread_stack_size) {
             return result(invalid);
         }
+
+        // T179: Validar a saída guest antes de alocar pilha, TLS ou thread
+        std::uint64_t out_probe = 0;
+        if (mem_.load(a(0), &out_probe, sizeof(out_probe)) != MemoryError::ok ||
+            mem_.store(a(0), &out_probe, sizeof(out_probe)) != MemoryError::ok) {
+            return result(invalid);
+        }
+
+        // T180: Validar template TLS, DTV e TCB antes de mapear
+        const std::uint64_t thread_tls_region = 0x20000; // 128 KB for TLS + TCB + Module TLS
+        if (tls_template_.filesz > tls_template_.memsz) {
+            return result(invalid);
+        }
+        std::uint64_t main_align = tls_template_.align ? tls_template_.align : 16;
+        if ((main_align & (main_align - 1)) != 0 || main_align > 4096) {
+            return result(invalid);
+        }
+        std::uint64_t main_tls_size = tls_template_.memsz ? (tls_template_.memsz + main_align - 1) & ~(main_align - 1) : 0x1000;
+        if (main_tls_size < 0x1000) main_tls_size = 0x1000;
+        if (main_tls_size + 1024 > thread_tls_region) {
+            return result(invalid);
+        }
+        if (tls_template_.filesz > 0) {
+            if (!tls_template_.address) return result(invalid);
+            std::uint8_t probe_byte = 0;
+            if (mem_.load(tls_template_.address, &probe_byte, 1) != MemoryError::ok ||
+                mem_.load(tls_template_.address + tls_template_.filesz - 1, &probe_byte, 1) != MemoryError::ok) {
+                return result(invalid);
+            }
+        }
+
+        std::uint64_t simulated_mod_offset = (main_tls_size + 512 + 63) & ~static_cast<std::uint64_t>(63);
+        for (const auto& mod : module_tls_templates_) {
+            if (mod.filesz > mod.memsz) {
+                return result(invalid);
+            }
+            std::uint64_t m_align = mod.align ? mod.align : 16;
+            if ((m_align & (m_align - 1)) != 0 || m_align > 4096) {
+                return result(invalid);
+            }
+            if (mod.filesz > 0) {
+                if (!mod.address) return result(invalid);
+                std::uint8_t probe_byte = 0;
+                if (mem_.load(mod.address, &probe_byte, 1) != MemoryError::ok ||
+                    mem_.load(mod.address + mod.filesz - 1, &probe_byte, 1) != MemoryError::ok) {
+                    return result(invalid);
+                }
+            }
+            if (!mod.module_id || mod.module_id > 64) continue;
+            simulated_mod_offset = (simulated_mod_offset + m_align - 1) & ~(m_align - 1);
+            std::uint64_t m_memsz = (mod.memsz + m_align - 1) & ~(m_align - 1);
+            if (simulated_mod_offset + m_memsz > thread_tls_region) {
+                return result(invalid);
+            }
+            simulated_mod_offset += m_memsz;
+        }
+
+        // T179: Mapeamento da pilha e TLS com reversão integral em falha
         const auto bottom = thread_stack_next_;
         auto err1 = mem_.map(bottom, thread_stack_size, read | write);
         if (err1 != MemoryError::ok) {
-            std::printf("[PTHREAD] mem_.map stack bottom=0x%llx sz=0x%zx failed: err=%d\n",
-                        (unsigned long long)bottom, thread_stack_size, (int)err1);
             return result(no_memory);
         }
 
-        std::uint64_t main_tls_size = tls_template_.memsz ? (tls_template_.memsz + 15) & ~15ULL : 0x1000;
-        if (main_tls_size < 0x1000) main_tls_size = 0x1000;
-        const std::uint64_t thread_tls_region = 0x10000; // 64 KB for TLS + TCB
         std::uint64_t thread_tls_base = next_virtual_;
-        next_virtual_ += thread_tls_region;
         auto err2 = mem_.map(thread_tls_base, thread_tls_region, read | write);
         if (err2 != MemoryError::ok) {
-            std::printf("[PTHREAD] mem_.map tls base=0x%llx failed: err=%d\n", (unsigned long long)thread_tls_base, (int)err2);
             mem_.unmap(bottom);
             return result(no_memory);
         }
+        next_virtual_ += thread_tls_region;
         mappings_[thread_tls_base] = thread_tls_region;
 
         std::uint64_t thread_tcb = thread_tls_base + main_tls_size;
@@ -377,26 +607,50 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         std::uint64_t thread_dtv = thread_tcb + 64;
         put<std::uint64_t>(mem_, thread_tcb + 8, thread_dtv);
         put<std::uint64_t>(mem_, thread_tcb + 16, thread_tcb + 256);
-        put<std::uint64_t>(mem_, thread_dtv, 1);
+
+        std::uint64_t max_mod_id = 1;
+        for (const auto& mod : module_tls_templates_) {
+            if (mod.module_id > max_mod_id) max_mod_id = mod.module_id;
+        }
+        put<std::uint64_t>(mem_, thread_dtv, max_mod_id + 1);
         put<std::uint64_t>(mem_, thread_dtv + 8, thread_tls_base);
+
+        std::uint64_t next_mod_tls = (thread_tcb + 512 + 63) & ~static_cast<std::uint64_t>(63);
+        for (const auto& mod : module_tls_templates_) {
+            if (!mod.module_id || mod.module_id > 64) continue;
+            if (thread_dtv + 8 * mod.module_id >= thread_tcb + 256) continue;
+            std::uint64_t align = mod.align ? mod.align : 16;
+            next_mod_tls = (next_mod_tls + align - 1) & ~(align - 1);
+            std::uint64_t memsz = (mod.memsz + align - 1) & ~(align - 1);
+            if (next_mod_tls + memsz <= thread_tls_base + thread_tls_region) {
+                if (mod.filesz && mod.address) {
+                    std::vector<std::uint8_t> data(static_cast<std::size_t>(mod.filesz));
+                    mem_.load(mod.address, data.data(), data.size());
+                    mem_.store(next_mod_tls, data.data(), data.size());
+                }
+                put<std::uint64_t>(mem_, thread_dtv + 8 * mod.module_id, next_mod_tls);
+                next_mod_tls += memsz;
+            }
+        }
 
         auto id = scheduler_->create(a(2), bottom, bottom + thread_stack_size, return_trap, a(3), thread_tcb);
         if (!id) {
-            std::printf("[PTHREAD] scheduler_->create failed\n");
+            mem_.unmap(thread_tls_base);
+            mappings_.erase(thread_tls_base);
             mem_.unmap(bottom);
             return result(invalid);
         }
         std::uint64_t thread_handle = id;
         if (mem_.store(a(0), &thread_handle, sizeof(thread_handle)) != MemoryError::ok) {
+            scheduler_->abort_created(id);
+            mem_.unmap(thread_tls_base);
+            mappings_.erase(thread_tls_base);
             mem_.unmap(bottom);
             return result(invalid);
         }
         thread_stack_next_ += thread_stack_size;
         auto thread_name = (n == "pthread_create") ? "pthread" : (a(4) ? read_guest_string(a(4)) : std::string("unnamed"));
         auto start_res = scheduler_->start(id);
-        std::printf("[HLE] Created guest thread %u: '%s' entry=0x%llx arg=0x%llx stack=[0x%llx..0x%llx] start_res=0x%x\n",
-                    id, thread_name.c_str(), (unsigned long long)a(2), (unsigned long long)a(3),
-                    (unsigned long long)bottom, (unsigned long long)(bottom + thread_stack_size), start_res);
         return result(static_cast<std::uint32_t>(start_res));
     }
 
@@ -428,6 +682,12 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
                 return result(invalid);
         }
         const auto target = static_cast<GuestScheduler::Id>(a(0));
+        if (target == tid) {
+            return result(ORBIS_KERNEL_ERROR_EDEADLK);
+        }
+        if (!scheduler_->has_thread(target)) {
+            return result(ORBIS_KERNEL_ERROR_ESRCH);
+        }
         auto status = scheduler_->join(tid, target);
         if (status) return result(static_cast<std::uint32_t>(status));
         if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
@@ -455,6 +715,10 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
 
     if (n == "scePthreadMutexInit" || n == "pthread_mutex_init") {
         if (!a(0)) return result(invalid);
+        std::uint64_t dummy = 0;
+        if (mem_.store(a(0), &dummy, sizeof(dummy)) != MemoryError::ok) {
+            return result(invalid);
+        }
         bool recursive = false;
         if (a(1)) {
             auto attr = get<std::uint64_t>(mem_, a(1));
@@ -465,7 +729,12 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         const auto id = scheduler_->mutex_create(recursive);
         const auto handle = next_handle_++;
         guest_mutexes_[handle] = id;
-        put(mem_, a(0), handle);
+        std::uint64_t handle_u64 = handle;
+        if (mem_.store(a(0), &handle_u64, sizeof(handle_u64)) != MemoryError::ok) {
+            scheduler_->mutex_delete(id);
+            guest_mutexes_.erase(handle);
+            return result(invalid);
+        }
         return result(0);
     }
 
@@ -518,6 +787,9 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         if (!guest_mutexes_.count(handle)) return result(invalid);
         const auto id = guest_mutexes_.at(handle);
         if (n == "scePthreadMutexDestroy" || n == "pthread_mutex_destroy") {
+            if (scheduler_) {
+                scheduler_->mutex_delete(id);
+            }
             guest_mutexes_.erase(handle);
             put<std::uint64_t>(mem_, a(0), 0);
             return result(0);
@@ -545,16 +817,31 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
 
     if (n == "scePthreadCondInit" || n == "pthread_cond_init") {
         if (!a(0)) return result(invalid);
+        std::uint64_t dummy = 0;
+        if (mem_.store(a(0), &dummy, sizeof(dummy)) != MemoryError::ok) {
+            return result(invalid);
+        }
         const auto handle = next_handle_++;
-        guest_conds_[handle] = scheduler_->cond_create();
-        put(mem_, a(0), handle);
+        const auto id = scheduler_->cond_create();
+        guest_conds_[handle] = id;
+        std::uint64_t handle_u64 = handle;
+        if (mem_.store(a(0), &handle_u64, sizeof(handle_u64)) != MemoryError::ok) {
+            scheduler_->cond_delete(id);
+            guest_conds_.erase(handle);
+            return result(invalid);
+        }
         return result(0);
     }
 
     if (n == "scePthreadCondDestroy" || n == "pthread_cond_destroy") {
         if (!a(0)) return result(invalid);
         auto handle = get<std::uint64_t>(mem_, a(0));
-        if (!guest_conds_.erase(handle)) return result(invalid);
+        auto it = guest_conds_.find(handle);
+        if (it == guest_conds_.end()) return result(invalid);
+        if (scheduler_) {
+            scheduler_->cond_delete(it->second);
+        }
+        guest_conds_.erase(it);
         put<std::uint64_t>(mem_, a(0), 0);
         return result(0);
     }
@@ -640,16 +927,31 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
             return result(handle);
         } else {
             if (!a(0) || a(2) > 3) return result(invalid);
+            std::uint64_t dummy = 0;
+            if (mem_.store(a(0), &dummy, sizeof(dummy)) != MemoryError::ok) {
+                return result(invalid);
+            }
             const auto handle = static_cast<std::uint32_t>(next_handle_++);
-            guest_events_[handle] = scheduler_->event_create(a(3));
-            put<std::uint64_t>(mem_, a(0), static_cast<std::uint64_t>(handle));
+            const auto id = scheduler_->event_create(a(3));
+            guest_events_[handle] = id;
+            std::uint64_t handle_u64 = handle;
+            if (mem_.store(a(0), &handle_u64, sizeof(handle_u64)) != MemoryError::ok) {
+                scheduler_->event_delete(id);
+                guest_events_.erase(handle);
+                return result(invalid);
+            }
             return result(0);
         }
     }
 
     if (n == "sceKernelDeleteEventFlag") {
         auto handle = static_cast<std::uint32_t>(a(0));
-        if (!guest_events_.erase(handle)) return result(0x80020003); // ESRCH
+        auto it = guest_events_.find(handle);
+        if (it == guest_events_.end()) return result(0x80020003); // ESRCH
+        if (scheduler_) {
+            scheduler_->event_delete(it->second);
+        }
+        guest_events_.erase(it);
         return result(0);
     }
 
@@ -807,6 +1109,13 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         if (max_val <= 0) max_val = std::max<std::int32_t>(1, init_val);
         if (init_val < 0 || max_val <= 0 || init_val > max_val) return result(invalid);
 
+        if (!is_sdk) {
+            std::uint32_t dummy = 0;
+            if (mem_.store(out_id_addr, &dummy, sizeof(dummy)) != MemoryError::ok) {
+                return result(invalid);
+            }
+        }
+
         auto sid = scheduler_->sema_create(init_val, max_val);
         if (!sid) return result(no_memory);
         auto handle = static_cast<std::uint32_t>(next_handle_++);
@@ -825,7 +1134,12 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         if (is_sdk) {
             return result(handle);
         } else {
-            put<std::uint64_t>(mem_, out_id_addr, static_cast<std::uint64_t>(handle));
+            if (mem_.store(out_id_addr, &handle, sizeof(handle)) != MemoryError::ok) {
+                scheduler_->sema_delete(sid);
+                guest_semas_.erase(handle);
+                sema_records_.erase(handle);
+                return result(invalid);
+            }
             return result(0);
         }
     }
@@ -934,9 +1248,9 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
     }
 
     if (n == "scePthreadKeyDelete" || n == "pthread_key_delete") {
-        if (!a(0)) return result(invalid);
         std::uint32_t key = static_cast<std::uint32_t>(a(0));
-        scheduler_->tls_delete(key);
+        auto err = scheduler_->tls_delete(key);
+        if (err != ORBIS_OK) return result(invalid);
         return result(0);
     }
 
@@ -944,11 +1258,13 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         std::uint32_t key = static_cast<std::uint32_t>(a(0));
         std::uint64_t value = a(1);
         auto status = scheduler_->tls_set(tid, key, value);
-        return result(static_cast<std::uint32_t>(status));
+        if (status != ORBIS_OK) return result(invalid);
+        return result(0);
     }
 
     if (n == "scePthreadGetspecific" || n == "pthread_getspecific") {
         std::uint32_t key = static_cast<std::uint32_t>(a(0));
+        if (!scheduler_->tls_valid(key)) return result(0);
         return result(scheduler_->tls_get(tid, key));
     }
 
@@ -976,6 +1292,44 @@ OrbisRuntime::InvocationResult OrbisRuntime::invoke_trap(const std::string& impo
         return result(0);
     }
 
+    if (n == "sceKernelUsleep" || n == "usleep") {
+        std::uint64_t us = a(0);
+        if (tid && us > 0) {
+            scheduler_->sleep(tid, us);
+            if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+                std::uint64_t ret = 0;
+                if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+                cpu.gpr[4] += 8;
+                cpu.rip = ret;
+                cpu.gpr[0] = 0;
+                scheduler_->set_resume(tid, [](CpuState& state, std::int32_t res) {
+                    state.gpr[0] = static_cast<std::uint32_t>(res);
+                });
+                return {InvocationResult::Action::blocked, 0, 0, 0};
+            }
+        }
+        return result(0);
+    }
+
+    if (n == "sceKernelSleep" || n == "sleep") {
+        std::uint64_t sec = a(0);
+        if (tid && sec > 0) {
+            scheduler_->sleep(tid, sec * 1000000ULL);
+            if (scheduler_->state(tid) == GuestScheduler::State::waiting) {
+                std::uint64_t ret = 0;
+                if (mem_.load(cpu.gpr[4], &ret, 8) != MemoryError::ok) return result(invalid);
+                cpu.gpr[4] += 8;
+                cpu.rip = ret;
+                cpu.gpr[0] = 0;
+                scheduler_->set_resume(tid, [](CpuState& state, std::int32_t res) {
+                    state.gpr[0] = static_cast<std::uint32_t>(res);
+                });
+                return {InvocationResult::Action::blocked, 0, 0, 0};
+            }
+        }
+        return result(0);
+    }
+
     if (n == "__error") {
         return result(get_errno_addr(tid));
     }
@@ -993,6 +1347,29 @@ OrbisRuntime::InvocationResult OrbisRuntime::complete_callback(CpuState& cpu, Gu
     cpu.gpr[0] = static_cast<std::uint32_t>(status);
     callbacks_.erase(it);
     return {InvocationResult::Action::returned, static_cast<std::uint32_t>(status), 0, 0};
+}
+void OrbisRuntime::dispatch_flip_event(std::int32_t video_handle, std::uint32_t buf_idx) {
+    (void)buf_idx;
+    std::lock_guard<std::mutex> lock(equeues_mutex_);
+    for (auto& pair : equeues_) {
+        auto& eq = pair.second;
+        if (!eq) continue;
+        std::lock_guard<std::mutex> eq_lock(eq->mtx);
+        if (eq->deleted) continue;
+        for (const auto& reg : eq->flip_registrations) {
+            if (reg.video_handle == video_handle || reg.video_handle == -1 || video_handle == 0 || reg.video_handle == 0) {
+                EqueueEvent ev{};
+                ev.ident = static_cast<std::uint64_t>(video_handle != 0 ? video_handle : (reg.video_handle != 0 ? reg.video_handle : 0x6));
+                ev.filter = -13; // EVFILT_VIDEO_OUT
+                ev.flags = 0;
+                ev.fflags = 0;
+                ev.data = 1;
+                ev.udata = reg.udata;
+                eq->pending_events.push_back(ev);
+                eq->cv.notify_all();
+            }
+        }
+    }
 }
 std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     auto a=[&](unsigned i){return arg(c,i);};
@@ -1094,10 +1471,10 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             if (mem_.load(a(0), &p, sizeof(p)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
             if (p.max_quota_per_slot > 0) quota = static_cast<std::size_t>(p.max_quota_per_slot);
         }
-        std::string base = save_mgr_.get_base_directory();
+        std::string base = save_data_manager().get_base_directory();
         if (base.empty()) base = SaveDataManager::instance().get_base_directory();
         if (base.empty()) base = "savedata";
-        bool ok = save_mgr_.initialize(base, quota, save_mgr_.get_vfs() ? save_mgr_.get_vfs() : vfs_);
+        bool ok = save_data_manager().initialize(base, quota, save_data_manager().get_vfs() ? save_data_manager().get_vfs() : vfs_);
         return static_cast<std::uint32_t>(ok ? SCE_SAVEDATA_OK : SCE_SAVEDATA_ERROR_INTERNAL);
     }
     if (n == "sceSaveDataMount" || n == "sceSaveDataMount2") {
@@ -1128,17 +1505,29 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         const char* title_str = nullptr;
         if (title_ptr) {
             if (mem_.load(title_ptr, &title_obj, sizeof(title_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            if (!std::memchr(title_obj.data, '\0', sizeof(title_obj.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
             title_str = title_obj.data;
         }
         SceSaveDataDirName dir_obj{};
         const char* dir_str = nullptr;
         if (dir_ptr) {
             if (mem_.load(dir_ptr, &dir_obj, sizeof(dir_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            if (!std::memchr(dir_obj.data, '\0', sizeof(dir_obj.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
             dir_str = dir_obj.data;
+        }
+        // A saída precisa estar totalmente gravável antes de criar ou ocupar um slot.
+        std::uint64_t result_base = 0;
+        std::size_t result_size = 0;
+        unsigned result_perm = 0;
+        if (!mem_.query_region(a(1), result_base, result_size, result_perm) ||
+            !(result_perm & Permission::write) || a(1) < result_base ||
+            a(1) - result_base >= result_size ||
+            sizeof(SceSaveDataMountResult) > result_size - (a(1) - result_base)) {
+            return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
         }
         std::string mount_pt;
         uint32_t status = 0;
-        int32_t res = save_mgr_.mount(user, title_str, dir_str, mode, blocks, mount_pt, status);
+        int32_t res = save_data_manager().mount(user, title_str, dir_str, mode, blocks, mount_pt, status);
         if (res == SCE_SAVEDATA_OK) {
             SceSaveDataMountResult result{};
             std::strncpy(result.point.data, mount_pt.c_str(), sizeof(result.point.data) - 1);
@@ -1152,8 +1541,9 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (!a(0)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
         SceSaveDataMountPoint pt{};
         if (mem_.load(a(0), &pt, sizeof(pt)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        if (!std::memchr(pt.data, '\0', sizeof(pt.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
         bool commit = (a(1) & SCE_SAVEDATA_UMOUNT_FLAG_COMMIT) != 0;
-        return static_cast<std::uint32_t>(save_mgr_.umount(pt.data, commit));
+        return static_cast<std::uint32_t>(save_data_manager().umount(pt.data, commit));
     }
     if (n == "sceSaveDataDelete") {
         if (!a(0)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
@@ -1166,11 +1556,13 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         const char* title_str = nullptr;
         if (title_ptr) {
             if (mem_.load(title_ptr, &title_obj, sizeof(title_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            if (!std::memchr(title_obj.data, '\0', sizeof(title_obj.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
             title_str = title_obj.data;
         }
         SceSaveDataDirName dir_obj{};
         if (mem_.load(dir_ptr, &dir_obj, sizeof(dir_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
-        return static_cast<std::uint32_t>(save_mgr_.delete_save(d.user, title_str, dir_obj.data));
+        if (!std::memchr(dir_obj.data, '\0', sizeof(dir_obj.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        return static_cast<std::uint32_t>(save_data_manager().delete_save(d.user, title_str, dir_obj.data));
     }
     if (n == "sceSaveDataDirNameSearch") {
         if (!a(0) || !a(1)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
@@ -1184,16 +1576,18 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         const char* title_str = nullptr;
         if (title_ptr) {
             if (mem_.load(title_ptr, &title_obj, sizeof(title_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            if (!std::memchr(title_obj.data, '\0', sizeof(title_obj.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
             title_str = title_obj.data;
         }
         SceSaveDataDirName dir_obj{};
         const char* dir_pattern = nullptr;
         if (dir_ptr) {
             if (mem_.load(dir_ptr, &dir_obj, sizeof(dir_obj)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+            if (!std::memchr(dir_obj.data, '\0', sizeof(dir_obj.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
             dir_pattern = dir_obj.data;
         }
         std::vector<SaveSearchEntry> entries;
-        int32_t res = save_mgr_.dir_name_search(cond.user, title_str, dir_pattern, cond.key, cond.order, entries);
+        int32_t res = save_data_manager().dir_name_search(cond.user, title_str, dir_pattern, cond.key, cond.order, entries);
         if (res != SCE_SAVEDATA_OK) return static_cast<std::uint32_t>(res);
 
         result.hits = static_cast<uint32_t>(entries.size());
@@ -1206,37 +1600,50 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             if (names_addr) {
                 SceSaveDataDirName name{};
                 std::strncpy(name.data, entries[i].dir_name.c_str(), sizeof(name.data) - 1);
-                mem_.store(names_addr + i * sizeof(SceSaveDataDirName), &name, sizeof(name));
+                if (mem_.store(names_addr + i * sizeof(SceSaveDataDirName), &name, sizeof(name)) != MemoryError::ok) {
+                    return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+                }
             }
             if (params_addr) {
-                mem_.store(params_addr + i * sizeof(SceSaveDataParam), &entries[i].param, sizeof(SceSaveDataParam));
+                if (mem_.store(params_addr + i * sizeof(SceSaveDataParam), &entries[i].param, sizeof(SceSaveDataParam)) != MemoryError::ok) {
+                    return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+                }
             }
             if (infos_addr) {
                 SceSaveDataSearchInfo info{};
                 info.blocks = entries[i].blocks;
                 info.free_blocks = entries[i].free_blocks;
-                mem_.store(infos_addr + i * sizeof(SceSaveDataSearchInfo), &info, sizeof(info));
+                if (mem_.store(infos_addr + i * sizeof(SceSaveDataSearchInfo), &info, sizeof(info)) != MemoryError::ok) {
+                    return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+                }
             }
         }
-        mem_.store(a(1), &result, sizeof(result));
+        if (mem_.store(a(1), &result, sizeof(result)) != MemoryError::ok) {
+            return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        }
         return SCE_SAVEDATA_OK;
     }
     if (n == "sceSaveDataSetParam") {
         if (!a(0) || !a(2)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
         SceSaveDataMountPoint pt{};
         if (mem_.load(a(0), &pt, sizeof(pt)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
-        std::vector<uint8_t> buf(a(3));
-        if (a(3) > 0) {
-            if (mem_.load(a(2), buf.data(), a(3)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
-        }
-        return static_cast<std::uint32_t>(save_mgr_.set_param(pt.data, static_cast<uint32_t>(a(1)), buf.data(), a(3)));
+        if (!std::memchr(pt.data, '\0', sizeof(pt.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        uint32_t type = static_cast<uint32_t>(a(1));
+        std::size_t size = static_cast<std::size_t>(a(3));
+        if (type > 4 || size == 0 || size > 65536) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        if (type == 0 && size < sizeof(SceSaveDataParam)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        if (type == 4 && size < sizeof(uint32_t)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        std::vector<uint8_t> buf(size);
+        if (mem_.load(a(2), buf.data(), size) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        return static_cast<std::uint32_t>(save_data_manager().set_param(pt.data, type, buf.data(), size));
     }
     if (n == "sceSaveDataGetParam") {
         if (!a(0) || !a(2)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
         SceSaveDataMountPoint pt{};
         if (mem_.load(a(0), &pt, sizeof(pt)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
         SceSaveDataParam param{};
-        int32_t res = save_mgr_.get_param(pt.data, param);
+        if (!std::memchr(pt.data, '\0', sizeof(pt.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        int32_t res = save_data_manager().get_param(pt.data, param);
         if (res == SCE_SAVEDATA_OK) {
             std::size_t copy_size = std::min<std::size_t>(sizeof(param), static_cast<std::size_t>(a(3)));
             if (mem_.store(a(2), &param, copy_size) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
@@ -1247,14 +1654,16 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (!a(0) || !a(1)) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
         SceSaveDataMountPoint pt{};
         if (mem_.load(a(0), &pt, sizeof(pt)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
-        std::vector<uint8_t> buf(a(2));
-        if (a(2) > 0) {
-            if (mem_.load(a(1), buf.data(), a(2)) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
-        }
-        return static_cast<std::uint32_t>(save_mgr_.save_icon(pt.data, buf.data(), a(2)));
+        std::size_t size = static_cast<std::size_t>(a(2));
+        if (!std::memchr(pt.data, '\0', sizeof(pt.data))) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        constexpr std::size_t kMaxIconSize = 2 * 1024 * 1024;
+        if (size == 0 || size > kMaxIconSize) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        std::vector<uint8_t> buf(size);
+        if (mem_.load(a(1), buf.data(), size) != MemoryError::ok) return static_cast<std::uint32_t>(SCE_SAVEDATA_ERROR_PARAMETER);
+        return static_cast<std::uint32_t>(save_data_manager().save_icon(pt.data, buf.data(), size));
     }
     if (n == "sceSaveDataTerminate") {
-        save_mgr_.terminate();
+        save_data_manager().terminate();
         return 0;
     }
 
@@ -1287,22 +1696,247 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n == "sceAudioOutInit") return 0;
 
-    // libSceAvPlayer HLE (stubs para transição direta aos menus)
-    if (n == "sceAvPlayerInit") return next_handle_++;
-    if (n == "sceAvPlayerClose" || n == "sceAvPlayerPostInit" ||
-        n == "sceAvPlayerAddSource" || n == "sceAvPlayerSetLooping" ||
-        n == "sceAvPlayerStart" || n == "sceAvPlayerStop" ||
-        n == "sceAvPlayerPause" || n == "sceAvPlayerResume" ||
-        n == "sceAvPlayerEnableStream") {
+    // libSceAvPlayer HLE: ciclo de vida de player com validacao e transicao de intro (T155)
+    if (n == "sceAvPlayerInit") {
+        auto h = static_cast<std::uint32_t>(next_handle_++);
+        av_players_[h] = AvPlayerState{h, "", false, false, false, 0, 3000, 2};
+        return h;
+    }
+    if (n == "sceAvPlayerClose") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        av_players_.erase(it);
         return 0;
     }
-    if (n == "sceAvPlayerIsActive" || n == "sceAvPlayerGetVideoDataEx" ||
-        n == "sceAvPlayerGetVideoData" || n == "sceAvPlayerGetAudioData" ||
-        n == "sceAvPlayerGetAudioDataEx" || n == "sceAvPlayerCurrentTime" ||
-        n == "sceAvPlayerStreamCount" || n == "sceAvPlayerGetStreamInfo" ||
-        n == "sceAvPlayerReset" || n == "sceAvPlayerSetAvSync" ||
-        n == "sceAvPlayerJumpToTime" || n == "sceAvPlayerIsPaused" ||
-        n == "sceAvPlayerGetDuration") {
+    if (n == "sceAvPlayerAddSource") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        auto src_ptr = a(1);
+        if (!src_ptr) return 0x80540002;
+        std::string src_path;
+        for (std::size_t i = 0; i < 1024; ++i) {
+            char c = 0;
+            if (mem_.load(src_ptr + i, &c, 1) != MemoryError::ok) return 0x80540002;
+            if (c == '\0') break;
+            src_path.push_back(c);
+        }
+        if (src_path.empty()) return 0x80540002;
+
+        // Validar se e formato de video suportado ou arquivo existente no VFS
+        bool valid_source = false;
+        std::string lower = src_path;
+        for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        auto ends_with = [](const std::string& str, const std::string& suffix) {
+            return str.size() >= suffix.size() &&
+                   str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+        if (ends_with(lower, ".mp4") || ends_with(lower, ".m4v") ||
+            ends_with(lower, ".avi") || ends_with(lower, ".mkv") ||
+            ends_with(lower, ".bk2") || ends_with(lower, ".webm")) {
+            valid_source = true;
+        }
+
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        if (active_vfs) {
+            auto vpath = resolve_guest_virtual_path(src_path);
+            if (!vpath.empty() && active_vfs->exists(vpath)) {
+                valid_source = true;
+            } else if (!valid_source) {
+                return 0x80540002;
+            }
+        } else if (!valid_source) {
+            return 0x80540002;
+        }
+
+        it->second.source_path = src_path;
+        it->second.active = true;
+        it->second.current_time_ms = 0;
+        return 0;
+    }
+    if (n == "sceAvPlayerStart") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        if (it->second.source_path.empty()) return 0x80540002;
+        it->second.active = true;
+        it->second.paused = false;
+        return 0;
+    }
+    if (n == "sceAvPlayerStop") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        it->second.active = false;
+        it->second.current_time_ms = 0;
+        return 0;
+    }
+    if (n == "sceAvPlayerPause") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        it->second.paused = true;
+        return 0;
+    }
+    if (n == "sceAvPlayerResume") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        it->second.paused = false;
+        return 0;
+    }
+    if (n == "sceAvPlayerIsActive") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0;
+        return it->second.active ? 1 : 0;
+    }
+    if (n == "sceAvPlayerIsPaused") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0;
+        return it->second.paused ? 1 : 0;
+    }
+    if (n == "sceAvPlayerCurrentTime") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0;
+        auto& p = it->second;
+        if (p.active && !p.paused) {
+            if (p.current_time_ms < p.duration_ms) {
+                p.current_time_ms += 33;
+            } else if (!p.looping) {
+                p.active = false;
+            } else {
+                p.current_time_ms = 0;
+            }
+        }
+        return p.current_time_ms;
+    }
+    if (n == "sceAvPlayerGetDuration") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0;
+        return it->second.duration_ms;
+    }
+    if (n == "sceAvPlayerStreamCount") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0;
+        return it->second.stream_count;
+    }
+    if (n == "sceAvPlayerSetLooping") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        it->second.looping = (a(1) != 0);
+        return 0;
+    }
+    if (n == "sceAvPlayerReset") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        it->second.current_time_ms = 0;
+        it->second.active = true;
+        it->second.paused = false;
+        return 0;
+    }
+    if (n == "sceAvPlayerJumpToTime") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        std::uint64_t target_ms = a(1);
+        it->second.current_time_ms = std::min(target_ms, it->second.duration_ms);
+        if (it->second.current_time_ms >= it->second.duration_ms && !it->second.looping) {
+            it->second.active = false;
+        }
+        return 0;
+    }
+    if (n == "sceAvPlayerEnableStream") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        auto stream_idx = static_cast<std::uint32_t>(a(2));
+        if (stream_idx >= it->second.stream_count) return 0x80540003;
+        return 0;
+    }
+    if (n == "sceAvPlayerPostInit" || n == "sceAvPlayerSetAvSync") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        if (!av_players_.count(h)) return 0x80540001;
+        return 0;
+    }
+    if (n == "sceAvPlayerGetVideoDataEx" || n == "sceAvPlayerGetVideoData") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        auto out_ptr = a(1);
+        if (!out_ptr) return 0x80540002;
+        if (!it->second.active || it->second.current_time_ms >= it->second.duration_ms) {
+            return 0; // Nenhum quadro disponivel / EOF
+        }
+        std::uint32_t frame_info[8] = {
+            static_cast<std::uint32_t>(it->second.current_time_ms & 0xFFFFFFFF),
+            static_cast<std::uint32_t>((it->second.current_time_ms >> 32) & 0xFFFFFFFF),
+            0, 0, // pData
+            1920, // width
+            1080, // height
+            1920 * 4, // pitch
+            1 // RGBA
+        };
+        if (mem_.store(out_ptr, frame_info, sizeof(frame_info)) != MemoryError::ok) {
+            return 0x80540002;
+        }
+        return 1;
+    }
+    if (n == "sceAvPlayerGetAudioData" || n == "sceAvPlayerGetAudioDataEx") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        auto out_ptr = a(1);
+        if (!out_ptr) return 0x80540002;
+        if (!it->second.active || it->second.current_time_ms >= it->second.duration_ms) {
+            return 0;
+        }
+        std::uint32_t audio_info[6] = {
+            static_cast<std::uint32_t>(it->second.current_time_ms & 0xFFFFFFFF),
+            static_cast<std::uint32_t>((it->second.current_time_ms >> 32) & 0xFFFFFFFF),
+            0, 0, // pData
+            2,    // channels
+            48000 // sample rate
+        };
+        if (mem_.store(out_ptr, audio_info, sizeof(audio_info)) != MemoryError::ok) {
+            return 0x80540002;
+        }
+        return 1;
+    }
+    if (n == "sceAvPlayerGetStreamInfo") {
+        auto h = static_cast<std::uint32_t>(a(0));
+        auto it = av_players_.find(h);
+        if (it == av_players_.end()) return 0x80540001;
+        auto stream_idx = static_cast<std::uint32_t>(a(1));
+        if (stream_idx >= it->second.stream_count) return 0x80540003;
+        auto out_ptr = a(2);
+        if (!out_ptr) return 0x80540002;
+        std::uint32_t stream_info[6] = {};
+        if (stream_idx == 0) {
+            stream_info[0] = 1; // Video
+            stream_info[1] = 1920;
+            stream_info[2] = 1080;
+            stream_info[3] = 30; // 30 FPS
+            stream_info[4] = static_cast<std::uint32_t>(it->second.duration_ms & 0xFFFFFFFF);
+            stream_info[5] = static_cast<std::uint32_t>((it->second.duration_ms >> 32) & 0xFFFFFFFF);
+        } else {
+            stream_info[0] = 2; // Audio
+            stream_info[1] = 2; // Stereo
+            stream_info[2] = 48000;
+            stream_info[3] = 0;
+            stream_info[4] = static_cast<std::uint32_t>(it->second.duration_ms & 0xFFFFFFFF);
+            stream_info[5] = static_cast<std::uint32_t>((it->second.duration_ms >> 32) & 0xFFFFFFFF);
+        }
+        if (mem_.store(out_ptr, stream_info, sizeof(stream_info)) != MemoryError::ok) {
+            return 0x80540002;
+        }
         return 0;
     }
 
@@ -1318,11 +1952,38 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n == "sceVideoOutAddFlipEvent") {
         auto eq_id = static_cast<std::uint32_t>(a(0));
+        auto video_handle = static_cast<std::int32_t>(a(1));
         auto udata = a(2);
+        std::lock_guard<std::mutex> lock(equeues_mutex_);
         auto it = equeues_.find(eq_id);
         if (it != equeues_.end()) {
-            it->second.has_flip_event = true;
-            it->second.flip_udata = udata;
+            std::lock_guard<std::mutex> eq_lock(it->second->mtx);
+            bool found = false;
+            for (auto& reg : it->second->flip_registrations) {
+                if (reg.video_handle == video_handle) {
+                    reg.udata = udata;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                it->second->flip_registrations.push_back({video_handle, udata});
+            }
+        }
+        return 0;
+    }
+    if (n == "sceVideoOutDeleteFlipEvent") {
+        auto eq_id = static_cast<std::uint32_t>(a(0));
+        auto video_handle = static_cast<std::int32_t>(a(1));
+        std::lock_guard<std::mutex> lock(equeues_mutex_);
+        auto it = equeues_.find(eq_id);
+        if (it != equeues_.end()) {
+            std::lock_guard<std::mutex> eq_lock(it->second->mtx);
+            auto& regs = it->second->flip_registrations;
+            regs.erase(std::remove_if(regs.begin(), regs.end(),
+                [video_handle](const FlipEventRegistration& reg) {
+                    return reg.video_handle == video_handle;
+                }), regs.end());
         }
         return 0;
     }
@@ -1389,12 +2050,7 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             video_out_->submit_flip(static_cast<std::uint32_t>(buf_idx), flip_arg) != VideoStatus::ok) {
             return static_cast<std::uint64_t>(-1);
         }
-        for (auto& pair : equeues_) {
-            if (pair.second.has_flip_event) {
-                EqueueEvent ev{0x6, -13, 0, 0, 1, pair.second.flip_udata};
-                pair.second.pending_events.push_back(ev);
-            }
-        }
+        dispatch_flip_event(static_cast<std::int32_t>(a(0)), static_cast<std::uint32_t>(buf_idx));
         return 0;
     }
     if (n == "sceVideoOutGetFlipStatus") {
@@ -1410,15 +2066,34 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     if (n == "sceKernelCreateEqueue") {
         auto out_eq = a(0);
         auto name_ptr = a(1);
+        if (!out_eq) return 0x80020016;
         std::string name = name_ptr ? read_guest_string(name_ptr) : "equeue";
+        std::lock_guard<std::mutex> lock(equeues_mutex_);
         auto id = static_cast<std::uint32_t>(next_equeue_id_++);
-        equeues_[id] = EqueueRecord{name, {}, 0, false};
-        if (out_eq) put<std::uint64_t>(mem_, out_eq, id);
+        auto eq = std::make_shared<EqueueRecord>();
+        eq->name = std::move(name);
+        equeues_[id] = eq;
+        put<std::int32_t>(mem_, out_eq, static_cast<std::int32_t>(id));
         return 0;
     }
     if (n == "sceKernelDeleteEqueue") {
         auto id = static_cast<std::uint32_t>(a(0));
-        equeues_.erase(id);
+        std::shared_ptr<EqueueRecord> eq;
+        {
+            std::lock_guard<std::mutex> lock(equeues_mutex_);
+            auto it = equeues_.find(id);
+            if (it == equeues_.end()) {
+                return 0x80020014;
+            }
+            eq = it->second;
+            equeues_.erase(it);
+        }
+        if (eq) {
+            std::lock_guard<std::mutex> eq_lock(eq->mtx);
+            eq->deleted = true;
+            eq->pending_events.clear();
+            eq->cv.notify_all();
+        }
         return 0;
     }
     if (n == "sceKernelWaitEqueue") {
@@ -1426,24 +2101,71 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         auto ev_ptr = a(1);
         auto num = static_cast<int>(a(2));
         auto out_ptr = a(3);
+        auto micros_ptr = a(4);
 
-        auto it = equeues_.find(id);
-        if (it == equeues_.end()) {
-            if (out_ptr) put<std::int32_t>(mem_, out_ptr, 0);
-            return 0;
+        if (out_ptr) put<std::int32_t>(mem_, out_ptr, 0);
+
+        std::shared_ptr<EqueueRecord> eq;
+        {
+            std::lock_guard<std::mutex> lock(equeues_mutex_);
+            auto it = equeues_.find(id);
+            if (it == equeues_.end()) {
+                return 0x80020014;
+            }
+            eq = it->second;
         }
 
-        if (num > 0 && ev_ptr) {
-            if (!it->second.pending_events.empty()) {
-                auto ev = it->second.pending_events.front();
-                it->second.pending_events.erase(it->second.pending_events.begin());
-                mem_.store(ev_ptr, &ev, sizeof(EqueueEvent));
-                if (out_ptr) put<std::int32_t>(mem_, out_ptr, 1);
-                return 0;
+        if (num <= 0 || !ev_ptr) {
+            return 0x80020016;
+        }
+
+        std::unique_lock<std::mutex> lock(eq->mtx);
+        if (eq->deleted) {
+            return 0x80020014;
+        }
+
+        bool has_timeout = (micros_ptr != 0);
+        std::uint32_t timeout_us = 0;
+        if (has_timeout) {
+            if (mem_.load(micros_ptr, &timeout_us, sizeof(timeout_us)) != MemoryError::ok) {
+                return 0x80020016;
             }
         }
 
-        if (out_ptr) put<std::int32_t>(mem_, out_ptr, 0);
+        if (eq->pending_events.empty()) {
+            if (has_timeout && timeout_us == 0) {
+                return 0x8002001a;
+            }
+            if (has_timeout) {
+                bool ok = eq->cv.wait_for(lock, std::chrono::microseconds(timeout_us), [&]() {
+                    return !eq->pending_events.empty() || eq->deleted;
+                });
+                if (eq->deleted) {
+                    return 0x80020014;
+                }
+                if (!ok && eq->pending_events.empty()) {
+                    return 0x8002001a;
+                }
+            } else {
+                eq->cv.wait(lock, [&]() {
+                    return !eq->pending_events.empty() || eq->deleted;
+                });
+                if (eq->deleted) {
+                    return 0x80020014;
+                }
+            }
+        }
+
+        int count = 0;
+        while (count < num && !eq->pending_events.empty()) {
+            auto ev = eq->pending_events.front();
+            eq->pending_events.erase(eq->pending_events.begin());
+            if (mem_.store(ev_ptr + count * sizeof(EqueueEvent), &ev, sizeof(EqueueEvent)) != MemoryError::ok) {
+                break;
+            }
+            count++;
+        }
+        if (out_ptr) put<std::int32_t>(mem_, out_ptr, count);
         return 0;
     }
 
@@ -1528,32 +2250,46 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
                 return static_cast<std::uint64_t>(-1);
             }
         }
+        last_rasterizer_status_ = RasterizerStatus::Ok;
+        if (!pending->draw_calls().empty()) {
+            last_rasterizer_status_ = rasterizer_.execute_draw_calls(
+                mem_, pending->draw_calls(), &rasterizer_stats_);
+            if (last_rasterizer_status_ != RasterizerStatus::Ok) {
+                ++rasterizer_failure_count_;
+                // T154: Propagar erro de desenho e impedir flip de quadro invalido sem poluir contexto
+                return static_cast<std::uint64_t>(-1);
+            }
+        }
+        // T157: Conectar a submissão de draws e dispatches guest ao bridge Metal iOS
+        if (gnm_listener_) {
+            if (!pending->draw_calls().empty() && !gnm_listener_->on_draw_calls(pending->draw_calls())) {
+                ++rasterizer_failure_count_;
+                last_rasterizer_status_ = RasterizerStatus::Error;
+                return static_cast<std::uint64_t>(-1);
+            }
+            if (!pending->dispatch_calls().empty() && !gnm_listener_->on_dispatch_calls(pending->dispatch_calls())) {
+                ++rasterizer_failure_count_;
+                last_rasterizer_status_ = RasterizerStatus::Error;
+                return static_cast<std::uint64_t>(-1);
+            }
+        }
         gnm_context_.swap(pending);
         submit_count_ += count;
-        last_rasterizer_status_ = RasterizerStatus::Ok;
-        if (!gnm_context_->draw_calls().empty()) {
-            last_rasterizer_status_ = rasterizer_.execute_draw_calls(
-                mem_, gnm_context_->draw_calls(), &rasterizer_stats_);
-            if (last_rasterizer_status_ != RasterizerStatus::Ok) ++rasterizer_failure_count_;
-        }
         if (n == "sceGnmSubmitAndFlipCommandBuffers") {
-            auto h = static_cast<std::uint32_t>(a(5));
+            auto h = static_cast<std::int32_t>(a(5));
             auto buf_idx = static_cast<std::uint32_t>(a(6));
             auto flip_arg = a(8);
             if (!video_out_) return static_cast<std::uint64_t>(-1);
             VideoStatus flip_status = VideoStatus::invalid;
+            std::uint32_t actual_buf = buf_idx;
             if (buf_idx < 16) {
                 flip_status = video_out_->submit_flip(buf_idx, flip_arg);
             } else if (h < 16) {
-                flip_status = video_out_->submit_flip(h, a(7));
+                flip_status = video_out_->submit_flip(static_cast<std::uint32_t>(h), a(7));
+                actual_buf = static_cast<std::uint32_t>(h);
             }
             if (flip_status != VideoStatus::ok) return static_cast<std::uint64_t>(-1);
-            for (auto& pair : equeues_) {
-                if (pair.second.has_flip_event) {
-                    EqueueEvent ev{0x6, -13, 0, 0, 1, pair.second.flip_udata};
-                    pair.second.pending_events.push_back(ev);
-                }
-            }
+            dispatch_flip_event(h, actual_buf);
         }
         return 0;
     }
@@ -1750,100 +2486,196 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
 
-    // snprintf
+    // Formatting functions (snprintf, vsnprintf, sprintf, vsprintf, fprintf, vfprintf)
+    auto make_variadic_args = [&](unsigned start_int_arg) {
+        struct VariadicGetters {
+            std::function<std::uint64_t()> get_int;
+            std::function<double()> get_float;
+        };
+        auto int_idx = std::make_shared<unsigned>(start_int_arg);
+        auto float_idx = std::make_shared<unsigned>(0);
+        VariadicGetters g;
+        g.get_int = [&c, this, int_idx]() -> std::uint64_t {
+            return arg(c, (*int_idx)++);
+        };
+        g.get_float = [&c, this, int_idx, float_idx]() -> double {
+            double d = 0.0;
+            if (*float_idx < 8 && (c.xmm[*float_idx][0] != 0 || (c.gpr[0] > 0 && c.gpr[0] <= 8))) {
+                std::memcpy(&d, &c.xmm[(*float_idx)++][0], sizeof(d));
+            } else {
+                std::uint64_t gpr_val = arg(c, (*int_idx)++);
+                std::memcpy(&d, &gpr_val, sizeof(d));
+            }
+            return d;
+        };
+        return g;
+    };
+
+    auto make_valist_args = [&](std::uint64_t va_list_addr) {
+        struct VaListGetters {
+            std::function<std::uint64_t()> get_int;
+            std::function<double()> get_float;
+        };
+        struct SysVVaList {
+            std::uint32_t gp_offset;
+            std::uint32_t fp_offset;
+            std::uint64_t overflow_arg_area;
+            std::uint64_t reg_save_area;
+        };
+        auto vl = std::make_shared<SysVVaList>();
+        auto is_sysv = std::make_shared<bool>(false);
+        auto raw_offset = std::make_shared<std::uint64_t>(0);
+
+        if (va_list_addr != 0 && mem_.load(va_list_addr, vl.get(), sizeof(SysVVaList)) == MemoryError::ok) {
+            if (vl->gp_offset <= 48 && vl->fp_offset >= 48 && vl->fp_offset <= 176 && vl->reg_save_area != 0) {
+                *is_sysv = true;
+            }
+        }
+
+        VaListGetters g;
+        g.get_int = [this, va_list_addr, vl, is_sysv, raw_offset]() -> std::uint64_t {
+            if (!va_list_addr) return 0;
+            std::uint64_t val = 0;
+            if (*is_sysv) {
+                if (vl->gp_offset < 48) {
+                    mem_.load(vl->reg_save_area + vl->gp_offset, &val, 8);
+                    vl->gp_offset += 8;
+                } else if (vl->overflow_arg_area) {
+                    mem_.load(vl->overflow_arg_area, &val, 8);
+                    vl->overflow_arg_area += 8;
+                }
+                mem_.store(va_list_addr, vl.get(), sizeof(SysVVaList));
+            } else {
+                mem_.load(va_list_addr + *raw_offset, &val, 8);
+                *raw_offset += 8;
+            }
+            return val;
+        };
+        g.get_float = [this, va_list_addr, vl, is_sysv, raw_offset]() -> double {
+            if (!va_list_addr) return 0.0;
+            double val = 0.0;
+            if (*is_sysv) {
+                if (vl->fp_offset < 176) {
+                    mem_.load(vl->reg_save_area + vl->fp_offset, &val, 8);
+                    vl->fp_offset += 16;
+                } else if (vl->overflow_arg_area) {
+                    mem_.load(vl->overflow_arg_area, &val, 8);
+                    vl->overflow_arg_area += 8;
+                }
+                mem_.store(va_list_addr, vl.get(), sizeof(SysVVaList));
+            } else {
+                mem_.load(va_list_addr + *raw_offset, &val, 8);
+                *raw_offset += 8;
+            }
+            return val;
+        };
+        return g;
+    };
+
     if (n == "snprintf") {
         std::uint64_t dst = a(0);
         std::uint64_t max_size = a(1);
         std::uint64_t fmt_addr = a(2);
-        if (!fmt_addr) return 0;
+        if (!fmt_addr) return static_cast<std::uint64_t>(-1);
+        if (!dst && max_size > 0) return static_cast<std::uint64_t>(-1);
 
         std::string format = read_guest_string(fmt_addr, 4096);
+        auto getters = make_variadic_args(3);
         std::string out;
-        unsigned int_arg_idx = 3;
-        unsigned float_arg_idx = 0;
-
-        for (std::size_t i = 0; i < format.size(); ) {
-            if (format[i] != '%') {
-                out.push_back(format[i++]);
-                continue;
-            }
-            if (i + 1 < format.size() && format[i + 1] == '%') {
-                out.push_back('%');
-                i += 2;
-                continue;
-            }
-            std::size_t spec_start = i;
-            ++i;
-            std::string flags_width_prec;
-            while (i < format.size() && (std::strchr("-+ #0123456789.", format[i]) != nullptr)) {
-                flags_width_prec.push_back(format[i++]);
-            }
-            while (i < format.size() && (format[i] == 'l' || format[i] == 'z' || format[i] == 'h')) {
-                ++i;
-            }
-            if (i >= format.size()) {
-                out.append(format.substr(spec_start));
-                break;
-            }
-            char spec = format[i++];
-            char piece[512] = {};
-            if (spec == 'd' || spec == 'i') {
-                std::int64_t val = static_cast<std::int64_t>(a(int_arg_idx++));
-                std::string subspec = "%" + flags_width_prec + "lld";
-                std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<long long>(val));
-                out.append(piece);
-            } else if (spec == 'u') {
-                std::uint64_t val = a(int_arg_idx++);
-                std::string subspec = "%" + flags_width_prec + "llu";
-                std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<unsigned long long>(val));
-                out.append(piece);
-            } else if (spec == 'x' || spec == 'X') {
-                std::uint64_t val = a(int_arg_idx++);
-                std::string subspec = "%" + flags_width_prec + (spec == 'x' ? "llx" : "llX");
-                std::snprintf(piece, sizeof(piece), subspec.c_str(), static_cast<unsigned long long>(val));
-                out.append(piece);
-            } else if (spec == 's') {
-                std::uint64_t s_addr = a(int_arg_idx++);
-                std::string s_val = s_addr ? read_guest_string(s_addr, 4096) : "(null)";
-                std::string subspec = "%" + flags_width_prec + "s";
-                std::snprintf(piece, sizeof(piece), subspec.c_str(), s_val.c_str());
-                out.append(piece);
-            } else if (spec == 'f' || spec == 'F' || spec == 'g' || spec == 'G' || spec == 'e' || spec == 'E') {
-                double d = 0.0;
-                if (float_arg_idx < 8 && (c.xmm[float_arg_idx][0] != 0 || (c.gpr[0] > 0 && c.gpr[0] <= 8))) {
-                    std::memcpy(&d, &c.xmm[float_arg_idx][0], sizeof(d));
-                    float_arg_idx++;
-                } else if (float_arg_idx < 8 && c.xmm[float_arg_idx][0] == 0 && a(int_arg_idx) == 0 && float_arg_idx > 0) {
-                    std::memcpy(&d, &c.xmm[float_arg_idx][0], sizeof(d));
-                    float_arg_idx++;
-                } else {
-                    std::uint64_t gpr_val = a(int_arg_idx++);
-                    std::memcpy(&d, &gpr_val, sizeof(d));
-                }
-                std::string subspec = "%" + flags_width_prec + spec;
-                std::snprintf(piece, sizeof(piece), subspec.c_str(), d);
-                out.append(piece);
-            } else if (spec == 'p') {
-                std::uint64_t ptr_val = a(int_arg_idx++);
-                std::snprintf(piece, sizeof(piece), "%p", reinterpret_cast<void*>(static_cast<uintptr_t>(ptr_val)));
-                out.append(piece);
-            } else if (spec == 'c') {
-                char c_val = static_cast<char>(a(int_arg_idx++));
-                out.push_back(c_val);
-            } else {
-                out.append(format.substr(spec_start, i - spec_start));
-            }
+        if (!format_printf(format, getters.get_int, getters.get_float, out)) {
+            return static_cast<std::uint64_t>(-1);
         }
 
         if (dst && max_size > 0) {
             std::size_t to_write = std::min<std::size_t>(out.size(), static_cast<std::size_t>(max_size - 1));
-            if (to_write > 0) {
-                mem_.store(dst, out.data(), to_write);
+            if (to_write > 0 && mem_.store(dst, out.data(), to_write) != MemoryError::ok) {
+                return static_cast<std::uint64_t>(-1);
             }
             char null_byte = '\0';
-            mem_.store(dst + to_write, &null_byte, 1);
+            if (mem_.store(dst + to_write, &null_byte, 1) != MemoryError::ok) {
+                return static_cast<std::uint64_t>(-1);
+            }
         }
         return static_cast<std::uint64_t>(out.size());
+    }
+
+    if (n == "vsnprintf") {
+        std::uint64_t dst = a(0);
+        std::uint64_t max_size = a(1);
+        std::uint64_t fmt_addr = a(2);
+        std::uint64_t va_list_addr = a(3);
+        if (!fmt_addr) return static_cast<std::uint64_t>(-1);
+        if (!dst && max_size > 0) return static_cast<std::uint64_t>(-1);
+
+        std::string format = read_guest_string(fmt_addr, 4096);
+        auto getters = make_valist_args(va_list_addr);
+        std::string out;
+        if (!format_printf(format, getters.get_int, getters.get_float, out)) {
+            return static_cast<std::uint64_t>(-1);
+        }
+
+        if (dst && max_size > 0) {
+            std::size_t to_write = std::min<std::size_t>(out.size(), static_cast<std::size_t>(max_size - 1));
+            if (to_write > 0 && mem_.store(dst, out.data(), to_write) != MemoryError::ok) {
+                return static_cast<std::uint64_t>(-1);
+            }
+            char null_byte = '\0';
+            if (mem_.store(dst + to_write, &null_byte, 1) != MemoryError::ok) {
+                return static_cast<std::uint64_t>(-1);
+            }
+        }
+        return static_cast<std::uint64_t>(out.size());
+    }
+
+    if (n == "sprintf" || n == "vsprintf") {
+        std::uint64_t dst = a(0);
+        std::uint64_t fmt_addr = a(1);
+        if (!dst || !fmt_addr) return static_cast<std::uint64_t>(-1);
+
+        std::string format = read_guest_string(fmt_addr, 4096);
+        std::string out;
+        bool ok = false;
+        if (n == "sprintf") {
+            auto getters = make_variadic_args(2);
+            ok = format_printf(format, getters.get_int, getters.get_float, out);
+        } else {
+            auto getters = make_valist_args(a(2));
+            ok = format_printf(format, getters.get_int, getters.get_float, out);
+        }
+        if (!ok) return static_cast<std::uint64_t>(-1);
+
+        if (mem_.store(dst, out.data(), out.size()) != MemoryError::ok) {
+            return static_cast<std::uint64_t>(-1);
+        }
+        char null_byte = '\0';
+        if (mem_.store(dst + out.size(), &null_byte, 1) != MemoryError::ok) {
+            return static_cast<std::uint64_t>(-1);
+        }
+        return static_cast<std::uint64_t>(out.size());
+    }
+
+    if (n == "fprintf" || n == "vfprintf") {
+        FILE* fp = get_file(a(0));
+        if (!fp) return static_cast<std::uint64_t>(-1);
+        std::uint64_t fmt_addr = a(1);
+        if (!fmt_addr) return static_cast<std::uint64_t>(-1);
+
+        std::string format = read_guest_string(fmt_addr, 4096);
+        std::string out;
+        bool ok = false;
+        if (n == "fprintf") {
+            auto getters = make_variadic_args(2);
+            ok = format_printf(format, getters.get_int, getters.get_float, out);
+        } else {
+            auto getters = make_valist_args(a(2));
+            ok = format_printf(format, getters.get_int, getters.get_float, out);
+        }
+        if (!ok) return static_cast<std::uint64_t>(-1);
+
+        std::size_t written = std::fwrite(out.data(), 1, out.size(), fp);
+        std::fflush(fp);
+        if (written < out.size()) return static_cast<std::uint64_t>(-1);
+        return static_cast<std::uint64_t>(written);
     }
     if (n=="atexit" || n=="__cxa_atexit") {
         if (!a(0)) return invalid;
@@ -1891,15 +2723,59 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (size>logical_limit-mem_.used()) return no_memory;
         auto at=get<std::uint64_t>(mem_,a(0));
         if (!(flags & 0x10) || !at) { if (next_virtual_>UINT64_MAX-alignment) return no_memory; at=align(next_virtual_,alignment); }
-        if (mem_.map(at,static_cast<std::size_t>(size),read|write)!=MemoryError::ok) return no_memory;
+        unsigned permissions = ((prot & 0x11) ? static_cast<unsigned>(read) : 0u) | ((prot & 0x22) ? static_cast<unsigned>(write) : 0u);
+        if (mem_.map(at,static_cast<std::size_t>(size),permissions)!=MemoryError::ok) return no_memory;
         try { put(mem_,a(0),at); } catch (...) { mem_.unmap(at); throw; }
         mappings_[at]=size; if (direct) direct_mappings_[at]=phys;
         next_virtual_=std::max(next_virtual_,at+size); return 0;
     }
     if (n=="sceKernelMunmap" || n=="munmap" || n=="sceKernelReleaseFlexibleMemory") {
-        auto it=mappings_.find(a(0));
-        if (it==mappings_.end() || a(1)!=it->second) return invalid;
-        mem_.unmap(it->first); direct_mappings_.erase(it->first); mappings_.erase(it); return 0;
+        auto addr = a(0);
+        auto size = a(1);
+        if (!addr || !size || addr % page || size % page || size > UINT64_MAX - addr ||
+            size > std::numeric_limits<std::size_t>::max()) return invalid;
+        // Não confirmar liberação de buracos: validar toda a faixa antes de modificar o mapa.
+        const std::uint64_t u_start = addr;
+        const std::uint64_t u_end = addr + size;
+        for (auto cursor = u_start; cursor < u_end;) {
+            std::uint64_t base = 0;
+            std::size_t length = 0;
+            unsigned permissions = 0;
+            if (!mem_.query_region(cursor, base, length, permissions)) return 0x8002000e; // EFAULT
+            cursor = std::min(u_end, base + length);
+        }
+        const auto unmap_result = mem_.unmap(addr, static_cast<std::size_t>(size));
+        if (unmap_result != MemoryError::ok)
+            return unmap_result == MemoryError::unmapped ? 0x8002000e : invalid;
+        std::vector<std::uint64_t> to_del;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> to_ins;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> direct_to_ins;
+        for (auto& m : mappings_) {
+            std::uint64_t m_start = m.first;
+            std::uint64_t m_size = m.second;
+            std::uint64_t m_end = m_start + m_size;
+            if (m_start >= u_end || m_end <= u_start) continue;
+            to_del.push_back(m_start);
+            const auto direct = direct_mappings_.find(m_start);
+            if (u_start > m_start) {
+                to_ins.emplace_back(m_start, u_start - m_start);
+                if (direct != direct_mappings_.end()) direct_to_ins.emplace_back(m_start, direct->second);
+            }
+            if (u_end < m_end) {
+                to_ins.emplace_back(u_end, m_end - u_end);
+                if (direct != direct_mappings_.end())
+                    direct_to_ins.emplace_back(u_end, direct->second + (u_end - m_start));
+            }
+        }
+        for (auto k : to_del) {
+            mappings_.erase(k);
+            direct_mappings_.erase(k);
+        }
+        for (auto& p : to_ins) {
+            mappings_.insert(p);
+        }
+        for (auto& p : direct_to_ins) direct_mappings_.insert(p);
+        return 0;
     }
     if (n=="sceKernelReserveVirtualRange") {
         auto inout = a(0);
@@ -1917,7 +2793,73 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         next_virtual_ = std::max(next_virtual_, at + size);
         return 0;
     }
-    if (n=="sceKernelMprotect") return 0;
+    if (n=="sceKernelMprotect" || n=="mprotect") {
+        auto addr = a(0);
+        auto len = a(1);
+        auto prot = a(2);
+        if (!addr || !len) return invalid;
+        if ((addr % page) != 0 || (len % page) != 0) return invalid;
+        if ((prot & ~7) != 0) return invalid;
+
+        std::uint64_t cursor = addr;
+        const std::uint64_t p_end = addr + len;
+        if (p_end < addr) return 0x8002000e; // EFAULT / overflow
+        while (cursor < p_end) {
+            std::uint64_t base = 0;
+            std::size_t size = 0;
+            unsigned current_perm = 0;
+            if (!mem_.query_region(cursor, base, size, current_perm)) {
+                return 0x8002000e; // EFAULT
+            }
+            cursor = std::min(p_end, base + size);
+        }
+
+        unsigned new_perm = 0;
+        if (prot & 1) new_perm |= read;
+        if (prot & 2) new_perm |= write;
+
+        MemoryError merr = mem_.protect(addr, static_cast<std::size_t>(len), new_perm);
+        if (merr != MemoryError::ok) {
+            if (merr == MemoryError::invalid) return invalid;
+            if (merr == MemoryError::unmapped) return 0x8002000e;
+            return invalid;
+        }
+
+        std::vector<std::uint64_t> to_del;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> to_ins;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> direct_to_ins;
+        for (auto& m : mappings_) {
+            std::uint64_t m_start = m.first;
+            std::uint64_t m_size = m.second;
+            std::uint64_t m_end = m_start + m_size;
+            if (m_start >= p_end || m_end <= addr) continue;
+            to_del.push_back(m_start);
+            const auto direct = direct_mappings_.find(m_start);
+            if (addr > m_start) {
+                to_ins.emplace_back(m_start, addr - m_start);
+                if (direct != direct_mappings_.end()) direct_to_ins.emplace_back(m_start, direct->second);
+            }
+            const std::uint64_t mid_start = std::max(addr, m_start);
+            const std::uint64_t mid_end = std::min(p_end, m_end);
+            to_ins.emplace_back(mid_start, mid_end - mid_start);
+            if (direct != direct_mappings_.end()) {
+                direct_to_ins.emplace_back(mid_start, direct->second + (mid_start - m_start));
+            }
+            if (p_end < m_end) {
+                to_ins.emplace_back(p_end, m_end - p_end);
+                if (direct != direct_mappings_.end())
+                    direct_to_ins.emplace_back(p_end, direct->second + (p_end - m_start));
+            }
+        }
+        for (auto k : to_del) {
+            mappings_.erase(k);
+            direct_mappings_.erase(k);
+        }
+        for (auto& p : to_ins) mappings_.insert(p);
+        for (auto& p : direct_to_ins) direct_mappings_.insert(p);
+
+        return 0;
+    }
     if (n=="sceKernelQueryMemoryProtection") {
         auto addr = a(0);
         auto out_start = a(1);
@@ -1925,13 +2867,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         auto out_prot = a(3);
         std::uint64_t base = 0;
         std::size_t size = 0;
-        unsigned perm = bb::Permission::read | bb::Permission::write;
-        if (!mem_.query_region(addr, base, size, perm)) {
-            if (addr < 0x1000) return 0x8002000e; // EFAULT
-            base = addr & ~0x3fffULL;
-            size = 0x4000;
-            perm = bb::Permission::read | bb::Permission::write;
-        }
+        unsigned perm = 0;
+        if (!mem_.query_region(addr, base, size, perm)) return 0x8002000e; // EFAULT
         if (out_start) put<std::uint64_t>(mem_, out_start, base);
         if (out_end) put<std::uint64_t>(mem_, out_end, base + size);
         if (out_prot) {
@@ -1949,13 +2886,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (!info || info_size < 32) return invalid;
         std::uint64_t base = 0;
         std::size_t size = 0;
-        unsigned perm = bb::Permission::read | bb::Permission::write;
-        if (!mem_.query_region(addr, base, size, perm)) {
-            if (addr < 0x1000) return 0x8002000e;
-            base = addr & ~0x3fffULL;
-            size = 0x4000;
-            perm = bb::Permission::read | bb::Permission::write;
-        }
+        unsigned perm = 0;
+        if (!mem_.query_region(addr, base, size, perm)) return 0x8002000e; // EFAULT
         put<std::uint64_t>(mem_, info, base);
         put<std::uint64_t>(mem_, info + 8, base + size);
         put<std::uint64_t>(mem_, info + 16, 0); // offset
@@ -1997,22 +2929,117 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             mem_.load(entry_ptr + 28, &operation, 4);
 
             if (operation == 0 || operation == 3) { // map direct ou flexible
-                if (!start_addr || !length || length % page) break;
+                if (!length || length % page) break;
                 if (!(flags & 0x10) || !start_addr) {
                     start_addr = align(next_virtual_, page);
                 }
-                if (mem_.map(start_addr, static_cast<std::size_t>(length), read|write) != MemoryError::ok) break;
+                if ((static_cast<unsigned char>(prot) & ~0x37) != 0) break;
+                const unsigned permissions = ((prot & 0x11) ? static_cast<unsigned>(read) : 0u) | ((prot & 0x22) ? static_cast<unsigned>(write) : 0u);
+                if (mem_.map(start_addr, static_cast<std::size_t>(length), permissions) != MemoryError::ok) break;
                 put(mem_, entry_ptr, start_addr);
                 mappings_[start_addr] = length;
                 next_virtual_ = std::max(next_virtual_, start_addr + length);
             } else if (operation == 1) { // unmap
-                auto it = mappings_.find(start_addr);
-                if (it != mappings_.end()) {
-                    mem_.unmap(it->first);
-                    mappings_.erase(it);
+                if (!length || (length % page) != 0 || (start_addr % page) != 0) break;
+                std::uint64_t cursor = start_addr;
+                const std::uint64_t u_end = start_addr + length;
+                if (u_end < start_addr) break;
+                bool all_mapped = true;
+                while (cursor < u_end) {
+                    std::uint64_t base = 0;
+                    std::size_t rsize = 0;
+                    unsigned perm = 0;
+                    if (!mem_.query_region(cursor, base, rsize, perm)) {
+                        all_mapped = false;
+                        break;
+                    }
+                    cursor = std::min(u_end, base + rsize);
                 }
+                if (!all_mapped) break;
+
+                const auto unmap_res = mem_.unmap(start_addr, static_cast<std::size_t>(length));
+                if (unmap_res != MemoryError::ok) break;
+
+                std::vector<std::uint64_t> to_del;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> to_ins;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> direct_to_ins;
+                for (auto& m : mappings_) {
+                    std::uint64_t m_start = m.first;
+                    std::uint64_t m_size = m.second;
+                    std::uint64_t m_end = m_start + m_size;
+                    if (m_start >= u_end || m_end <= start_addr) continue;
+                    to_del.push_back(m_start);
+                    const auto direct = direct_mappings_.find(m_start);
+                    if (start_addr > m_start) {
+                        to_ins.emplace_back(m_start, start_addr - m_start);
+                        if (direct != direct_mappings_.end()) direct_to_ins.emplace_back(m_start, direct->second);
+                    }
+                    if (u_end < m_end) {
+                        to_ins.emplace_back(u_end, m_end - u_end);
+                        if (direct != direct_mappings_.end())
+                            direct_to_ins.emplace_back(u_end, direct->second + (u_end - m_start));
+                    }
+                }
+                for (auto k : to_del) {
+                    mappings_.erase(k);
+                    direct_mappings_.erase(k);
+                }
+                for (auto& p : to_ins) mappings_.insert(p);
+                for (auto& p : direct_to_ins) direct_mappings_.insert(p);
             } else if (operation == 2 || operation == 4) { // protect
-                // no-op no ambiente emulado
+                if ((static_cast<unsigned char>(prot) & ~0x37) != 0 || !length || (length % page) != 0 || (start_addr % page) != 0) break;
+                std::uint64_t cursor = start_addr;
+                const std::uint64_t p_end = start_addr + length;
+                if (p_end < start_addr) break;
+                bool all_mapped = true;
+                while (cursor < p_end) {
+                    std::uint64_t base = 0;
+                    std::size_t rsize = 0;
+                    unsigned perm = 0;
+                    if (!mem_.query_region(cursor, base, rsize, perm)) {
+                        all_mapped = false;
+                        break;
+                    }
+                    cursor = std::min(p_end, base + rsize);
+                }
+                if (!all_mapped) break;
+                const unsigned permissions = ((prot & 0x11) ? static_cast<unsigned>(read) : 0u) | ((prot & 0x22) ? static_cast<unsigned>(write) : 0u);
+                if (mem_.protect(start_addr, static_cast<std::size_t>(length), permissions) != MemoryError::ok) break;
+
+                std::vector<std::uint64_t> to_del;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> to_ins;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> direct_to_ins;
+                for (auto& m : mappings_) {
+                    std::uint64_t m_start = m.first;
+                    std::uint64_t m_size = m.second;
+                    std::uint64_t m_end = m_start + m_size;
+                    if (m_start >= p_end || m_end <= start_addr) continue;
+                    to_del.push_back(m_start);
+                    const auto direct = direct_mappings_.find(m_start);
+                    if (start_addr > m_start) {
+                        to_ins.emplace_back(m_start, start_addr - m_start);
+                        if (direct != direct_mappings_.end()) direct_to_ins.emplace_back(m_start, direct->second);
+                    }
+                    const std::uint64_t mid_start = std::max(start_addr, m_start);
+                    const std::uint64_t mid_end = std::min(p_end, m_end);
+                    to_ins.emplace_back(mid_start, mid_end - mid_start);
+                    if (direct != direct_mappings_.end()) {
+                        direct_to_ins.emplace_back(mid_start, direct->second + (mid_start - m_start));
+                    }
+                    if (p_end < m_end) {
+                        to_ins.emplace_back(p_end, m_end - p_end);
+                        if (direct != direct_mappings_.end())
+                            direct_to_ins.emplace_back(p_end, direct->second + (p_end - m_start));
+                    }
+                }
+                for (auto k : to_del) {
+                    mappings_.erase(k);
+                    direct_mappings_.erase(k);
+                }
+                for (auto& p : to_ins) mappings_.insert(p);
+                for (auto& p : direct_to_ins) direct_mappings_.insert(p);
+            } else {
+                break;
             }
         }
         if (processed_addr) put<std::int32_t>(mem_, processed_addr, done);
@@ -2061,6 +3088,9 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
     if (n=="scePthreadMutexInit" || n=="pthread_mutex_init") {
+        if (!a(0)) return invalid;
+        std::uint64_t dummy = 0;
+        if (mem_.store(a(0), &dummy, sizeof(dummy)) != MemoryError::ok) return invalid;
         unsigned type=1;
         if (a(1)) {
             auto attr=get<std::uint64_t>(mem_,a(1));
@@ -2129,6 +3159,13 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (max_val <= 0) max_val = std::max<std::int32_t>(1, init_val);
         if (init_val < 0 || max_val <= 0 || init_val > max_val) return invalid;
 
+        if (!is_sdk) {
+            std::uint32_t dummy = 0;
+            if (mem_.store(out_id_addr, &dummy, sizeof(dummy)) != MemoryError::ok) {
+                return invalid;
+            }
+        }
+
         std::uint32_t id = 0;
         auto ret = KernelSyncManager::instance().create_sema(&id, sema_name.c_str(), attr, init_val, max_val);
         if (ret != ORBIS_OK) return static_cast<std::uint32_t>(ret);
@@ -2143,7 +3180,11 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (is_sdk) {
             return id;
         } else {
-            put<std::uint32_t>(mem_, out_id_addr, id);
+            if (mem_.store(out_id_addr, &id, sizeof(id)) != MemoryError::ok) {
+                KernelSyncManager::instance().delete_sema(id);
+                sema_records_.erase(id);
+                return invalid;
+            }
             return 0;
         }
     }
@@ -2334,23 +3375,10 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     // pthread thread functions (stubs for non-scheduler mode)
     if (n=="scePthreadSelf" || n=="pthread_self" || n=="pthread_getthreadid_np") {
-        return 1; // main thread ID
+        return current_tid_ ? current_tid_ : 1;
     }
     if (n=="scePthreadCreate" || n=="pthread_create" || n=="pthread_create_name_np") {
-        // Simplified: allocate a thread ID and return success
-        if (!a(0) || !a(2)) return invalid;
-        std::uint64_t tid = next_handle_++;
-        put<std::uint64_t>(mem_, a(0), tid);
-        // Note: actual thread creation requires scheduler; returning success for now
-        return 0;
-    }
-    if (n=="scePthreadExit") {
-        // In non-scheduler mode, just return success
-        return 0;
-    }
-    if (n=="scePthreadJoin") {
-        // Simplified: return success immediately
-        return 0;
+        return invalid;
     }
     if (n=="scePthreadDetach") {
         return 0;
@@ -2361,26 +3389,6 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     if (n=="scePthreadEqual") {
         // Compare two thread IDs
         return (a(0) == a(1)) ? 1 : 0;
-    }
-    if (n=="scePthreadKeyCreate") {
-        if (!a(0)) return invalid;
-        std::uint64_t key = next_handle_++;
-        keys_[key] = a(1); // destructor
-        put<std::uint32_t>(mem_, a(0), static_cast<std::uint32_t>(key));
-        return 0;
-    }
-    if (n=="scePthreadKeyDelete") {
-        keys_.erase(a(0));
-        key_values_.erase(a(0));
-        return 0;
-    }
-    if (n=="scePthreadSetspecific") {
-        key_values_[a(0)] = a(1);
-        return 0;
-    }
-    if (n=="scePthreadGetspecific") {
-        auto it = key_values_.find(a(0));
-        return it == key_values_.end() ? 0 : it->second;
     }
     if (n=="scePthreadGetprio") {
         if (!a(1)) return invalid;
@@ -2428,6 +3436,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n=="scePthreadCondInit" || n=="pthread_cond_init") {
         if (!a(0)) return invalid;
+        std::uint64_t dummy = 0;
+        if (mem_.store(a(0), &dummy, sizeof(dummy)) != MemoryError::ok) return invalid;
         auto h=next_handle_++; put(mem_,a(0),h); conds_[h]=0; return 0;
     }
     if (n=="scePthreadCondDestroy" || n=="pthread_cond_destroy" || n=="scePthreadCondSignal" || n=="pthread_cond_signal" || n=="scePthreadCondBroadcast" || n=="pthread_cond_broadcast" || n=="scePthreadCondWait" || n=="pthread_cond_wait" || n=="scePthreadCondTimedwait" || n=="pthread_cond_timedwait") {
@@ -2463,6 +3473,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             return h;
         } else {
             if (!a(0) || a(2) > 3) return invalid;
+            std::uint32_t dummy = 0;
+            if (mem_.store(a(0), &dummy, sizeof(dummy)) != MemoryError::ok) return invalid;
             const auto h = next_handle_++;
             event_flags_[h] = a(3);
             put<std::uint32_t>(mem_, a(0), static_cast<std::uint32_t>(h));
@@ -2503,56 +3515,49 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
     if (n=="sceKernelGetProcessTime") {
+        if (scheduler_) return scheduler_->now();
         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     }
     if (n=="sceKernelClockGettime" || n=="clock_gettime") {
         if (!a(1) || a(0)>4) return invalid;
-        const auto now=a(0)==0 ? std::chrono::system_clock::now().time_since_epoch() : std::chrono::steady_clock::now().time_since_epoch();
-        const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
-        put<std::int64_t>(mem_,a(1),ns/1000000000); put<std::int64_t>(mem_,a(1)+8,ns%1000000000); return 0;
+        std::uint64_t ns = 0;
+        if (a(0) == 0) {
+            auto now = std::chrono::system_clock::now().time_since_epoch();
+            ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+        } else if (scheduler_) {
+            ns = scheduler_->now() * 1000ULL;
+        } else {
+            auto now = std::chrono::steady_clock::now().time_since_epoch();
+            ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+        }
+        const std::int64_t sec = static_cast<std::int64_t>(ns / 1000000000ULL);
+        const std::int64_t nsec = static_cast<std::int64_t>(ns % 1000000000ULL);
+        if (mem_.store(a(1), &sec, sizeof(sec)) != MemoryError::ok ||
+            mem_.store(a(1) + sizeof(sec), &nsec, sizeof(nsec)) != MemoryError::ok) {
+            return 0x8002000e; // EFAULT
+        }
+        return 0;
     }
     if (n=="sceSysmoduleLoadModule") {
-        const auto id = static_cast<std::uint16_t>(a(0));
-        if (!id) return 0x805A1000; // SCE_SYSMODULE_ERROR_INVALID_VALUE
-        return 0; // SCE_SYSMODULE_OK
+        return static_cast<std::uint32_t>(default_sysmodule().sceSysmoduleLoadModule(static_cast<std::int32_t>(a(0))));
     }
     if (n=="sceSysmoduleUnloadModule") {
-        const auto id = static_cast<std::uint16_t>(a(0));
-        if (!id) return 0x805A1000;
-        return 0;
+        return static_cast<std::uint32_t>(default_sysmodule().sceSysmoduleUnloadModule(static_cast<std::int32_t>(a(0))));
     }
     if (n=="sceSysmoduleIsLoaded") {
-        const auto id = static_cast<std::uint16_t>(a(0));
-        if (!id) return 0x805A1000;
-        return 0; // SCE_SYSMODULE_LOADED
+        return static_cast<std::uint32_t>(default_sysmodule().sceSysmoduleIsLoaded(static_cast<std::int32_t>(a(0))));
     }
     if (n=="sceAppContentInitialize") {
-        const auto boot_param_addr = a(1);
-        if (boot_param_addr) {
-            std::uint8_t zero[40] = {};
-            mem_.store(boot_param_addr, zero, sizeof(zero));
-        }
-        return 0; // SCE_APP_CONTENT_OK
+        return static_cast<std::uint32_t>(default_app_content().sceAppContentInitialize(mem_, a(0), a(1)));
     }
     if (n=="sceAppContentAppParamGetInt") {
-        const auto param_id = static_cast<std::uint32_t>(a(0));
-        const auto out_addr = a(1);
-        if (!out_addr) return 0x80D90002; // SCE_APP_CONTENT_ERROR_PARAMETER
-        std::int32_t val = 0;
-        if (param_id == 0) val = 3; // SCE_APP_CONTENT_SKU_FLAG_FULL
-        else if (param_id == 1) val = 13; // USER_DEFINED_PARAM_1 (param.sfo Bloodborne)
-        else if (param_id <= 4) val = 0;
-        else return 0x80D90002;
-        mem_.store(out_addr, &val, sizeof(val));
-        return 0;
+        return static_cast<std::uint32_t>(default_app_content().sceAppContentAppParamGetInt(mem_, static_cast<std::uint32_t>(a(0)), a(1)));
     }
     if (n=="sceAppContentGetAddcontInfoList") {
-        const auto hits_addr = a(3);
-        if (hits_addr) {
-            std::uint32_t hits = 0;
-            mem_.store(hits_addr, &hits, sizeof(hits));
-        }
-        return 0;
+        return static_cast<std::uint32_t>(default_app_content().sceAppContentGetAddcontInfoList(mem_, static_cast<std::uint32_t>(a(0)), a(1), static_cast<std::uint32_t>(a(2)), a(3)));
+    }
+    if (n=="sceAppContentGetPaddedAddcontInfo") {
+        return static_cast<std::uint32_t>(default_app_content().sceAppContentGetPaddedAddcontInfo(mem_, static_cast<std::uint32_t>(a(0)), a(1), a(2)));
     }
     // Dialog HLE: CommonDialog, MsgDialog, ImeDialog, SaveDataDialog, NpProfileDialog, NpCommerceDialog
     if (n=="sceCommonDialogInitialize") {
@@ -2634,14 +3639,18 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             case 1000: val = 1; break; // Enter button = cross
             default: val = 0; break;
         }
-        mem_.store(out, &val, sizeof(val));
+        if (mem_.store(out, &val, sizeof(val)) != MemoryError::ok) {
+            return 0x80A10003;
+        }
         return 0;
     }
     if (n == "sceSystemServiceGetStatus") {
         auto out = a(0);
         if (!out) return 0x80A10003;
         std::uint8_t status[12] = {}; // event_num=0, no overlay, foreground, normal CPU mode
-        mem_.store(out, status, sizeof(status));
+        if (mem_.store(out, status, sizeof(status)) != MemoryError::ok) {
+            return 0x80A10003;
+        }
         return 0;
     }
     if (n == "sceSystemServiceReceiveEvent") {
@@ -2738,31 +3747,59 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
 
     if (n == "sceAjmInitialize") {
-        if (a(1)) put<std::int32_t>(mem_, a(1), 1);
-        else if (a(0)) put<std::int32_t>(mem_, a(0), 1);
-        return 0;
+        std::int32_t ctx_id = 0;
+        auto res = default_ajm_manager().initialize(static_cast<std::int64_t>(a(0)), &ctx_id);
+        if (a(1)) put<std::int32_t>(mem_, a(1), ctx_id);
+        else if (a(0)) put<std::int32_t>(mem_, a(0), ctx_id);
+        return static_cast<std::uint32_t>(res);
     }
     if (n == "sceAjmFinalize") {
-        return 0;
+        return static_cast<std::uint32_t>(default_ajm_manager().finalize(static_cast<std::int32_t>(a(0))));
     }
-    if (n == "sceAjmModuleRegister" || n == "sceAjmModuleUnregister") {
-        return 0;
+    if (n == "sceAjmModuleRegister") {
+        return static_cast<std::uint32_t>(default_ajm_manager().module_register(static_cast<std::int32_t>(a(0)), static_cast<std::uint32_t>(a(1))));
+    }
+    if (n == "sceAjmModuleUnregister") {
+        return static_cast<std::uint32_t>(default_ajm_manager().module_unregister(static_cast<std::int32_t>(a(0)), static_cast<std::uint32_t>(a(1))));
     }
     if (n == "sceAjmInstanceCreate") {
-        if (a(2)) put<std::int32_t>(mem_, a(2), 1);
-        else if (a(1)) put<std::int32_t>(mem_, a(1), 1);
-        return 0;
+        std::int32_t inst_id = 0;
+        auto ctx_id = static_cast<std::int32_t>(a(0));
+        auto codec = static_cast<std::uint32_t>(a(1));
+        auto param_addr = a(2);
+        auto out_id_addr = a(3);
+        if (!out_id_addr && param_addr) {
+            out_id_addr = param_addr;
+            param_addr = 0;
+        }
+        auto res = default_ajm_manager().instance_create(ctx_id, codec, mem_, param_addr, &inst_id);
+        if (out_id_addr) put<std::int32_t>(mem_, out_id_addr, inst_id);
+        return static_cast<std::uint32_t>(res);
     }
     if (n == "sceAjmInstanceDestroy") {
-        return 0;
+        return static_cast<std::uint32_t>(default_ajm_manager().instance_destroy(static_cast<std::int32_t>(a(0)), static_cast<std::int32_t>(a(1))));
     }
     if (n == "sceAjmBatchStartBuffer") {
-        if (a(3)) put<std::int32_t>(mem_, a(3), 1);
-        return 0;
+        std::uint64_t batch_id = 0;
+        auto res = default_ajm_manager().batch_start_buffer(static_cast<std::int32_t>(a(0)), &batch_id);
+        if (a(3)) put<std::uint64_t>(mem_, a(3), batch_id);
+        else if (a(1)) put<std::uint64_t>(mem_, a(1), batch_id);
+        return static_cast<std::uint32_t>(res);
     }
-    if (n == "sceAjmBatchWait" || n == "sceAjmBatchCancel" ||
-        n == "sceAjmBatchJobRunBufferRa" || n == "sceAjmBatchJobControlBufferRa" ||
-        n == "sceAjmBatchErrorDump") {
+    if (n == "sceAjmBatchJobRunBufferRa") {
+        std::uint32_t written = 0;
+        auto res = default_ajm_manager().batch_job_run_buffer(
+            static_cast<std::int32_t>(a(0)), a(1), mem_, a(2), static_cast<std::uint32_t>(a(3)),
+            a(4), static_cast<std::uint32_t>(a(5)), static_cast<std::int32_t>(a(6)), &written);
+        return static_cast<std::uint32_t>(res);
+    }
+    if (n == "sceAjmBatchWait") {
+        return static_cast<std::uint32_t>(default_ajm_manager().batch_wait(static_cast<std::int32_t>(a(0)), a(1), static_cast<std::uint32_t>(a(2))));
+    }
+    if (n == "sceAjmBatchCancel") {
+        return static_cast<std::uint32_t>(default_ajm_manager().batch_cancel(static_cast<std::int32_t>(a(0)), a(1)));
+    }
+    if (n == "sceAjmBatchJobControlBufferRa" || n == "sceAjmBatchErrorDump") {
         return 0;
     }
 
@@ -2913,30 +3950,23 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return n=="memcmp" ? 0 : a(0);
     }
     if (n=="vprintf" || n=="printf") {
-        std::string format;
-        for (std::uint64_t i=0;i<4096;++i) {
-            auto ch=get<char>(mem_,a(0)+i);
-            if (!ch) break;
-            format+=ch;
+        std::uint64_t fmt_addr = a(0);
+        if (!fmt_addr) return static_cast<std::uint64_t>(-1);
+        std::string format = read_guest_string(fmt_addr, 4096);
+        std::string out;
+        bool ok = false;
+        if (n == "printf") {
+            auto getters = make_variadic_args(1);
+            ok = format_printf(format, getters.get_int, getters.get_float, out);
+        } else {
+            auto getters = make_valist_args(a(1));
+            ok = format_printf(format, getters.get_int, getters.get_float, out);
         }
-        if (format.size()==4096) throw std::runtime_error("formato printf excessivo");
-        // Apenas strings literais: conversões exigem interpretar va_list Orbis.
-        if (format.find('%')!=std::string::npos) throw std::runtime_error("import não implementado: formato vprintf");
-        std::fwrite(format.data(),1,format.size(),stdout);
-        return format.size();
-    }
-
-    // vsnprintf - stub funcional básico
-    if (n=="vsnprintf") {
-        std::uint64_t dst = a(0);
-        std::uint64_t max_size = a(1);
-        (void)a(2); // fmt_addr
-        // va_list is at a(3) - simplified: just return 0 for now
-        if (dst && max_size > 0) {
-            char null_byte = '\0';
-            mem_.store(dst, &null_byte, 1);
-        }
-        return 0;
+        if (!ok) return static_cast<std::uint64_t>(-1);
+        std::size_t written = std::fwrite(out.data(), 1, out.size(), stdout);
+        std::fflush(stdout);
+        if (written < out.size()) return static_cast<std::uint64_t>(-1);
+        return static_cast<std::uint64_t>(written);
     }
 
     // String functions: strncpy, strcat, strncat
@@ -3122,16 +4152,56 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     };
 
     // Kernel & libc filesystem operations
-    if (n == "sceKernelStat" || n == "stat") {
-        if (!a(0) || !a(1)) return (n == "stat") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+    if (n == "sceKernelStat" || n == "stat" || n == "lstat") {
+        if (!a(0) || !a(1)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 14); // EFAULT
+            return (n == "sceKernelStat") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+        }
         auto path = read_guest_string(a(0));
-        auto host_path = resolve_guest_path(path);
+        if (path.empty() || VirtualFileSystem::contains_traversal(path)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return (n == "sceKernelStat") ? 0x80020002 : static_cast<std::uint64_t>(-1);
+        }
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto vpath = resolve_guest_virtual_path(path);
         SceKernelStat sb{};
-        if (!fill_stat(host_path, sb)) {
-            return (n == "stat") ? static_cast<std::uint64_t>(-1) : 0x80020002; // ENOENT
+        bool stat_ok = false;
+        if (active_vfs && !vpath.empty()) {
+            VfsStat vstat{};
+            if (active_vfs->stat(vpath, vstat) == VfsError::ok) {
+                sb.st_mode = vstat.is_directory ? 0040777 : 0100777;
+                sb.st_size = static_cast<std::int64_t>(vstat.size);
+                sb.st_blksize = vstat.is_directory ? 65536 : 4096;
+                sb.st_blocks = (sb.st_size + 511) / 512;
+                sb.st_nlink = 1;
+                auto host_path = resolve_guest_path(path);
+                if (!host_path.empty()) {
+                    SceKernelStat host_sb{};
+                    if (fill_stat(host_path, host_sb)) {
+                        sb.st_mtime_sec = host_sb.st_mtime_sec;
+                        sb.st_mtime_nsec = host_sb.st_mtime_nsec;
+                        sb.st_atime_sec = host_sb.st_atime_sec;
+                        sb.st_ctime_sec = host_sb.st_ctime_sec;
+                        sb.st_birthtime_sec = host_sb.st_birthtime_sec;
+                    }
+                }
+                stat_ok = true;
+            }
+        }
+        if (!stat_ok) {
+            auto host_path = resolve_guest_path(path);
+            if (host_path.empty() || !fill_stat(host_path, sb)) {
+                auto err_addr = get_errno_addr(1);
+                if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+                return (n == "sceKernelStat") ? 0x80020002 : static_cast<std::uint64_t>(-1);
+            }
         }
         if (mem_.store(a(1), &sb, sizeof(sb)) != MemoryError::ok) {
-            return (n == "stat") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 14); // EFAULT
+            return (n == "sceKernelStat") ? 0x80020016 : static_cast<std::uint64_t>(-1);
         }
         return 0;
     }
@@ -3144,7 +4214,22 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             return (n == "fstat") ? static_cast<std::uint64_t>(-1) : 0x80020009; // EBADF
         }
         SceKernelStat sb{};
-        if (!fill_stat(it->second.path, sb)) {
+        bool stat_ok = false;
+        if (it->second.is_vfs) {
+            auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+            if (active_vfs) {
+                VfsStat vstat{};
+                if (active_vfs->stat(it->second.vfs_path, vstat) == VfsError::ok) {
+                    sb.st_mode = vstat.is_directory ? 0040777 : 0100777;
+                    sb.st_size = static_cast<std::int64_t>(vstat.size);
+                    sb.st_blksize = 4096;
+                    sb.st_blocks = (sb.st_size + 511) / 512;
+                    sb.st_nlink = 1;
+                    stat_ok = true;
+                }
+            }
+        }
+        if (!stat_ok && !fill_stat(it->second.path, sb)) {
             sb.st_mode = 0100777;
             sb.st_size = static_cast<std::int64_t>(it->second.size);
             sb.st_blksize = 4096;
@@ -3157,44 +4242,120 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
 
-    if (n == "sceKernelOpen" || n == "open") {
-        if (!a(0)) return (n == "open") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+    if (n == "sceKernelOpen" || n == "open" || n == "_open") {
+        if (!a(0)) return (n == "open" || n == "_open") ? static_cast<std::uint64_t>(-1) : 0x80020016;
         auto path = read_guest_string(a(0));
         auto host_path = resolve_guest_path(path);
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto vpath = resolve_guest_virtual_path(path);
         int flags = static_cast<int>(a(1));
-        std::printf("[FILE] %s: '%s' -> '%s' (flags=0x%x)\n", n.c_str(), path.c_str(), host_path.c_str(), flags);
+        std::printf("[FILE] %s: '%s' -> '%s' (vpath='%s' flags=0x%x)\n",
+                    n.c_str(), path.c_str(), host_path.c_str(), vpath.c_str(), flags);
+
+        // Se o caminho viola o sandbox ou travessia, rejeita
+        if (host_path.empty() && (!active_vfs || vpath.empty())) {
+            return (n == "open" || n == "_open") ? static_cast<std::uint64_t>(-1) : 0x80020002;
+        }
+
+        bool is_write = ((flags & 0x0003) == 0x0001 || (flags & 0x0003) == 0x0002 || (flags & 0x0200));
+        if (is_write && active_vfs) {
+            std::string hp;
+            bool ro = false;
+            VfsStat vs{};
+            if (!vpath.empty() && active_vfs->stat(vpath, vs) == VfsError::ok && vs.is_readonly) {
+                return (n == "open" || n == "_open") ? static_cast<std::uint64_t>(-1) : 0x8002001e; // EROFS
+            }
+            if (!vpath.empty() && active_vfs->resolve(vpath, hp, ro) == VfsError::ok && ro) {
+                return (n == "open" || n == "_open") ? static_cast<std::uint64_t>(-1) : 0x8002001e; // EROFS
+            }
+        }
         
+        // Precedência de arquivos virtuais montados em BHD5/BND4 sobre o host (T119)
+        std::string open_vpath;
+        VfsStat vstat{};
+        if (active_vfs) {
+            if (!vpath.empty() && active_vfs->has_archive_file(vpath) && active_vfs->stat(vpath, vstat) == VfsError::ok && !vstat.is_directory) {
+                open_vpath = vpath;
+            } else if (active_vfs->has_archive_file(path) && active_vfs->stat(path, vstat) == VfsError::ok && !vstat.is_directory) {
+                open_vpath = path;
+            }
+        }
+        if (!open_vpath.empty()) {
+            if (is_write) {
+                return (n == "open" || n == "_open") ? static_cast<std::uint64_t>(-1) : 0x8002001e; // EROFS
+            }
+            int fd = next_kernel_fd_++;
+            std::uint64_t fsz = vstat.size;
+            kernel_files_[fd] = KernelFileEntry{nullptr, path, open_vpath, flags, fsz, 0, true, true};
+            std::printf("[FILE] %s: '%s' -> (VFS read_at) fd=%d size=%llu\n",
+                        n.c_str(), path.c_str(), fd, (unsigned long long)fsz);
+            return static_cast<std::uint64_t>(fd);
+        }
+
+        // Modos de abertura host com preservação byte a byte e conformidade com O_TRUNC/O_CREAT (T116)
+        bool has_trunc = (flags & 0x0400) != 0;
+        bool has_append = (flags & 0x0008) != 0;
+        bool has_creat = (flags & 0x0200) != 0;
+        bool is_rdwr = ((flags & 0x0003) == 0x0002);
+        bool is_wronly = ((flags & 0x0003) == 0x0001);
+
         const char* fmode = "rb";
-        if (flags & 0x0200) { // O_CREAT
-            if (flags & 0x0400) fmode = (flags & 0x0002) ? "w+b" : "wb"; // O_TRUNC
-            else if (flags & 0x0008) fmode = (flags & 0x0002) ? "a+b" : "ab"; // O_APPEND
-            else fmode = (flags & 0x0002) ? "r+b" : "wb";
-        } else if (flags & 0x0008) { // O_APPEND
-            fmode = (flags & 0x0002) ? "a+b" : "ab";
-        } else if ((flags & 0x0003) == 0x0002) { // O_RDWR
+        std::error_code ec_ex;
+        bool file_exists = !host_path.empty() && std::filesystem::exists(host_path, ec_ex) && !std::filesystem::is_directory(host_path, ec_ex);
+
+        if (has_trunc) {
+            fmode = is_rdwr ? "w+b" : "wb";
+        } else if (has_append) {
+            fmode = is_rdwr ? "a+b" : "ab";
+        } else if (is_rdwr) {
             fmode = "r+b";
-        } else if ((flags & 0x0003) == 0x0001) { // O_WRONLY
-            fmode = "wb";
+        } else if (is_wronly) {
+            if (file_exists) {
+                fmode = "r+b"; // Preserva conteudo preexistente byte a byte; escrita sem truncar
+            } else if (has_creat) {
+                fmode = "wb";  // Cria novo arquivo vazio
+            } else {
+                fmode = "r+b"; // Nao existe: tentara r+b e falhara com ENOENT
+            }
+        } else if (has_creat) {
+            if (file_exists) {
+                fmode = is_rdwr ? "r+b" : "rb";
+            } else {
+                fmode = is_rdwr ? "w+b" : "wb";
+            }
         } else {
             fmode = "rb";
         }
 
-        FILE* fp = portable_fopen(host_path, fmode);
-        if (!fp && (flags & 0x0200)) {
-            fp = portable_fopen(host_path, "w+b");
+        FILE* fp = host_path.empty() ? nullptr : portable_fopen(host_path, fmode);
+        if (!fp && has_creat && !file_exists && !host_path.empty()) {
+            fp = portable_fopen(host_path, is_rdwr ? "w+b" : "wb");
         }
-        if (!fp && vfs_) {
-            std::vector<std::uint8_t> vfs_data;
-            if (vfs_->read_file(path, vfs_data) == VfsError::ok || vfs_->read_file(host_path, vfs_data) == VfsError::ok) {
+        if (!fp && active_vfs) {
+            VfsStat fallback_vstat{};
+            std::string fallback_vpath;
+            if (!vpath.empty() && active_vfs->stat(vpath, fallback_vstat) == VfsError::ok && !fallback_vstat.is_directory) {
+                fallback_vpath = vpath;
+            } else if (active_vfs->stat(path, fallback_vstat) == VfsError::ok && !fallback_vstat.is_directory) {
+                fallback_vpath = path;
+            } else if (!host_path.empty() && active_vfs->stat(host_path, fallback_vstat) == VfsError::ok && !fallback_vstat.is_directory) {
+                fallback_vpath = host_path;
+            }
+            if (!fallback_vpath.empty()) {
+                // Rejeita tentativas de escrita em arquivos virtuais/read-only VFS
+                if (is_write) {
+                    return (n == "open" || n == "_open") ? static_cast<std::uint64_t>(-1) : 0x8002001e; // EROFS
+                }
                 int fd = next_kernel_fd_++;
-                std::uint64_t fsz = vfs_data.size();
-                kernel_files_[fd] = KernelFileEntry{nullptr, path, flags, fsz, std::move(vfs_data), 0, true};
-                std::printf("[FILE] %s: '%s' -> (synthetic VFS) fd=%d size=%llu\n", n.c_str(), path.c_str(), fd, (unsigned long long)fsz);
+                std::uint64_t fsz = fallback_vstat.size;
+                kernel_files_[fd] = KernelFileEntry{nullptr, path, fallback_vpath, flags, fsz, 0, true, true};
+                std::printf("[FILE] %s: '%s' -> (VFS read_at) fd=%d size=%llu\n",
+                            n.c_str(), path.c_str(), fd, (unsigned long long)fsz);
                 return static_cast<std::uint64_t>(fd);
             }
         }
         if (!fp) {
-            return (n == "open") ? static_cast<std::uint64_t>(-1) : 0x80020002; // ENOENT
+            return (n == "open" || n == "_open") ? static_cast<std::uint64_t>(-1) : 0x80020002; // ENOENT
         }
 
         std::uint64_t fsz = 0;
@@ -3204,17 +4365,17 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         }
 
         int fd = next_kernel_fd_++;
-        kernel_files_[fd] = KernelFileEntry{fp, host_path, flags, fsz, {}, 0, false};
+        kernel_files_[fd] = KernelFileEntry{fp, host_path, vpath, flags, fsz, 0, false, false};
         std::printf("[FILE] %s: '%s' -> fd=%d size=%llu\n", n.c_str(), path.c_str(), fd, (unsigned long long)fsz);
         return static_cast<std::uint64_t>(fd);
     }
 
-    if (n == "sceKernelClose" || n == "close") {
+    if (n == "sceKernelClose" || n == "close" || n == "_close") {
         int fd = static_cast<int>(a(0));
         auto it = kernel_files_.find(fd);
         if (it == kernel_files_.end()) {
             std::printf("[FILE] %s: fd=%d EBADF\n", n.c_str(), fd);
-            return (n == "close") ? static_cast<std::uint64_t>(-1) : 0x80020009; // EBADF
+            return (n == "close" || n == "_close") ? static_cast<std::uint64_t>(-1) : 0x80020009; // EBADF
         }
         std::printf("[FILE] %s: fd=%d ('%s')\n", n.c_str(), fd, it->second.path.c_str());
         if (it->second.fp) std::fclose(it->second.fp);
@@ -3230,35 +4391,74 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (it != kernel_files_.end()) {
             std::printf("[FILE] %s: fd=%d ('%s') nbyte=%zu\n", n.c_str(), fd, it->second.path.c_str(), nbyte);
         }
-        if (!buf) return (n == "sceKernelRead") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+        if (!buf && nbyte > 0) return (n == "sceKernelRead") ? 0x80020016 : static_cast<std::uint64_t>(-1);
         if (it == kernel_files_.end()) {
             return (n == "sceKernelRead") ? 0x80020009 : static_cast<std::uint64_t>(-1);
         }
-        if (it->second.is_synthetic) {
-            std::size_t available = (it->second.seek_pos < it->second.synthetic_data.size())
-                ? (it->second.synthetic_data.size() - static_cast<std::size_t>(it->second.seek_pos)) : 0;
-            std::size_t to_read = std::min(nbyte, available);
-            if (to_read > 0) {
-                if (mem_.store(buf, it->second.synthetic_data.data() + it->second.seek_pos, to_read) != MemoryError::ok) {
+        if (nbyte == 0) return 0;
+
+        if (it->second.is_vfs) {
+            auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+            if (!active_vfs) {
+                return (n == "sceKernelRead") ? 0x80020009 : static_cast<std::uint64_t>(-1);
+            }
+            if (it->second.seek_pos >= it->second.size) {
+                return 0; // EOF
+            }
+            std::uint64_t avail = it->second.size - it->second.seek_pos;
+            std::size_t to_transfer = static_cast<std::size_t>(std::min<std::uint64_t>(nbyte, avail));
+            constexpr std::size_t kChunkSize = 64 * 1024;
+            std::vector<std::uint8_t> chunk(kChunkSize);
+            std::size_t total_read = 0;
+            VfsError last_err = VfsError::ok;
+            while (total_read < to_transfer) {
+                std::size_t step = std::min(to_transfer - total_read, kChunkSize);
+                std::size_t out_bytes = 0;
+                last_err = active_vfs->read_at(it->second.vfs_path,
+                                               it->second.seek_pos + total_read,
+                                               chunk.data(),
+                                               step,
+                                               out_bytes);
+                if (last_err != VfsError::ok || out_bytes == 0) break;
+                if (mem_.store(buf + total_read, chunk.data(), out_bytes) != MemoryError::ok) {
                     return (n == "sceKernelRead") ? 0x80020016 : static_cast<std::uint64_t>(-1);
                 }
-                it->second.seek_pos += to_read;
+                total_read += out_bytes;
+                if (out_bytes < step) break;
             }
-            return static_cast<std::uint64_t>(to_read);
+            if (total_read > 0) {
+                it->second.seek_pos += total_read;
+                return static_cast<std::uint64_t>(total_read);
+            }
+            if (last_err != VfsError::ok) {
+                if (n == "sceKernelRead") {
+                    if (last_err == VfsError::access_denied) return 0x8002000d;
+                    if (last_err == VfsError::not_found) return 0x80020002;
+                    return 0x80020005; // EIO
+                }
+                return static_cast<std::uint64_t>(-1);
+            }
+            return 0; // EOF genuíno
         }
+
         if (!it->second.fp) {
             return (n == "sceKernelRead") ? 0x80020009 : static_cast<std::uint64_t>(-1);
         }
-        constexpr std::size_t max_chunk = 64ull * 1024 * 1024;
-        std::size_t to_read = std::min(nbyte, max_chunk);
-        std::vector<std::uint8_t> tmp(to_read);
-        std::size_t bytes_read = std::fread(tmp.data(), 1, to_read, it->second.fp);
-        if (bytes_read > 0) {
-            if (mem_.store(buf, tmp.data(), bytes_read) != MemoryError::ok) {
+        constexpr std::size_t kChunkSize = 64 * 1024;
+        std::vector<std::uint8_t> tmp(kChunkSize);
+        std::size_t total_read = 0;
+        while (total_read < nbyte) {
+            std::size_t step = std::min(nbyte - total_read, kChunkSize);
+            std::size_t bytes_read = std::fread(tmp.data(), 1, step, it->second.fp);
+            if (bytes_read == 0) break;
+            if (mem_.store(buf + total_read, tmp.data(), bytes_read) != MemoryError::ok) {
                 return (n == "sceKernelRead") ? 0x80020016 : static_cast<std::uint64_t>(-1);
             }
+            total_read += bytes_read;
+            it->second.seek_pos += bytes_read;
+            if (bytes_read < step) break;
         }
-        return static_cast<std::uint64_t>(bytes_read);
+        return static_cast<std::uint64_t>(total_read);
     }
 
     if (n == "sceKernelPread") {
@@ -3271,21 +4471,50 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
             std::printf("[FILE] sceKernelPread: fd=%d ('%s') off=%lld nbyte=%zu\n",
                         fd, it->second.path.c_str(), (long long)offset, nbyte);
         }
-        if (!buf) return 0x80020016;
+        if (!buf && nbyte > 0) return 0x80020016;
         if (it == kernel_files_.end()) return 0x80020009;
-        if (it->second.is_synthetic) {
-            if (offset < 0 || static_cast<std::uint64_t>(offset) > it->second.synthetic_data.size()) {
-                return 0;
+        if (offset < 0) return 0x80020016;
+        if (nbyte == 0) return 0;
+
+        if (it->second.is_vfs) {
+            if (static_cast<std::uint64_t>(offset) >= it->second.size) {
+                return 0; // EOF per POSIX pread
             }
-            std::size_t available = it->second.synthetic_data.size() - static_cast<std::size_t>(offset);
-            std::size_t to_read = std::min(nbyte, available);
-            if (to_read > 0) {
-                if (mem_.store(buf, it->second.synthetic_data.data() + offset, to_read) != MemoryError::ok) {
+            auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+            if (!active_vfs) return 0x80020009;
+
+            std::uint64_t avail = it->second.size - static_cast<std::uint64_t>(offset);
+            std::size_t to_transfer = static_cast<std::size_t>(std::min<std::uint64_t>(nbyte, avail));
+            constexpr std::size_t kChunkSize = 64 * 1024;
+            std::vector<std::uint8_t> chunk(kChunkSize);
+            std::size_t total_read = 0;
+            VfsError last_err = VfsError::ok;
+            while (total_read < to_transfer) {
+                std::size_t step = std::min(to_transfer - total_read, kChunkSize);
+                std::size_t out_bytes = 0;
+                last_err = active_vfs->read_at(it->second.vfs_path,
+                                               static_cast<std::uint64_t>(offset) + total_read,
+                                               chunk.data(),
+                                               step,
+                                               out_bytes);
+                if (last_err != VfsError::ok || out_bytes == 0) break;
+                if (mem_.store(buf + total_read, chunk.data(), out_bytes) != MemoryError::ok) {
                     return 0x80020016;
                 }
+                total_read += out_bytes;
+                if (out_bytes < step) break;
             }
-            return static_cast<std::uint64_t>(to_read);
+            if (total_read > 0) {
+                return static_cast<std::uint64_t>(total_read);
+            }
+            if (last_err != VfsError::ok) {
+                if (last_err == VfsError::access_denied) return 0x8002000d;
+                if (last_err == VfsError::not_found) return 0x80020002;
+                return 0x80020005; // EIO
+            }
+            return 0;
         }
+
         if (!it->second.fp) {
             return 0x80020009;
         }
@@ -3297,53 +4526,72 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         off_t cur = ftello(fp);
         if (fseeko(fp, offset, SEEK_SET) != 0) return 0x80020016;
 #endif
-        constexpr std::size_t max_chunk = 64ull * 1024 * 1024;
-        std::size_t to_read = std::min(nbyte, max_chunk);
-        std::vector<std::uint8_t> tmp(to_read);
-        std::size_t bytes_read = std::fread(tmp.data(), 1, to_read, fp);
-        if (bytes_read > 0) {
-            if (mem_.store(buf, tmp.data(), bytes_read) != MemoryError::ok) {
-#if defined(_WIN32)
-                _fseeki64(fp, cur, SEEK_SET);
-#else
-                fseeko(fp, cur, SEEK_SET);
-#endif
-                return 0x80020016;
+        constexpr std::size_t kChunkSize = 64 * 1024;
+        std::vector<std::uint8_t> tmp(kChunkSize);
+        std::size_t total_read = 0;
+        bool store_err = false;
+        while (total_read < nbyte) {
+            std::size_t step = std::min(nbyte - total_read, kChunkSize);
+            std::size_t bytes_read = std::fread(tmp.data(), 1, step, fp);
+            if (bytes_read == 0) break;
+            if (mem_.store(buf + total_read, tmp.data(), bytes_read) != MemoryError::ok) {
+                store_err = true;
+                break;
             }
+            total_read += bytes_read;
+            if (bytes_read < step) break;
         }
 #if defined(_WIN32)
         _fseeki64(fp, cur, SEEK_SET);
 #else
         fseeko(fp, cur, SEEK_SET);
 #endif
-        return static_cast<std::uint64_t>(bytes_read);
+        if (store_err) return 0x80020016;
+        return static_cast<std::uint64_t>(total_read);
     }
 
     if (n == "sceKernelWrite" || n == "write" || n == "_write") {
         int fd = static_cast<int>(a(0));
         std::uint64_t buf = a(1);
         std::size_t nbyte = static_cast<std::size_t>(a(2));
-        if (!buf) return (n == "sceKernelWrite") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+        if (!buf && nbyte > 0) return (n == "sceKernelWrite") ? 0x80020016 : static_cast<std::uint64_t>(-1);
         if (fd == 1 || fd == 2) {
-            std::vector<char> tmp(nbyte + 1, 0);
-            if (mem_.load(buf, tmp.data(), nbyte) == MemoryError::ok) {
-                std::fwrite(tmp.data(), 1, nbyte, (fd == 2) ? stderr : stdout);
-                std::fflush((fd == 2) ? stderr : stdout);
+            if (nbyte == 0) return 0;
+            FILE* out_fp = (fd == 2) ? stderr : stdout;
+            constexpr std::size_t kChunkSize = 64 * 1024;
+            std::vector<char> tmp(kChunkSize);
+            std::size_t total_written = 0;
+            while (total_written < nbyte) {
+                std::size_t step = std::min(nbyte - total_written, kChunkSize);
+                if (mem_.load(buf + total_written, tmp.data(), step) != MemoryError::ok) {
+                    if (total_written > 0) break;
+                    return (n == "sceKernelWrite") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+                }
+                std::size_t bytes_written = std::fwrite(tmp.data(), 1, step, out_fp);
+                total_written += bytes_written;
+                if (bytes_written < step) break;
             }
-            return nbyte;
+            std::fflush(out_fp);
+            return static_cast<std::uint64_t>(total_written);
         }
         auto it = kernel_files_.find(fd);
         if (it == kernel_files_.end() || !it->second.fp) {
             return (n == "sceKernelWrite") ? 0x80020009 : static_cast<std::uint64_t>(-1);
         }
-        constexpr std::size_t max_chunk = 64ull * 1024 * 1024;
-        std::size_t to_write = std::min(nbyte, max_chunk);
-        std::vector<std::uint8_t> tmp(to_write);
-        if (mem_.load(buf, tmp.data(), to_write) != MemoryError::ok) {
-            return (n == "sceKernelWrite") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+        constexpr std::size_t kChunkSize = 64 * 1024;
+        std::vector<std::uint8_t> tmp(kChunkSize);
+        std::size_t total_written = 0;
+        while (total_written < nbyte) {
+            std::size_t step = std::min(nbyte - total_written, kChunkSize);
+            if (mem_.load(buf + total_written, tmp.data(), step) != MemoryError::ok) {
+                return (n == "sceKernelWrite") ? 0x80020016 : static_cast<std::uint64_t>(-1);
+            }
+            std::size_t bytes_written = std::fwrite(tmp.data(), 1, step, it->second.fp);
+            total_written += bytes_written;
+            it->second.seek_pos += bytes_written;
+            if (bytes_written < step) break;
         }
-        std::size_t bytes_written = std::fwrite(tmp.data(), 1, to_write, it->second.fp);
-        return static_cast<std::uint64_t>(bytes_written);
+        return static_cast<std::uint64_t>(total_written);
     }
 
     if (n == "sceKernelPwrite") {
@@ -3351,7 +4599,8 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         std::uint64_t buf = a(1);
         std::size_t nbyte = static_cast<std::size_t>(a(2));
         std::int64_t offset = static_cast<std::int64_t>(a(3));
-        if (!buf) return 0x80020016;
+        if (!buf && nbyte > 0) return 0x80020016;
+        if (offset < 0) return 0x80020016;
         auto it = kernel_files_.find(fd);
         if (it == kernel_files_.end() || !it->second.fp) {
             return 0x80020009;
@@ -3364,62 +4613,69 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         off_t cur = ftello(fp);
         if (fseeko(fp, offset, SEEK_SET) != 0) return 0x80020016;
 #endif
-        constexpr std::size_t max_chunk = 64ull * 1024 * 1024;
-        std::size_t to_write = std::min(nbyte, max_chunk);
-        std::vector<std::uint8_t> tmp(to_write);
-        if (mem_.load(buf, tmp.data(), to_write) != MemoryError::ok) {
-#if defined(_WIN32)
-            _fseeki64(fp, cur, SEEK_SET);
-#else
-            fseeko(fp, cur, SEEK_SET);
-#endif
-            return 0x80020016;
+        constexpr std::size_t kChunkSize = 64 * 1024;
+        std::vector<std::uint8_t> tmp(kChunkSize);
+        std::size_t total_written = 0;
+        bool load_err = false;
+        while (total_written < nbyte) {
+            std::size_t step = std::min(nbyte - total_written, kChunkSize);
+            if (mem_.load(buf + total_written, tmp.data(), step) != MemoryError::ok) {
+                load_err = true;
+                break;
+            }
+            std::size_t bytes_written = std::fwrite(tmp.data(), 1, step, fp);
+            total_written += bytes_written;
+            if (bytes_written < step) break;
         }
-        std::size_t written = std::fwrite(tmp.data(), 1, to_write, fp);
 #if defined(_WIN32)
         _fseeki64(fp, cur, SEEK_SET);
 #else
         fseeko(fp, cur, SEEK_SET);
 #endif
-        return static_cast<std::uint64_t>(written);
+        if (load_err) return 0x80020016;
+        return static_cast<std::uint64_t>(total_written);
     }
 
-    if (n == "sceKernelLseek" || n == "lseek") {
+    if (n == "sceKernelLseek" || n == "lseek" || n == "_lseek") {
         int fd = static_cast<int>(a(0));
         std::int64_t offset = static_cast<std::int64_t>(a(1));
         int whence = static_cast<int>(a(2));
         auto it = kernel_files_.find(fd);
         if (it == kernel_files_.end()) {
-            return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020009;
+            return (n == "lseek" || n == "_lseek") ? static_cast<std::uint64_t>(-1) : 0x80020009;
         }
-        if (it->second.is_synthetic) {
+        if (it->second.is_vfs) {
             std::int64_t new_pos = 0;
             if (whence == 0) { // SEEK_SET
                 new_pos = offset;
             } else if (whence == 1) { // SEEK_CUR
                 new_pos = static_cast<std::int64_t>(it->second.seek_pos) + offset;
             } else if (whence == 2) { // SEEK_END
-                new_pos = static_cast<std::int64_t>(it->second.synthetic_data.size()) + offset;
+                new_pos = static_cast<std::int64_t>(it->second.size) + offset;
             } else {
-                return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+                return (n == "lseek" || n == "_lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
             }
-            if (new_pos < 0) return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
+            if (new_pos < 0) return (n == "lseek" || n == "_lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
             it->second.seek_pos = static_cast<std::uint64_t>(new_pos);
             return static_cast<std::uint64_t>(it->second.seek_pos);
         }
         if (!it->second.fp) {
-            return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020009;
+            return (n == "lseek" || n == "_lseek") ? static_cast<std::uint64_t>(-1) : 0x80020009;
         }
 #if defined(_WIN32)
         if (_fseeki64(it->second.fp, offset, whence) != 0) {
             return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
         }
-        return static_cast<std::uint64_t>(_ftelli64(it->second.fp));
+        auto cur = static_cast<std::uint64_t>(_ftelli64(it->second.fp));
+        it->second.seek_pos = cur;
+        return cur;
 #else
         if (fseeko(it->second.fp, offset, whence) != 0) {
             return (n == "lseek") ? static_cast<std::uint64_t>(-1) : 0x80020016;
         }
-        return static_cast<std::uint64_t>(ftello(it->second.fp));
+        auto cur = static_cast<std::uint64_t>(ftello(it->second.fp));
+        it->second.seek_pos = cur;
+        return cur;
 #endif
     }
 
@@ -3427,28 +4683,81 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         int fd = static_cast<int>(a(0));
         std::int64_t length = static_cast<std::int64_t>(a(1));
         auto it = kernel_files_.find(fd);
-        if (it == kernel_files_.end() || !it->second.fp) {
-            return (n == "ftruncate") ? static_cast<std::uint64_t>(-1) : 0x80020009;
+        if (it == kernel_files_.end()) {
+            if (n == "ftruncate") {
+                auto err_addr = get_errno_addr(1);
+                if (err_addr) put<std::int32_t>(mem_, err_addr, 9); // EBADF
+                return static_cast<std::uint64_t>(-1);
+            }
+            return 0x80020009; // EBADF
+        }
+        if (length < 0) {
+            if (n == "ftruncate") {
+                auto err_addr = get_errno_addr(1);
+                if (err_addr) put<std::int32_t>(mem_, err_addr, 22); // EINVAL
+                return static_cast<std::uint64_t>(-1);
+            }
+            return 0x80020016; // EINVAL
+        }
+        if (it->second.is_vfs || (it->second.flags & 0x0003) == 0 || !it->second.fp) {
+            if (n == "ftruncate") {
+                auto err_addr = get_errno_addr(1);
+                if (err_addr) put<std::int32_t>(mem_, err_addr, 22); // EINVAL
+                return static_cast<std::uint64_t>(-1);
+            }
+            return 0x80020016; // EINVAL
         }
 #if defined(_WIN32)
         int win_fd = _fileno(it->second.fp);
-        if (win_fd >= 0) {
-            _chsize_s(win_fd, length);
+        if (win_fd < 0) {
+            if (n == "ftruncate") {
+                auto err_addr = get_errno_addr(1);
+                if (err_addr) put<std::int32_t>(mem_, err_addr, 9); // EBADF
+                return static_cast<std::uint64_t>(-1);
+            }
+            return 0x80020009;
+        }
+        errno_t err = _chsize_s(win_fd, length);
+        if (err != 0) {
+            if (n == "ftruncate") {
+                auto err_addr = get_errno_addr(1);
+                if (err_addr) put<std::int32_t>(mem_, err_addr, static_cast<std::int32_t>(err));
+                return static_cast<std::uint64_t>(-1);
+            }
+            return 0x80020000 | static_cast<uint32_t>(err);
         }
 #else
         int posix_fd = fileno(it->second.fp);
-        if (posix_fd >= 0) {
-            if (ftruncate(posix_fd, length) != 0) {
-                // Truncate failed
+        if (posix_fd < 0) {
+            if (n == "ftruncate") {
+                auto err_addr = get_errno_addr(1);
+                if (err_addr) put<std::int32_t>(mem_, err_addr, 9);
+                return static_cast<std::uint64_t>(-1);
             }
+            return 0x80020009;
+        }
+        if (ftruncate(posix_fd, length) != 0) {
+            int err = errno;
+            if (n == "ftruncate") {
+                auto err_addr = get_errno_addr(1);
+                if (err_addr) put<std::int32_t>(mem_, err_addr, err);
+                return static_cast<std::uint64_t>(-1);
+            }
+            return 0x80020000 | static_cast<uint32_t>(err);
         }
 #endif
+        it->second.size = static_cast<std::uint64_t>(length);
         return 0;
     }
 
     if (n == "sceKernelCheckReachability") {
         if (!a(0)) return 0x80020016;
         auto path = read_guest_string(a(0));
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto vpath = resolve_guest_virtual_path(path);
+        if (active_vfs && !vpath.empty() && active_vfs->exists(vpath)) {
+            return 0;
+        }
         auto host_path = resolve_guest_path(path);
         std::error_code ec;
         if (!std::filesystem::exists(host_path, ec)) {
@@ -3458,32 +4767,119 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
 
     if (n == "mkdir") {
-        if (!a(0)) return static_cast<std::uint64_t>(-1);
+        if (!a(0)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 14); // EFAULT
+            return static_cast<std::uint64_t>(-1);
+        }
         auto path = read_guest_string(a(0));
-        auto host_path = resolve_guest_path(path);
+        if (path.empty() || VirtualFileSystem::contains_traversal(path)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return static_cast<std::uint64_t>(-1);
+        }
+        bool readonly = false;
+        auto host_path = resolve_guest_path(path, &readonly);
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto vpath = resolve_guest_virtual_path(path);
+        if (active_vfs && !vpath.empty()) {
+            VfsStat vs{};
+            if (active_vfs->stat(vpath, vs) == VfsError::ok && vs.is_readonly) {
+                readonly = true;
+            }
+        }
+        if (readonly) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 30); // EROFS
+            return static_cast<std::uint64_t>(-1);
+        }
+        if (host_path.empty()) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return static_cast<std::uint64_t>(-1);
+        }
         std::error_code ec;
         std::filesystem::create_directories(host_path, ec);
-        return ec ? static_cast<std::uint64_t>(-1) : 0;
+        if (ec) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 13); // EACCES
+            return static_cast<std::uint64_t>(-1);
+        }
+        return 0;
     }
 
     if (n == "rename") {
-        if (!a(0) || !a(1)) return static_cast<std::uint64_t>(-1);
-        auto old_p = resolve_guest_path(read_guest_string(a(0)));
-        auto new_p = resolve_guest_path(read_guest_string(a(1)));
+        if (!a(0) || !a(1)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 14); // EFAULT
+            return static_cast<std::uint64_t>(-1);
+        }
+        auto old_path = read_guest_string(a(0));
+        auto new_path = read_guest_string(a(1));
+        if (old_path.empty() || new_path.empty() ||
+            VirtualFileSystem::contains_traversal(old_path) ||
+            VirtualFileSystem::contains_traversal(new_path)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return static_cast<std::uint64_t>(-1);
+        }
+        bool old_ro = false, new_ro = false;
+        auto old_p = resolve_guest_path(old_path, &old_ro);
+        auto new_p = resolve_guest_path(new_path, &new_ro);
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto old_vp = resolve_guest_virtual_path(old_path);
+        auto new_vp = resolve_guest_virtual_path(new_path);
+        if (active_vfs) {
+            VfsStat vs{};
+            if (!old_vp.empty() && active_vfs->stat(old_vp, vs) == VfsError::ok && vs.is_readonly) old_ro = true;
+            if (!new_vp.empty() && active_vfs->stat(new_vp, vs) == VfsError::ok && vs.is_readonly) new_ro = true;
+        }
+        if (old_ro || new_ro) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 30); // EROFS
+            return static_cast<std::uint64_t>(-1);
+        }
+        if (old_p.empty() || new_p.empty()) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return static_cast<std::uint64_t>(-1);
+        }
         std::error_code ec;
         std::filesystem::rename(old_p, new_p, ec);
-        return ec ? static_cast<std::uint64_t>(-1) : 0;
+        if (ec) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 13); // EACCES
+            return static_cast<std::uint64_t>(-1);
+        }
+        return 0;
     }
 
-    auto get_file = [&](std::uint64_t handle) -> FILE* {
-        auto it = open_files_.find(handle);
-        return it != open_files_.end() ? it->second : nullptr;
-    };
     if (n=="fopen") {
+        if (!a(0) || !a(1)) return 0;
         std::string path = read_guest_string(a(0));
         std::string mode = read_guest_string(a(1));
-        if (path.empty() || mode.empty() || path.find("..") != std::string::npos) return 0;
-        auto host_path = resolve_guest_path(path);
+        if (path.empty() || mode.empty() || VirtualFileSystem::contains_traversal(path)) return 0;
+        bool readonly = false;
+        auto host_path = resolve_guest_path(path, &readonly);
+        if (host_path.empty()) return 0;
+
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto vpath = resolve_guest_virtual_path(path);
+        if (active_vfs && !vpath.empty()) {
+            VfsStat vs{};
+            if (active_vfs->stat(vpath, vs) == VfsError::ok && vs.is_readonly) {
+                readonly = true;
+            }
+        }
+
+        bool is_write = (mode.find('w') != std::string::npos ||
+                         mode.find('a') != std::string::npos ||
+                         mode.find('+') != std::string::npos);
+        if (readonly && is_write) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 30); // EROFS
+            return 0;
+        }
         FILE* fp = portable_fopen(host_path, mode.c_str());
         if (!fp) return 0;
         std::uint64_t handle = next_handle_++;
@@ -3561,25 +4957,6 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         if (fp) std::clearerr(fp);
         return 0;
     }
-    if (n=="fprintf" || n=="vfprintf") {
-        FILE* fp = get_file(a(0));
-        if (!fp) return 0;
-        std::string fmt = read_guest_string(a(1));
-        // Simplified: just print the format string without args
-        if (fmt.find('%') != std::string::npos) return 0;
-        return std::fprintf(fp, "%s", fmt.c_str());
-    }
-    if (n=="sprintf" || n=="vsprintf") {
-        std::uint64_t dst = a(0);
-        std::string fmt = read_guest_string(a(1));
-        if (fmt.find('%') != std::string::npos) return 0;
-        if (dst) {
-            mem_.store(dst, fmt.data(), fmt.size());
-            char null_byte = '\0';
-            mem_.store(dst + fmt.size(), &null_byte, 1);
-        }
-        return fmt.size();
-    }
     if (n=="puts") {
         std::string s = read_guest_string(a(0));
         std::fwrite(s.data(), 1, s.size(), stdout);
@@ -3621,16 +4998,29 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return fp ? std::fputs(s.c_str(), fp) : EOF;
     }
 
-    // pthreads stubs
-    if (n=="pthread_self") {
-        return reinterpret_cast<std::uint64_t>(&mem_); // unique-ish per instance
+    // pthreads (T150: identidade, espera e saida com sincronizacao no scheduler)
+    if (n=="pthread_self" || n=="scePthreadSelf" || n=="pthread_getthreadid_np") {
+        return current_tid_ ? current_tid_ : 1;
     }
-    if (n=="pthread_join") {
-        // Stub: return success without waiting
+    if (n=="pthread_join" || n=="scePthreadJoin") {
+        if (!scheduler_) return invalid;
+        if (a(1)) {
+            std::uint64_t probe = 0;
+            if (mem_.load(a(1), &probe, 8) != MemoryError::ok || mem_.store(a(1), &probe, 8) != MemoryError::ok)
+                return invalid;
+        }
+        const auto target = static_cast<GuestScheduler::Id>(a(0));
+        if (target == current_tid_) return ORBIS_KERNEL_ERROR_EDEADLK;
+        if (!scheduler_->has_thread(target)) return ORBIS_KERNEL_ERROR_ESRCH;
+        std::uint64_t val = 0;
+        auto status = scheduler_->join(current_tid_, target, &val);
+        if (status) return static_cast<std::uint32_t>(status);
+        if (a(1)) put(mem_, a(1), val);
         return 0;
     }
-    if (n=="pthread_exit") {
-        // Stub: do nothing
+    if (n=="pthread_exit" || n=="scePthreadExit") {
+        if (!scheduler_) return invalid;
+        scheduler_->exit(current_tid_, a(0));
         return 0;
     }
     if (n=="pthread_setname_np" || n=="scePthreadRename" || n=="scePthreadSetName") {
@@ -3647,58 +5037,146 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
 
-    // signals stubs
+    // signals (T151: isolamento de mascaras, validacao atomica de ponteiros e semanticas BSD/Orbis)
     if (n=="signal") {
-        // Return SIG_DFL (0) as previous handler
-        return 0;
+        int signo = static_cast<int>(a(0));
+        if (signo < 1 || signo > 128 || signo == 9 || signo == 17 || signo == 19) {
+            return ~0ULL; // SIG_ERR (SIGKILL 9 e SIGSTOP 17/19 nao podem ser capturados/ignorados)
+        }
+        std::uint64_t new_handler = a(1);
+        std::uint64_t old_handler = signal_actions_[signo].sa_handler;
+        signal_actions_[signo].sa_handler = new_handler;
+        return old_handler;
     }
     if (n=="raise") {
-        // Stub: do nothing
+        int signo = static_cast<int>(a(0));
+        if (signo < 1 || signo > 128) return 0x16; // EINVAL
         return 0;
     }
     if (n=="sigaction") {
-        // Stub: return success
+        int signo = static_cast<int>(a(0));
+        if (signo < 1 || signo > 128 || signo == 9 || signo == 17 || signo == 19) {
+            return 0x16; // EINVAL
+        }
+        auto act = a(1);
+        auto oact = a(2);
+        struct GuestSigActionRaw {
+            std::uint64_t handler;
+            std::uint32_t flags;
+            std::uint32_t pad;
+            std::uint32_t mask[4];
+        };
+        // Validacao atomica prévia dos ponteiros antes de alterar o estado
+        if (oact) {
+            GuestSigActionRaw dummy{};
+            if (mem_.store(oact, &dummy, sizeof(dummy)) != MemoryError::ok) {
+                return 0x0E; // EFAULT
+            }
+        }
+        GuestSigActionRaw act_raw{};
+        if (act) {
+            if (mem_.load(act, &act_raw, sizeof(act_raw)) != MemoryError::ok) {
+                return 0x0E; // EFAULT
+            }
+        }
+        if (oact) {
+            GuestSigAction cur = signal_actions_[signo];
+            GuestSigActionRaw raw{};
+            raw.handler = cur.sa_handler;
+            raw.flags = cur.sa_flags;
+            raw.pad = 0;
+            std::memcpy(raw.mask, cur.sa_mask.data(), sizeof(raw.mask));
+            mem_.store(oact, &raw, sizeof(raw));
+        }
+        if (act) {
+            GuestSigAction& entry = signal_actions_[signo];
+            entry.sa_handler = act_raw.handler;
+            entry.sa_flags = act_raw.flags;
+            std::memcpy(entry.sa_mask.data(), act_raw.mask, sizeof(entry.sa_mask));
+        }
         return 0;
     }
     if (n=="sigemptyset") {
-        std::uint64_t set = a(0);
-        if (set) put<std::uint64_t>(mem_, set, 0);
+        auto set = a(0);
+        if (!set) return 0x0E; // EFAULT
+        std::uint32_t zeros[4] = {0, 0, 0, 0};
+        if (mem_.store(set, zeros, sizeof(zeros)) != MemoryError::ok) {
+            return 0x0E; // EFAULT
+        }
         return 0;
     }
     if (n=="sigfillset") {
-        std::uint64_t set = a(0);
-        if (set) put<std::uint64_t>(mem_, set, ~0ULL);
+        auto set = a(0);
+        if (!set) return 0x0E; // EFAULT
+        std::uint32_t ones[4] = {~0U, ~0U, ~0U, ~0U};
+        if (mem_.store(set, ones, sizeof(ones)) != MemoryError::ok) {
+            return 0x0E; // EFAULT
+        }
         return 0;
     }
-    if (n=="sigaddset") {
-        // Stub: return success
+    if (n=="sigaddset" || n=="sigdelset" || n=="sigismember") {
+        auto set = a(0);
+        if (!set) return 0x0E; // EFAULT
+        int signo = static_cast<int>(a(1));
+        if (signo < 1 || signo > 128) return 0x16; // EINVAL
+        std::uint32_t mask[4] = {};
+        if (mem_.load(set, mask, sizeof(mask)) != MemoryError::ok) {
+            return 0x0E; // EFAULT
+        }
+        size_t idx = static_cast<size_t>((signo - 1) / 32);
+        std::uint32_t bit = 1U << ((signo - 1) % 32);
+        if (n == "sigismember") {
+            return (mask[idx] & bit) ? 1 : 0;
+        }
+        if (n == "sigaddset") {
+            mask[idx] |= bit;
+        } else {
+            mask[idx] &= ~bit;
+        }
+        if (mem_.store(set, mask, sizeof(mask)) != MemoryError::ok) {
+            return 0x0E; // EFAULT
+        }
         return 0;
     }
-    if (n=="sigdelset") {
-        // Stub: return success
-        return 0;
-    }
-    if (n=="sigismember") {
-        // Stub: return 0 (not a member)
-        return 0;
-    }
-    if (n=="sigprocmask" || n=="_sigprocmask") {
+    if (n=="sigprocmask" || n=="_sigprocmask" || n=="pthread_sigmask") {
         auto how = a(0);
         auto set = a(1);
         auto old = a(2);
-        static std::uint32_t current_mask[4] = {0, 0, 0, 0};
+        // Validacao prévia dos ponteiros
         if (old) {
-            mem_.store(old, current_mask, sizeof(current_mask));
+            std::uint32_t probe[4] = {};
+            if (mem_.store(old, probe, sizeof(probe)) != MemoryError::ok) {
+                return 0x0E; // EFAULT
+            }
+        }
+        std::uint32_t new_mask[4] = {};
+        if (set) {
+            if (how < 1 || how > 3) return 0x16; // EINVAL
+            if (mem_.load(set, new_mask, sizeof(new_mask)) != MemoryError::ok) {
+                return 0x0E; // EFAULT
+            }
+        }
+        auto& current_mask = get_signal_mask(current_tid_);
+        if (old) {
+            mem_.store(old, current_mask.data(), sizeof(std::uint32_t) * 4);
         }
         if (set) {
-            std::uint32_t new_mask[4] = {};
-            if (mem_.load(set, new_mask, sizeof(new_mask)) == MemoryError::ok) {
-                for (int i = 0; i < 4; ++i) {
-                    if (how == 1) current_mask[i] |= new_mask[i]; // SIG_BLOCK
-                    else if (how == 2) current_mask[i] &= ~new_mask[i]; // SIG_UNBLOCK
-                    else if (how == 3) current_mask[i] = new_mask[i]; // SIG_SETMASK
-                }
+            for (int i = 0; i < 4; ++i) {
+                if (how == 1) current_mask[i] |= new_mask[i]; // SIG_BLOCK
+                else if (how == 2) current_mask[i] &= ~new_mask[i]; // SIG_UNBLOCK
+                else if (how == 3) current_mask[i] = new_mask[i]; // SIG_SETMASK
             }
+            // SIGKILL (9) e SIGSTOP (17/19) nao podem ser bloqueados
+            current_mask[0] &= ~((1U << (9 - 1)) | (1U << (17 - 1)) | (1U << (19 - 1)));
+        }
+        return 0;
+    }
+    if (n=="sigpending") {
+        auto set = a(0);
+        if (!set) return 0x0E; // EFAULT
+        std::uint32_t zeros[4] = {0, 0, 0, 0};
+        if (mem_.store(set, zeros, sizeof(zeros)) != MemoryError::ok) {
+            return 0x0E; // EFAULT
         }
         return 0;
     }
@@ -3717,18 +5195,30 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         auto oldlen_ptr = a(3);
         if (!name_ptr || namelen < 2) return 0x16; // EINVAL
         std::int32_t name[2] = {};
-        if (mem_.load(name_ptr, name, sizeof(name)) == MemoryError::ok) {
-            if (name[0] == 1 && name[1] == 37) { // CTL_KERN, KERN_ARANDOM
-                if (old_ptr && oldlen_ptr) {
-                    std::uint64_t len = 0;
-                    if (mem_.load(oldlen_ptr, &len, sizeof(len)) == MemoryError::ok && len > 0) {
-                        std::vector<std::uint8_t> rand_data(len);
-                        for (std::size_t i = 0; i < len; ++i) rand_data[i] = static_cast<std::uint8_t>(std::rand() & 0xFF);
-                        mem_.store(old_ptr, rand_data.data(), len);
-                        return 0;
-                    }
-                }
+        if (mem_.load(name_ptr, name, sizeof(name)) != MemoryError::ok) {
+            return 0x0E; // EFAULT
+        }
+        if (name[0] == 1 && name[1] == 37) { // CTL_KERN, KERN_ARANDOM
+            if (!old_ptr || !oldlen_ptr) return 0x0E; // EFAULT
+            std::uint64_t len = 0;
+            if (mem_.load(oldlen_ptr, &len, sizeof(len)) != MemoryError::ok) {
+                return 0x0E; // EFAULT
             }
+            if (len == 0) return 0;
+            constexpr std::size_t MAX_ARANDOM_LEN = 256;
+            std::size_t to_write = std::min<std::size_t>(static_cast<std::size_t>(len), MAX_ARANDOM_LEN);
+            std::array<std::uint8_t, MAX_ARANDOM_LEN> rand_data{};
+            for (std::size_t i = 0; i < to_write; ++i) {
+                rand_data[i] = static_cast<std::uint8_t>(std::rand() & 0xFF);
+            }
+            if (mem_.store(old_ptr, rand_data.data(), to_write) != MemoryError::ok) {
+                return 0x0E; // EFAULT
+            }
+            std::uint64_t written_len = to_write;
+            if (mem_.store(oldlen_ptr, &written_len, sizeof(written_len)) != MemoryError::ok) {
+                return 0x0E; // EFAULT
+            }
+            return 0;
         }
         return 0;
     }
@@ -3758,43 +5248,53 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
     if (n=="localtime") {
-        // Stub: return a static pointer (simplified)
-        std::time_t t = static_cast<std::time_t>(a(0));
-        std::tm* tm = std::localtime(&t);
-        // Allocate a simple struct in guest memory
-        std::uint64_t buf = next_heap_;
-        next_heap_ += 128;
-        mem_.map(buf, 128, read | write);
-        if (tm) {
-            put<std::int32_t>(mem_, buf + 0, tm->tm_sec);
-            put<std::int32_t>(mem_, buf + 4, tm->tm_min);
-            put<std::int32_t>(mem_, buf + 8, tm->tm_hour);
-            put<std::int32_t>(mem_, buf + 12, tm->tm_mday);
-            put<std::int32_t>(mem_, buf + 16, tm->tm_mon);
-            put<std::int32_t>(mem_, buf + 20, tm->tm_year);
-            put<std::int32_t>(mem_, buf + 24, tm->tm_wday);
-            put<std::int32_t>(mem_, buf + 28, tm->tm_yday);
-            put<std::int32_t>(mem_, buf + 32, tm->tm_isdst);
+        if (!a(0)) return 0;
+        std::int64_t raw_t = 0;
+        if (mem_.load(a(0), &raw_t, sizeof(raw_t)) != MemoryError::ok) {
+            if (a(0) > 1000000000ULL && a(0) < 3000000000ULL) {
+                raw_t = static_cast<std::int64_t>(a(0));
+            } else {
+                return 0;
+            }
         }
+        std::time_t t = static_cast<std::time_t>(raw_t);
+        std::tm* tm = std::localtime(&t);
+        if (!tm) return 0;
+        std::uint64_t buf = get_static_libc_buf(0, 64);
+        put<std::int32_t>(mem_, buf + 0, tm->tm_sec);
+        put<std::int32_t>(mem_, buf + 4, tm->tm_min);
+        put<std::int32_t>(mem_, buf + 8, tm->tm_hour);
+        put<std::int32_t>(mem_, buf + 12, tm->tm_mday);
+        put<std::int32_t>(mem_, buf + 16, tm->tm_mon);
+        put<std::int32_t>(mem_, buf + 20, tm->tm_year);
+        put<std::int32_t>(mem_, buf + 24, tm->tm_wday);
+        put<std::int32_t>(mem_, buf + 28, tm->tm_yday);
+        put<std::int32_t>(mem_, buf + 32, tm->tm_isdst);
         return buf;
     }
     if (n=="gmtime") {
-        std::time_t t = static_cast<std::time_t>(a(0));
-        std::tm* tm = std::gmtime(&t);
-        std::uint64_t buf = next_heap_;
-        next_heap_ += 128;
-        mem_.map(buf, 128, read | write);
-        if (tm) {
-            put<std::int32_t>(mem_, buf + 0, tm->tm_sec);
-            put<std::int32_t>(mem_, buf + 4, tm->tm_min);
-            put<std::int32_t>(mem_, buf + 8, tm->tm_hour);
-            put<std::int32_t>(mem_, buf + 12, tm->tm_mday);
-            put<std::int32_t>(mem_, buf + 16, tm->tm_mon);
-            put<std::int32_t>(mem_, buf + 20, tm->tm_year);
-            put<std::int32_t>(mem_, buf + 24, tm->tm_wday);
-            put<std::int32_t>(mem_, buf + 28, tm->tm_yday);
-            put<std::int32_t>(mem_, buf + 32, tm->tm_isdst);
+        if (!a(0)) return 0;
+        std::int64_t raw_t = 0;
+        if (mem_.load(a(0), &raw_t, sizeof(raw_t)) != MemoryError::ok) {
+            if (a(0) > 1000000000ULL && a(0) < 3000000000ULL) {
+                raw_t = static_cast<std::int64_t>(a(0));
+            } else {
+                return 0;
+            }
         }
+        std::time_t t = static_cast<std::time_t>(raw_t);
+        std::tm* tm = std::gmtime(&t);
+        if (!tm) return 0;
+        std::uint64_t buf = get_static_libc_buf(0, 64);
+        put<std::int32_t>(mem_, buf + 0, tm->tm_sec);
+        put<std::int32_t>(mem_, buf + 4, tm->tm_min);
+        put<std::int32_t>(mem_, buf + 8, tm->tm_hour);
+        put<std::int32_t>(mem_, buf + 12, tm->tm_mday);
+        put<std::int32_t>(mem_, buf + 16, tm->tm_mon);
+        put<std::int32_t>(mem_, buf + 20, tm->tm_year);
+        put<std::int32_t>(mem_, buf + 24, tm->tm_wday);
+        put<std::int32_t>(mem_, buf + 28, tm->tm_yday);
+        put<std::int32_t>(mem_, buf + 32, tm->tm_isdst);
         return buf;
     }
     if (n=="gmtime_s") {
@@ -3852,9 +5352,7 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         std::int32_t year = get<std::int32_t>(mem_, tm_ptr + 20);
         static const char* wday_name[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
         static const char* mon_name[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
-        std::uint64_t buf = next_heap_;
-        next_heap_ += 64;
-        mem_.map(buf, 64, read | write);
+        std::uint64_t buf = get_static_libc_buf(64, 64);
         char out[64];
         std::snprintf(out, sizeof(out), "%.3s %.3s %2d %.2d:%.2d:%.2d %d\n",
             wday_name[0], mon_name[mon % 12], mday, hour, min, sec, 1900 + year);
@@ -3862,12 +5360,21 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return buf;
     }
     if (n=="ctime") {
-        std::time_t t = static_cast<std::time_t>(a(0));
-        std::string s = std::ctime(&t);
-        std::uint64_t buf = next_heap_;
-        next_heap_ += s.size() + 1;
-        mem_.map(buf, s.size() + 1, read | write);
-        mem_.store(buf, s.data(), s.size() + 1);
+        if (!a(0)) return 0;
+        std::int64_t raw_t = 0;
+        if (mem_.load(a(0), &raw_t, sizeof(raw_t)) != MemoryError::ok) {
+            if (a(0) > 1000000000ULL && a(0) < 3000000000ULL) {
+                raw_t = static_cast<std::int64_t>(a(0));
+            } else {
+                return 0;
+            }
+        }
+        std::time_t t = static_cast<std::time_t>(raw_t);
+        const char* s = std::ctime(&t);
+        if (!s) return 0;
+        std::size_t slen = std::strlen(s);
+        std::uint64_t buf = get_static_libc_buf(128, 64);
+        mem_.store(buf, s, slen + 1);
         return buf;
     }
     if (n=="strftime") {
@@ -3905,35 +5412,46 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     if (n=="getpagesize") {
         return 4096;
     }
-    if (n=="remove") {
-        std::string path = read_guest_string(a(0));
-        if (path.empty() || path.find("..") != std::string::npos) return static_cast<std::uint64_t>(-1);
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        return ec ? static_cast<std::uint64_t>(-1) : 0;
-    }
-    if (n=="rename") {
-        std::string oldpath = read_guest_string(a(0));
-        std::string newpath = read_guest_string(a(1));
-        if (oldpath.empty() || newpath.empty() || oldpath.find("..") != std::string::npos || newpath.find("..") != std::string::npos)
+    if (n=="remove" || n=="rmdir") {
+        if (!a(0)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 14); // EFAULT
             return static_cast<std::uint64_t>(-1);
-        std::error_code ec;
-        std::filesystem::rename(oldpath, newpath, ec);
-        return ec ? static_cast<std::uint64_t>(-1) : 0;
-    }
-    if (n=="mkdir") {
+        }
         std::string path = read_guest_string(a(0));
-        if (path.empty() || path.find("..") != std::string::npos) return static_cast<std::uint64_t>(-1);
+        if (path.empty() || VirtualFileSystem::contains_traversal(path)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return static_cast<std::uint64_t>(-1);
+        }
+        bool readonly = false;
+        auto host_path = resolve_guest_path(path, &readonly);
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto vpath = resolve_guest_virtual_path(path);
+        if (active_vfs && !vpath.empty()) {
+            VfsStat vs{};
+            if (active_vfs->stat(vpath, vs) == VfsError::ok && vs.is_readonly) {
+                readonly = true;
+            }
+        }
+        if (readonly) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 30); // EROFS
+            return static_cast<std::uint64_t>(-1);
+        }
+        if (host_path.empty()) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return static_cast<std::uint64_t>(-1);
+        }
         std::error_code ec;
-        std::filesystem::create_directories(path, ec);
-        return ec ? static_cast<std::uint64_t>(-1) : 0;
-    }
-    if (n=="rmdir") {
-        std::string path = read_guest_string(a(0));
-        if (path.empty() || path.find("..") != std::string::npos) return static_cast<std::uint64_t>(-1);
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        return ec ? static_cast<std::uint64_t>(-1) : 0;
+        std::filesystem::remove(host_path, ec);
+        if (ec) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return static_cast<std::uint64_t>(-1);
+        }
+        return 0;
     }
     if (n=="fgetpos") {
         FILE* fp = get_file(a(0));
@@ -3953,11 +5471,35 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         return 0;
     }
     if (n=="freopen") {
+        if (!a(0) || !a(1)) return 0;
         std::string path = read_guest_string(a(0));
         std::string mode = read_guest_string(a(1));
         auto it = open_files_.find(a(2));
-        if (it == open_files_.end() || path.empty() || path.find("..") != std::string::npos) return 0;
-        FILE* res = std::freopen(path.c_str(), mode.c_str(), it->second);
+        if (it == open_files_.end() || it->second == nullptr || path.empty() || mode.empty() || VirtualFileSystem::contains_traversal(path)) return 0;
+
+        bool readonly = false;
+        auto host_path = resolve_guest_path(path, &readonly);
+        if (host_path.empty()) return 0;
+
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto vpath = resolve_guest_virtual_path(path);
+        if (active_vfs && !vpath.empty()) {
+            VfsStat vs{};
+            if (active_vfs->stat(vpath, vs) == VfsError::ok && vs.is_readonly) {
+                readonly = true;
+            }
+        }
+
+        bool is_write = (mode.find('w') != std::string::npos ||
+                         mode.find('a') != std::string::npos ||
+                         mode.find('+') != std::string::npos);
+        if (readonly && is_write) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 30); // EROFS
+            return 0;
+        }
+
+        FILE* res = portable_freopen(host_path, mode.c_str(), it->second);
         if (!res) {
             open_files_.erase(it);
             return 0;
@@ -4137,11 +5679,11 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
     }
     if (n=="strerror") {
         int errnum = static_cast<int>(a(0));
-        std::string msg = std::strerror(errnum);
-        std::uint64_t buf = next_heap_;
-        next_heap_ += msg.size() + 1;
-        mem_.map(buf, msg.size() + 1, read | write);
-        mem_.store(buf, msg.data(), msg.size() + 1);
+        const char* msg = std::strerror(errnum);
+        if (!msg) msg = "Unknown error";
+        std::size_t len = std::strlen(msg);
+        std::uint64_t buf = get_static_libc_buf(256, 256);
+        mem_.store(buf, msg, len + 1);
         return buf;
     }
     if (n=="strcoll") {
@@ -4236,16 +5778,63 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         // Stub
         return 0;
     }
-    if (n=="fstat" || n=="stat") {
-        // Stub
-        return 0;
-    }
-    if (n=="lstat") {
-        // Stub
-        return 0;
-    }
     if (n=="access") {
-        // Stub
+        if (!a(0)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 14); // EFAULT
+            return static_cast<std::uint64_t>(-1);
+        }
+        auto path = read_guest_string(a(0));
+        if (path.empty() || VirtualFileSystem::contains_traversal(path)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return static_cast<std::uint64_t>(-1);
+        }
+        int amode = static_cast<int>(a(1));
+        if ((amode & ~7) != 0) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 22); // EINVAL
+            return static_cast<std::uint64_t>(-1);
+        }
+
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto vpath = resolve_guest_virtual_path(path);
+        bool file_exists = false;
+        bool is_ro = false;
+
+        if (active_vfs && !vpath.empty()) {
+            VfsStat vstat{};
+            if (active_vfs->stat(vpath, vstat) == VfsError::ok) {
+                file_exists = true;
+                is_ro = vstat.is_readonly;
+            }
+        }
+
+        if (!file_exists) {
+            bool ro = false;
+            auto host_path = resolve_guest_path(path, &ro);
+            if (!host_path.empty()) {
+                std::error_code ec;
+                if (std::filesystem::exists(host_path, ec)) {
+                    file_exists = true;
+                    is_ro = ro;
+                }
+            }
+        }
+
+        if (!file_exists) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return static_cast<std::uint64_t>(-1);
+        }
+
+        // Testar permissões solicitadas: R_OK = 4, W_OK = 2, X_OK = 1, F_OK = 0
+        if ((amode & 2) != 0 && is_ro) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 13); // EACCES
+            return static_cast<std::uint64_t>(-1);
+        }
+
         return 0;
     }
     if (n=="chmod" || n=="fchmod") {
@@ -4260,61 +5849,46 @@ std::uint64_t OrbisRuntime::handle(const std::string& n, CpuState& c) {
         // Stub
         return 0;
     }
-    if (n=="unlink") {
-        std::string path = read_guest_string(a(0));
-        if (path.empty() || path.find("..") != std::string::npos) return static_cast<std::uint64_t>(-1);
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        return ec ? static_cast<std::uint64_t>(-1) : 0;
-    }
-    // POSIX I/O functions (libc low-level)
-    if (n=="_write" || n=="write") {
-        int fd = static_cast<int>(a(0));
-        std::uint64_t buf = a(1);
-        std::size_t count = static_cast<std::size_t>(a(2));
-        if (count > 1024*1024) count = 1024*1024;
-        std::vector<char> data(count);
-        if (mem_.load(buf, data.data(), count) != MemoryError::ok) return static_cast<std::uint64_t>(-1);
-        if (fd == 1 || fd == 2) {
-            std::fwrite(data.data(), 1, count, fd == 1 ? stdout : stderr);
-            return count;
+    if (n=="sceKernelUnlink" || n=="unlink") {
+        if (!a(0)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 14); // EFAULT
+            return (n == "unlink") ? static_cast<std::uint64_t>(-1) : 0x80020016;
         }
-        return static_cast<std::uint64_t>(::write(fd, data.data(), static_cast<unsigned int>(count)));
-    }
-    if (n=="_read" || n=="read") {
-        int fd = static_cast<int>(a(0));
-        std::uint64_t buf = a(1);
-        std::size_t count = static_cast<std::size_t>(a(2));
-        if (count > 1024*1024) count = 1024*1024;
-        std::vector<char> data(count);
-#if defined(_WIN32)
-        int res = ::read(fd, data.data(), static_cast<unsigned int>(count));
-#else
-        ssize_t res = ::read(fd, data.data(), count);
-#endif
-        if (res > 0 && mem_.store(buf, data.data(), static_cast<std::size_t>(res)) != MemoryError::ok) return static_cast<std::uint64_t>(-1);
-        return static_cast<std::uint64_t>(res);
-    }
-    if (n=="_open" || n=="open") {
         std::string path = read_guest_string(a(0));
-        int oflag = static_cast<int>(a(1));
-        int mode = static_cast<int>(a(2));
-        int fd = ::open(path.c_str(), oflag, mode);
-        return static_cast<std::uint64_t>(fd);
-    }
-    if (n=="_close" || n=="close") {
-        int fd = static_cast<int>(a(0));
-        return static_cast<std::uint64_t>(::close(fd));
-    }
-    if (n=="_lseek" || n=="lseek") {
-        int fd = static_cast<int>(a(0));
-#if defined(_WIN32)
-        long offset = static_cast<long>(a(1));
-#else
-        off_t offset = static_cast<off_t>(a(1));
-#endif
-        int whence = static_cast<int>(a(2));
-        return static_cast<std::uint64_t>(::lseek(fd, offset, whence));
+        if (path.empty() || VirtualFileSystem::contains_traversal(path)) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return (n == "unlink") ? static_cast<std::uint64_t>(-1) : 0x80020002;
+        }
+        bool readonly = false;
+        auto host_path = resolve_guest_path(path, &readonly);
+        auto* active_vfs = vfs_ ? vfs_ : owned_vfs_.get();
+        auto vpath = resolve_guest_virtual_path(path);
+        if (active_vfs && !vpath.empty()) {
+            VfsStat vs{};
+            if (active_vfs->stat(vpath, vs) == VfsError::ok && vs.is_readonly) {
+                readonly = true;
+            }
+        }
+        if (readonly) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 30); // EROFS
+            return (n == "unlink") ? static_cast<std::uint64_t>(-1) : 0x8002001e; // EROFS
+        }
+        if (host_path.empty()) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return (n == "unlink") ? static_cast<std::uint64_t>(-1) : 0x80020002;
+        }
+        std::error_code ec;
+        std::filesystem::remove(host_path, ec);
+        if (ec) {
+            auto err_addr = get_errno_addr(1);
+            if (err_addr) put<std::int32_t>(mem_, err_addr, 2); // ENOENT
+            return (n == "unlink") ? static_cast<std::uint64_t>(-1) : 0x80020002;
+        }
+        return 0;
     }
     if (n=="getcwd") {
         // Stub

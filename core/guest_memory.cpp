@@ -20,47 +20,81 @@
 
 namespace bb {
 
-MemoryBuffer::MemoryBuffer(std::size_t size) : size_(size) {
-    if (size == 0) return;
+class MemoryStorage {
+public:
+    explicit MemoryStorage(std::size_t size) : size_(size) {
+        if (size == 0) return;
 #if defined(_WIN32)
-    data_ = static_cast<std::uint8_t*>(::VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (!data_) throw std::bad_alloc();
+        data_ = static_cast<std::uint8_t*>(::VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!data_) throw std::bad_alloc();
 #else
-    void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (p == MAP_FAILED) throw std::bad_alloc();
-    data_ = static_cast<std::uint8_t*>(p);
+        void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (p == MAP_FAILED) throw std::bad_alloc();
+        data_ = static_cast<std::uint8_t*>(p);
 #endif
-}
+    }
 
-MemoryBuffer::~MemoryBuffer() {
-    if (!data_) return;
+    ~MemoryStorage() {
+        if (!data_) return;
 #if defined(_WIN32)
-    ::VirtualFree(data_, 0, MEM_RELEASE);
+        ::VirtualFree(data_, 0, MEM_RELEASE);
 #else
-    ::munmap(data_, size_);
+        ::munmap(data_, size_);
 #endif
-}
+    }
 
-MemoryBuffer::MemoryBuffer(MemoryBuffer&& other) noexcept : data_(other.data_), size_(other.size_) {
-    other.data_ = nullptr;
+    MemoryStorage(const MemoryStorage&) = delete;
+    MemoryStorage& operator=(const MemoryStorage&) = delete;
+
+    std::uint8_t* data() noexcept { return data_; }
+    const std::uint8_t* data() const noexcept { return data_; }
+    std::size_t size() const noexcept { return size_; }
+
+private:
+    std::uint8_t* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+MemoryBuffer::MemoryBuffer(std::size_t size)
+    : storage_(size > 0 ? std::make_shared<MemoryStorage>(size) : nullptr),
+      offset_(0),
+      size_(size) {}
+
+MemoryBuffer::MemoryBuffer(std::shared_ptr<MemoryStorage> storage, std::size_t offset, std::size_t size) noexcept
+    : storage_(std::move(storage)), offset_(offset), size_(size) {}
+
+MemoryBuffer::~MemoryBuffer() = default;
+
+MemoryBuffer::MemoryBuffer(MemoryBuffer&& other) noexcept
+    : storage_(std::move(other.storage_)), offset_(other.offset_), size_(other.size_) {
+    other.offset_ = 0;
     other.size_ = 0;
 }
 
 MemoryBuffer& MemoryBuffer::operator=(MemoryBuffer&& other) noexcept {
     if (this != &other) {
-        if (data_) {
-#if defined(_WIN32)
-            ::VirtualFree(data_, 0, MEM_RELEASE);
-#else
-            ::munmap(data_, size_);
-#endif
-        }
-        data_ = other.data_;
+        storage_ = std::move(other.storage_);
+        offset_ = other.offset_;
         size_ = other.size_;
-        other.data_ = nullptr;
+        other.offset_ = 0;
         other.size_ = 0;
     }
     return *this;
+}
+
+MemoryBuffer MemoryBuffer::slice(std::size_t offset, std::size_t size) const {
+    if (offset >= size_ || size > size_ - offset) {
+        return MemoryBuffer();
+    }
+    return MemoryBuffer(storage_, offset_ + offset, size);
+}
+
+std::uint8_t* MemoryBuffer::data() noexcept {
+    return storage_ ? storage_->data() + offset_ : nullptr;
+}
+
+const std::uint8_t* MemoryBuffer::data() const noexcept {
+    return storage_ ? storage_->data() + offset_ : nullptr;
 }
 
 namespace {
@@ -99,12 +133,142 @@ MemoryError GuestMemory::unmap(std::uint64_t address) {
     return MemoryError::ok;
 }
 
+MemoryError GuestMemory::unmap(std::uint64_t address, std::size_t size) {
+    if (size == 0 || !valid_span(address, size)) return MemoryError::invalid;
+    std::lock_guard<std::mutex> guard(mutex_);
+
+    const std::uint64_t unmap_start = address;
+    const std::uint64_t unmap_end = address + size;
+
+    std::vector<std::uint64_t> to_remove;
+    std::vector<std::pair<std::uint64_t, Region>> to_add;
+    bool any_overlap = false;
+
+    for (auto& pair : regions_) {
+        const std::uint64_t reg_start = pair.first;
+        const std::size_t reg_size = pair.second.bytes.size();
+        const std::uint64_t reg_end = reg_start + reg_size;
+
+        if (reg_start >= unmap_end) {
+            break;
+        }
+        if (reg_end <= unmap_start) {
+            continue;
+        }
+
+        any_overlap = true;
+        to_remove.push_back(reg_start);
+
+        const unsigned perm = pair.second.permissions;
+
+        if (unmap_start > reg_start && unmap_end < reg_end) {
+            const std::size_t prefix_size = static_cast<std::size_t>(unmap_start - reg_start);
+            to_add.emplace_back(reg_start, Region{pair.second.bytes.slice(0, prefix_size), perm});
+
+            const std::size_t suffix_size = static_cast<std::size_t>(reg_end - unmap_end);
+            to_add.emplace_back(unmap_end, Region{pair.second.bytes.slice(unmap_end - reg_start, suffix_size), perm});
+
+            used_ -= size;
+        } else if (unmap_start <= reg_start && unmap_end < reg_end) {
+            const std::size_t suffix_size = static_cast<std::size_t>(reg_end - unmap_end);
+            to_add.emplace_back(unmap_end, Region{pair.second.bytes.slice(unmap_end - reg_start, suffix_size), perm});
+
+            used_ -= (unmap_end - reg_start);
+        } else if (unmap_start > reg_start && unmap_end >= reg_end) {
+            const std::size_t prefix_size = static_cast<std::size_t>(unmap_start - reg_start);
+            to_add.emplace_back(reg_start, Region{pair.second.bytes.slice(0, prefix_size), perm});
+
+            used_ -= (reg_end - unmap_start);
+        } else {
+            used_ -= reg_size;
+        }
+    }
+
+    if (!any_overlap) {
+        return MemoryError::unmapped;
+    }
+
+    for (std::uint64_t addr : to_remove) {
+        regions_.erase(addr);
+    }
+    for (auto& new_reg : to_add) {
+        regions_.emplace(new_reg.first, std::move(new_reg.second));
+    }
+
+    return MemoryError::ok;
+}
+
 MemoryError GuestMemory::protect(std::uint64_t address, unsigned p) {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!valid_permissions(p)) return MemoryError::invalid;
     auto it = regions_.find(address);
     if (it == regions_.end()) return MemoryError::unmapped;
     it->second.permissions = p;
+    return MemoryError::ok;
+}
+
+MemoryError GuestMemory::protect(std::uint64_t address, std::size_t size, unsigned p) {
+    if (size == 0 || !valid_span(address, size)) return MemoryError::invalid;
+    if (!valid_permissions(p)) return MemoryError::invalid;
+    std::lock_guard<std::mutex> guard(mutex_);
+
+    const std::uint64_t prot_start = address;
+    const std::uint64_t prot_end = address + size;
+
+    std::uint64_t cursor = prot_start;
+    while (cursor < prot_end) {
+        auto it = find(cursor, 1);
+        if (it == regions_.end()) return MemoryError::unmapped;
+        cursor = it->first + it->second.bytes.size();
+    }
+
+    std::vector<std::uint64_t> to_remove;
+    std::vector<std::pair<std::uint64_t, Region>> to_add;
+
+    for (auto& pair : regions_) {
+        const std::uint64_t reg_start = pair.first;
+        const std::size_t reg_size = pair.second.bytes.size();
+        const std::uint64_t reg_end = reg_start + reg_size;
+
+        if (reg_start >= prot_end) break;
+        if (reg_end <= prot_start) continue;
+
+        to_remove.push_back(reg_start);
+        const unsigned old_perm = pair.second.permissions;
+
+        if (prot_start > reg_start && prot_end < reg_end) {
+            const std::size_t prefix_size = static_cast<std::size_t>(prot_start - reg_start);
+            to_add.emplace_back(reg_start, Region{pair.second.bytes.slice(0, prefix_size), old_perm});
+
+            const std::size_t mid_size = static_cast<std::size_t>(prot_end - prot_start);
+            to_add.emplace_back(prot_start, Region{pair.second.bytes.slice(prefix_size, mid_size), p});
+
+            const std::size_t suffix_size = static_cast<std::size_t>(reg_end - prot_end);
+            to_add.emplace_back(prot_end, Region{pair.second.bytes.slice(prot_end - reg_start, suffix_size), old_perm});
+        } else if (prot_start <= reg_start && prot_end < reg_end) {
+            const std::size_t mid_size = static_cast<std::size_t>(prot_end - reg_start);
+            to_add.emplace_back(reg_start, Region{pair.second.bytes.slice(0, mid_size), p});
+
+            const std::size_t suffix_size = static_cast<std::size_t>(reg_end - prot_end);
+            to_add.emplace_back(prot_end, Region{pair.second.bytes.slice(mid_size, suffix_size), old_perm});
+        } else if (prot_start > reg_start && prot_end >= reg_end) {
+            const std::size_t prefix_size = static_cast<std::size_t>(prot_start - reg_start);
+            to_add.emplace_back(reg_start, Region{pair.second.bytes.slice(0, prefix_size), old_perm});
+
+            const std::size_t mid_size = static_cast<std::size_t>(reg_end - prot_start);
+            to_add.emplace_back(prot_start, Region{pair.second.bytes.slice(prefix_size, mid_size), p});
+        } else {
+            to_add.emplace_back(reg_start, Region{std::move(pair.second.bytes), p});
+        }
+    }
+
+    for (std::uint64_t addr : to_remove) {
+        regions_.erase(addr);
+    }
+    for (auto& new_reg : to_add) {
+        regions_.emplace(new_reg.first, std::move(new_reg.second));
+    }
+
     return MemoryError::ok;
 }
 
@@ -121,21 +285,82 @@ GuestMemory::Regions::const_iterator GuestMemory::find(std::uint64_t address, st
 MemoryError GuestMemory::load(std::uint64_t address, void* destination, std::size_t size) const {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!destination || !valid_span(address, size)) return MemoryError::invalid;
-    auto it = find(address, size);
-    if (it == regions_.end()) return MemoryError::unmapped;
-    if (!(it->second.permissions & read)) return MemoryError::denied;
-    std::memcpy(destination, it->second.bytes.data() + (address - it->first), size);
+
+    const std::uint64_t end = address + size;
+    std::uint64_t cur = address;
+    while (cur < end) {
+        auto it = regions_.upper_bound(cur);
+        if (it == regions_.begin()) return MemoryError::unmapped;
+        --it;
+        const std::uint64_t reg_start = it->first;
+        const std::size_t reg_size = it->second.bytes.size();
+        const std::uint64_t reg_end = reg_start + reg_size;
+        if (cur < reg_start || cur >= reg_end) {
+            return MemoryError::unmapped;
+        }
+        if (!(it->second.permissions & read)) {
+            return MemoryError::denied;
+        }
+        cur = reg_end;
+    }
+
+    cur = address;
+    std::size_t dest_offset = 0;
+    while (cur < end) {
+        auto it = regions_.upper_bound(cur);
+        --it;
+        const std::uint64_t reg_start = it->first;
+        const std::size_t reg_size = it->second.bytes.size();
+        const std::uint64_t reg_end = reg_start + reg_size;
+        const std::size_t step = static_cast<std::size_t>(std::min<std::uint64_t>(end - cur, reg_end - cur));
+        const std::size_t src_offset = static_cast<std::size_t>(cur - reg_start);
+        std::memcpy(static_cast<std::uint8_t*>(destination) + dest_offset,
+                    it->second.bytes.data() + src_offset,
+                    step);
+        dest_offset += step;
+        cur += step;
+    }
     return MemoryError::ok;
 }
 
 MemoryError GuestMemory::store(std::uint64_t address, const void* source, std::size_t size) {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!source || !valid_span(address, size)) return MemoryError::invalid;
-    auto found = find(address, size);
-    if (found == regions_.end()) return MemoryError::unmapped;
-    if (!(found->second.permissions & write)) return MemoryError::denied;
-    auto it = regions_.find(found->first);
-    std::memcpy(it->second.bytes.data() + (address - it->first), source, size);
+
+    const std::uint64_t end = address + size;
+    std::uint64_t cur = address;
+    while (cur < end) {
+        auto it = regions_.upper_bound(cur);
+        if (it == regions_.begin()) return MemoryError::unmapped;
+        --it;
+        const std::uint64_t reg_start = it->first;
+        const std::size_t reg_size = it->second.bytes.size();
+        const std::uint64_t reg_end = reg_start + reg_size;
+        if (cur < reg_start || cur >= reg_end) {
+            return MemoryError::unmapped;
+        }
+        if (!(it->second.permissions & write)) {
+            return MemoryError::denied;
+        }
+        cur = reg_end;
+    }
+
+    cur = address;
+    std::size_t src_offset = 0;
+    while (cur < end) {
+        auto it = regions_.upper_bound(cur);
+        --it;
+        const std::uint64_t reg_start = it->first;
+        const std::size_t reg_size = it->second.bytes.size();
+        const std::uint64_t reg_end = reg_start + reg_size;
+        const std::size_t step = static_cast<std::size_t>(std::min<std::uint64_t>(end - cur, reg_end - cur));
+        const std::size_t dst_offset = static_cast<std::size_t>(cur - reg_start);
+        std::memcpy(it->second.bytes.data() + dst_offset,
+                    static_cast<const std::uint8_t*>(source) + src_offset,
+                    step);
+        src_offset += step;
+        cur += step;
+    }
     return MemoryError::ok;
 }
 

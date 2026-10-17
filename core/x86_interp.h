@@ -2,9 +2,11 @@
 #include "guest_memory.h"
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 namespace bb {
 
@@ -55,6 +57,21 @@ struct CpuRunResult {
     std::string describe() const;
 };
 
+enum class AotExecutionStatus {
+    completed,             // Bloco AOT executado completamente ate o fim
+    fallback_untranslated, // Instrucao nao traduzida encontrada: fallback seguro para o interpretador
+    trap_encountered,      // RIP de trap atingido durante execucao do bloco
+    fault                  // Falha de memoria ou execucao
+};
+
+struct AotBlockResult {
+    AotExecutionStatus status = AotExecutionStatus::completed;
+    std::uint64_t steps = 0;
+    std::uint64_t fallback_rip = 0;
+};
+
+using AotBlockHandler = std::function<AotBlockResult(CpuState& state, GuestMemory& memory)>;
+
 // Interpreter only: never executes guest bytes natively and never needs executable
 // host pages, so it is valid for iOS builds without JIT entitlements.
 class X86Interpreter {
@@ -66,6 +83,16 @@ public:
 
     // rip values in [base, base + size) stop execution with CpuStop::trap before fetching.
     void add_trap_range(std::uint64_t base, std::uint64_t size);
+    using PauseChecker = std::function<bool()>;
+    void set_pause_checker(PauseChecker checker) { pause_checker_ = std::move(checker); }
+
+    // Suporte a blocos de codigo compilados AOT com fallback seguro
+    void register_aot_block(std::uint64_t rip, AotBlockHandler handler);
+    void unregister_aot_block(std::uint64_t rip);
+    bool has_aot_block(std::uint64_t rip) const;
+    void clear_aot_blocks();
+    std::size_t aot_block_count() const;
+
     CpuRunResult run(std::uint64_t max_steps);
 
 private:
@@ -74,7 +101,9 @@ private:
     bool in_trap(std::uint64_t rip) const;
     void step(CpuRunResult& out);
     GuestMemory& mem_;
+    PauseChecker pause_checker_{};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> traps_;
+    std::unordered_map<std::uint64_t, AotBlockHandler> aot_blocks_;
     std::uint64_t tsc_ = 0;
 public:
     struct TraceItem { std::uint64_t rip, rbp, rsp; };

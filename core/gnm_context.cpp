@@ -13,8 +13,13 @@ inline float uint_as_float(std::uint32_t val) {
 }
 } // namespace
 
+GnmContext::GnmContext(GuestMemory& memory)
+    : memory_(memory), memory_writer_(&memory) {
+    reset();
+}
+
 GnmContext::GnmContext(const GuestMemory& memory)
-    : memory_(memory) {
+    : memory_(memory), memory_writer_(nullptr) {
     reset();
 }
 
@@ -28,6 +33,14 @@ void GnmContext::reset() {
     compute_pipeline_state_ = ComputePipelineState{};
     draw_calls_.clear();
     dispatch_calls_.clear();
+    sync_events_.clear();
+
+    write_data_count_ = 0;
+    dma_count_ = 0;
+    sync_error_count_ = 0;
+    cache_invalidate_count_ = 0;
+    caches_invalidated_ = false;
+    last_error_.clear();
 
     // Configuração inicial padrão segura
     pipeline_state_.primitive_type = GnmPrimitiveType::TriList;
@@ -91,6 +104,39 @@ void GnmContext::on_pm4_event(const Pm4Event& event) {
         dc.threadgroups_z = event.args[2];
         dc.pipeline_state = compute_pipeline_state_; // Snapshot do compute pipeline
         dispatch_calls_.push_back(dc);
+        break;
+    }
+    // T153: Tratamento de eventos PM4 de escrita, DMA e sincronizacao
+    case Pm4Kind::write_data: {
+        sync_events_.push_back(event);
+        handle_write_data(event);
+        break;
+    }
+    case Pm4Kind::dma_data: {
+        sync_events_.push_back(event);
+        handle_dma_data(event);
+        break;
+    }
+    case Pm4Kind::release_mem: {
+        sync_events_.push_back(event);
+        handle_release_mem(event);
+        break;
+    }
+    case Pm4Kind::wait_reg_mem: {
+        sync_events_.push_back(event);
+        handle_wait_reg_mem(event);
+        break;
+    }
+    case Pm4Kind::acquire_mem: {
+        sync_events_.push_back(event);
+        handle_acquire_mem(event);
+        break;
+    }
+    case Pm4Kind::event_write:
+    case Pm4Kind::event_eop:
+    case Pm4Kind::event_eos: {
+        sync_events_.push_back(event);
+        handle_event_sync(event);
         break;
     }
     default:
@@ -232,6 +278,7 @@ const DispatchCall* GnmContext::last_dispatch_call() const {
 void GnmContext::clear_calls() {
     draw_calls_.clear();
     dispatch_calls_.clear();
+    sync_events_.clear();
 }
 
 // =============================================================================
@@ -547,6 +594,172 @@ void GnmContext::update_rasterizer() {
 }
 
 // =============================================================================
+// Tratamento de Eventos PM4 de Escrita, DMA e Sincronizacao (T153 / FR-004)
+// =============================================================================
+
+void GnmContext::handle_write_data(const Pm4Event& event) {
+    const std::uint32_t dst_sel = (event.args[0] >> 8) & 0x0F;
+    const std::uint64_t dst_addr = (event.address != 0) ? event.address :
+        ((static_cast<std::uint64_t>(event.args[2]) << 32) | event.args[1]);
+
+    const bool is_register = (dst_sel == 0) && (dst_addr < 0x4000);
+
+    if (is_register) {
+        std::uint32_t reg = static_cast<std::uint32_t>(dst_addr);
+        const std::size_t num_words = (event.words > 3) ? (event.words - 3) : 1;
+        for (std::size_t i = 3; i < event.args.size() && (i - 3) < num_words; ++i) {
+            set_context_reg(reg + static_cast<std::uint32_t>(i - 3), event.args[i]);
+        }
+        write_data_count_++;
+        return;
+    }
+
+    if (dst_addr == 0) {
+        sync_error_count_++;
+        last_error_ = "GnmContext: write_data endereco nulo";
+        return;
+    }
+    if (!memory_writer_) {
+        sync_error_count_++;
+        last_error_ = "GnmContext: write_data sem permissao de escrita na memoria";
+        return;
+    }
+
+    const std::size_t num_words = (event.words > 3) ? (event.words - 3) : 1;
+    for (std::size_t i = 3; i < event.args.size() && (i - 3) < num_words; ++i) {
+        const std::uint32_t val = event.args[i];
+        const std::uint64_t target = dst_addr + (i - 3) * sizeof(std::uint32_t);
+        if (memory_writer_->store(target, &val, sizeof(val)) != MemoryError::ok) {
+            sync_error_count_++;
+            last_error_ = "GnmContext: write_data falha ao gravar na memoria guest";
+            return;
+        }
+    }
+    write_data_count_++;
+}
+
+void GnmContext::handle_dma_data(const Pm4Event& event) {
+    const std::uint64_t src = (static_cast<std::uint64_t>(event.args[2]) << 32) | event.args[1];
+    const std::uint64_t dst = (static_cast<std::uint64_t>(event.args[4]) << 32) | event.args[3];
+    std::uint32_t byte_count = event.args[5] & 0x001FFFFF;
+    if (byte_count == 0) {
+        byte_count = 4;
+    }
+
+    if (src == 0 || dst == 0) {
+        sync_error_count_++;
+        last_error_ = "GnmContext: dma_data com endereco nulo";
+        return;
+    }
+    if (!memory_writer_) {
+        sync_error_count_++;
+        last_error_ = "GnmContext: dma_data sem gravador de memoria";
+        return;
+    }
+
+    std::uint8_t buffer[256];
+    std::size_t remaining = byte_count;
+    std::uint64_t cur_src = src;
+    std::uint64_t cur_dst = dst;
+
+    while (remaining > 0) {
+        const std::size_t chunk = std::min(remaining, sizeof(buffer));
+        if (memory_.load(cur_src, buffer, chunk) != MemoryError::ok ||
+            memory_writer_->store(cur_dst, buffer, chunk) != MemoryError::ok) {
+            sync_error_count_++;
+            last_error_ = "GnmContext: dma_data falha de I/O na memoria guest";
+            return;
+        }
+        cur_src += chunk;
+        cur_dst += chunk;
+        remaining -= chunk;
+    }
+    dma_count_++;
+}
+
+void GnmContext::handle_release_mem(const Pm4Event& event) {
+    const std::uint32_t data_sel = (event.args[0] >> 29) & 0x7;
+    std::uint64_t addr = (static_cast<std::uint64_t>(event.args[3]) << 32) | event.args[2];
+    if (addr == 0 && event.address != 0) {
+        addr = event.address;
+    }
+
+    if (addr == 0) {
+        sync_error_count_++;
+        last_error_ = "GnmContext: release_mem endereco nulo";
+        return;
+    }
+    if (!memory_writer_) {
+        sync_error_count_++;
+        last_error_ = "GnmContext: release_mem sem gravador de memoria";
+        return;
+    }
+
+    if (data_sel == 2) {
+        const std::uint64_t val = (static_cast<std::uint64_t>(event.args[5]) << 32) | event.args[4];
+        if (memory_writer_->store(addr, &val, sizeof(val)) != MemoryError::ok) {
+            sync_error_count_++;
+            last_error_ = "GnmContext: release_mem falha ao gravar 64-bit";
+            return;
+        }
+    } else if (data_sel == 3) {
+        const std::uint64_t ts = ++gpu_timestamp_;
+        if (memory_writer_->store(addr, &ts, sizeof(ts)) != MemoryError::ok) {
+            sync_error_count_++;
+            last_error_ = "GnmContext: release_mem falha ao gravar timestamp";
+            return;
+        }
+    } else {
+        const std::uint32_t val = event.args[4];
+        if (memory_writer_->store(addr, &val, sizeof(val)) != MemoryError::ok) {
+            sync_error_count_++;
+            last_error_ = "GnmContext: release_mem falha ao gravar 32-bit";
+            return;
+        }
+    }
+}
+
+void GnmContext::handle_wait_reg_mem(const Pm4Event& event) {
+    const std::uint64_t addr = (static_cast<std::uint64_t>(event.args[2]) << 32) | event.args[1];
+    if (addr == 0) {
+        sync_error_count_++;
+        last_error_ = "GnmContext: wait_reg_mem endereco nulo";
+        return;
+    }
+
+    const bool is_mem = (event.args[0] & 0x10) != 0;
+    if (is_mem) {
+        std::uint32_t val = 0;
+        if (memory_.load(addr, &val, sizeof(val)) != MemoryError::ok) {
+            sync_error_count_++;
+            last_error_ = "GnmContext: wait_reg_mem falha de leitura na memoria";
+            return;
+        }
+    }
+}
+
+void GnmContext::handle_acquire_mem(const Pm4Event& event) {
+    (void)event;
+    cache_invalidate_count_++;
+    caches_invalidated_ = true;
+}
+
+void GnmContext::handle_event_sync(const Pm4Event& event) {
+    std::uint64_t addr = event.address;
+    if (addr == 0) {
+        addr = (static_cast<std::uint64_t>(event.args[2]) << 32) | event.args[1];
+    }
+
+    if (addr != 0 && memory_writer_) {
+        const std::uint32_t val = (event.args[3] != 0) ? event.args[3] : 1;
+        if (memory_writer_->store(addr, &val, sizeof(val)) != MemoryError::ok) {
+            sync_error_count_++;
+            last_error_ = "GnmContext: handle_event_sync falha ao gravar na memoria";
+        }
+    }
+}
+
+// =============================================================================
 // Extração Segura de Descritores de Memória Guest
 // =============================================================================
 
@@ -649,6 +862,7 @@ bool GnmContext::read_sampler_descriptor(std::uint64_t address, SamplerDescripto
     out.min_filter = (dw[0] >> 9) & 0x7;
     out.mag_filter = (dw[0] >> 12) & 0x7;
     out.mip_filter = (dw[0] >> 15) & 0x3;
+    out.aniso_ratio = (dw[0] >> 17) & 0x7;
     out.min_lod = static_cast<float>((dw[1] >> 8) & 0xFFF) / 256.0f;
     out.max_lod = static_cast<float>((dw[1] >> 20) & 0xFFF) / 256.0f;
     out.lod_bias = static_cast<float>(static_cast<std::int16_t>(dw[2] & 0x3FFF)) / 256.0f;
@@ -772,7 +986,8 @@ std::array<std::uint8_t, 16> GnmContext::encode_sampler_descriptor(const Sampler
                              ((desc.clamp_z & 0x7) << 6) |
                              ((desc.min_filter & 0x7) << 9) |
                              ((desc.mag_filter & 0x7) << 12) |
-                             ((desc.mip_filter & 0x3) << 15);
+                             ((desc.mip_filter & 0x3) << 15) |
+                             ((desc.aniso_ratio & 0x7) << 17);
     const std::uint32_t min_l = static_cast<std::uint32_t>(desc.min_lod * 256.0f) & 0xFFF;
     const std::uint32_t max_l = static_cast<std::uint32_t>(desc.max_lod * 256.0f) & 0xFFF;
     const std::uint32_t dw1 = (min_l << 8) | (max_l << 20);

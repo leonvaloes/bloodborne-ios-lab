@@ -153,6 +153,9 @@ public:
     BinderError read_file(std::int32_t id, std::vector<std::uint8_t> &out_data) const;
     BinderError read_file(const std::string &name, std::vector<std::uint8_t> &out_data) const;
 
+    BinderError stream_file(std::int32_t id, std::uint64_t offset_in_file, void *dest, std::size_t bytes_to_read, std::size_t &out_bytes_read) const;
+    BinderError stream_file(const std::string &name, std::uint64_t offset_in_file, void *dest, std::size_t bytes_to_read, std::size_t &out_bytes_read) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

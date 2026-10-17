@@ -114,10 +114,14 @@ struct Exec {
     std::uint64_t start = 0;
     bool p66 = false, rep = false, repne = false, rex = false, rw = false, rr = false, rx = false,
          rb = false, fs = false, gs = false, addr32 = false;
+    bool has_lock = false, lock_consumed = false;
+    std::unique_lock<std::mutex> bus_lock_;
     bool branched = false;
     std::uint64_t& tsc;
 
     Exec(CpuState& st, GuestMemory& mem, std::uint64_t& tsc_ref) : s(st), m(mem), tsc(tsc_ref) {}
+
+    void check_lock(bool allowed, const Rm* rm = nullptr);
 
     // ---- fetch ----
     std::uint8_t u8() { if (pos >= 15) throw UdEx{}; if (pos >= n) throw Fault{start + pos}; return buf[pos++]; }
@@ -354,6 +358,17 @@ struct Exec {
     void two_byte(int opsz);
     void sse(std::uint8_t op2, int opsz);
 };
+
+static std::mutex s_bus_lock_mutex;
+
+void Exec::check_lock(bool allowed, const Rm* rm) {
+    if (!has_lock) return;
+    if (!allowed || !rm || rm->reg) throw UdEx{};
+    if (!bus_lock_.owns_lock()) {
+        bus_lock_ = std::unique_lock<std::mutex>(s_bus_lock_mutex);
+    }
+    lock_consumed = true;
+}
 
 void Exec::avx(bool three) {
     const std::uint8_t v1 = u8();
@@ -2043,6 +2058,7 @@ void Exec::two_byte(int opsz) {
     case 0xB0: case 0xB1: {  // cmpxchg
         const int sz = (op2 & 1) ? opsz : 1;
         const Rm rm = decode_rm(rg, 0);
+        check_lock(true, &rm);
         const std::uint64_t dest = rd_rm(rm, sz), acc = rd_reg(0, sz);
         alu(7, acc, dest, sz);
         if (s.rflags & FLAG_ZF) wr_rm(rm, sz, rd_reg(rg, sz));
@@ -2052,11 +2068,54 @@ void Exec::two_byte(int opsz) {
     case 0xC0: case 0xC1: {  // xadd
         const int sz = (op2 & 1) ? opsz : 1;
         const Rm rm = decode_rm(rg, 0);
+        check_lock(true, &rm);
         const std::uint64_t d = rd_rm(rm, sz), r = rd_reg(rg, sz);
         const std::uint64_t t = alu(0, d, r, sz);
         wr_reg(rg, sz, d);
         wr_rm(rm, sz, t);
         return;
+    }
+    case 0xC7: {  // CMPXCHG8B / CMPXCHG16B
+        const Rm rm = decode_rm(rg, 0);
+        const int sub = rg & 7;
+        if (sub == 1) { // cmpxchg8b / cmpxchg16b
+            if (rm.reg) throw UdEx{};
+            check_lock(true, &rm);
+            if (opsz == 8) { // cmpxchg16b m128
+                const std::uint64_t mem_lo = rd_mem(rm.addr, 8);
+                const std::uint64_t mem_hi = rd_mem(rm.addr + 8, 8);
+                const std::uint64_t rax = rd_reg(0, 8);
+                const std::uint64_t rdx = rd_reg(2, 8);
+                if (mem_lo == rax && mem_hi == rdx) {
+                    wr_mem(rm.addr, 8, rd_reg(3, 8)); // RBX
+                    wr_mem(rm.addr + 8, 8, rd_reg(1, 8)); // RCX
+                    set_flag(FLAG_ZF, true);
+                } else {
+                    wr_reg(0, 8, mem_lo);
+                    wr_reg(2, 8, mem_hi);
+                    set_flag(FLAG_ZF, false);
+                }
+                return;
+            } else { // cmpxchg8b m64
+                const std::uint64_t mem = rd_mem(rm.addr, 8);
+                const std::uint32_t eax = static_cast<std::uint32_t>(rd_reg(0, 4));
+                const std::uint32_t edx = static_cast<std::uint32_t>(rd_reg(2, 4));
+                const std::uint64_t edx_eax = (static_cast<std::uint64_t>(edx) << 32) | eax;
+                if (mem == edx_eax) {
+                    const std::uint32_t ebx = static_cast<std::uint32_t>(rd_reg(3, 4));
+                    const std::uint32_t ecx = static_cast<std::uint32_t>(rd_reg(1, 4));
+                    const std::uint64_t ecx_ebx = (static_cast<std::uint64_t>(ecx) << 32) | ebx;
+                    wr_mem(rm.addr, 8, ecx_ebx);
+                    set_flag(FLAG_ZF, true);
+                } else {
+                    wr_reg(0, 4, static_cast<std::uint32_t>(mem & 0xFFFFFFFF));
+                    wr_reg(2, 4, static_cast<std::uint32_t>(mem >> 32));
+                    set_flag(FLAG_ZF, false);
+                }
+                return;
+            }
+        }
+        throw Unsupported{};
     }
     case 0xBA: {  // bt/bts/btr/btc r/m, imm8
         const Rm rm = decode_rm(rg, 1);
@@ -2064,6 +2123,8 @@ void Exec::two_byte(int opsz) {
         const std::uint64_t v = rd_rm(rm, opsz);
         const int sub = rg & 7;
         if (sub < 4) throw Unsupported{};
+        if (sub == 4) check_lock(false);
+        else check_lock(true, &rm);
         set_flag(FLAG_CF, ((v >> bit) & 1) != 0);
         if (sub == 5) wr_rm(rm, opsz, v | (1ULL << bit));
         else if (sub == 6) wr_rm(rm, opsz, v & ~(1ULL << bit));
@@ -2072,6 +2133,8 @@ void Exec::two_byte(int opsz) {
     }
     case 0xA3: case 0xAB: case 0xB3: case 0xBB: {
         const Rm rm = decode_rm(rg, 0);
+        if (op2 == 0xA3) check_lock(false);
+        else check_lock(true, &rm);
         if (rm.reg) {
             const unsigned bit = static_cast<unsigned>(rd_reg(rg, opsz)) & (opsz * 8 - 1);
             const std::uint64_t v = rd_reg(rm.r, opsz);
@@ -2771,7 +2834,7 @@ void Exec::step() {
         if (b == 0x66) { p66 = true; ++pos; }
         else if (b == 0xF3) { rep = true; repne = false; ++pos; }
         else if (b == 0xF2) { repne = true; rep = false; ++pos; }
-        else if (b == 0xF0) { ++pos; }
+        else if (b == 0xF0) { has_lock = true; ++pos; }
         else if (b == 0x64) { fs = true; gs = false; ++pos; }
         else if (b == 0x65) { gs = true; fs = false; ++pos; }
         else if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36) { ++pos; }
@@ -2784,18 +2847,25 @@ void Exec::step() {
     const std::uint8_t op = u8();
     int rg = 0;
 
-    if (op == 0xC5) { avx(false); s.rip = start + pos; return; }
+    if (op == 0xC5) { if (has_lock) throw UdEx{}; avx(false); s.rip = start + pos; return; }
     if (op == 0xC4 && pos + 1 < n && (buf[pos] & 31) == 2 && (buf[pos + 1] & 3) == 0) {
+        if (has_lock) throw UdEx{};
         bmi1();
         s.rip = start + pos;
         return;
     }
-    if (op == 0xC4) { avx(true); s.rip = start + pos; return; }
-    if (op == 0x0F) { two_byte(opsz); if (!branched) s.rip = start + pos; return; }
+    if (op == 0xC4) { if (has_lock) throw UdEx{}; avx(true); s.rip = start + pos; return; }
+    if (op == 0x0F) {
+        two_byte(opsz);
+        if (has_lock && !lock_consumed) throw UdEx{};
+        if (!branched) s.rip = start + pos;
+        return;
+    }
 
     if ((op & 0xC0) == 0 && (op & 7) < 6) {  // ALU group
         const int aluop = (op >> 3) & 7, form = op & 7;
         if (form >= 4) {
+            check_lock(false);
             const int sz = (form == 4) ? 1 : opsz;
             const std::uint64_t imm = imm_of(sz == 8 ? 4 : sz);
             const std::uint64_t res = alu(aluop, rd_reg(0, sz), imm, sz);
@@ -2804,9 +2874,12 @@ void Exec::step() {
             const int sz = (form & 1) ? opsz : 1;
             const Rm rm = decode_rm(rg, 0);
             if (form < 2) {
+                if (aluop == 7) check_lock(false);
+                else check_lock(true, &rm);
                 const std::uint64_t res = alu(aluop, rd_rm(rm, sz), rd_reg(rg, sz), sz);
                 if (aluop != 7) wr_rm(rm, sz, res);
             } else {
+                check_lock(false);
                 const std::uint64_t res = alu(aluop, rd_reg(rg, sz), rd_rm(rm, sz), sz);
                 if (aluop != 7) wr_reg(rg, sz, res);
             }
@@ -2815,16 +2888,18 @@ void Exec::step() {
         return;
     }
 
-    if (op >= 0x50 && op <= 0x57) { push(s.gpr[(op & 7) | (rb ? 8 : 0)]); s.rip = start + pos; return; }
-    if (op >= 0x58 && op <= 0x5F) { const std::uint64_t v = pop(); s.gpr[(op & 7) | (rb ? 8 : 0)] = v; s.rip = start + pos; return; }
+    if (op >= 0x50 && op <= 0x57) { if (has_lock) throw UdEx{}; push(s.gpr[(op & 7) | (rb ? 8 : 0)]); s.rip = start + pos; return; }
+    if (op >= 0x58 && op <= 0x5F) { if (has_lock) throw UdEx{}; const std::uint64_t v = pop(); s.gpr[(op & 7) | (rb ? 8 : 0)] = v; s.rip = start + pos; return; }
     if (op >= 0x70 && op <= 0x7F) {
+        if (has_lock) throw UdEx{};
         const std::int8_t rel = static_cast<std::int8_t>(u8());
         if (cond_true(op & 15, s.rflags)) { s.rip = start + pos + static_cast<std::int64_t>(rel); }
         else s.rip = start + pos;
         return;
     }
-    if (op >= 0xB0 && op <= 0xB7) { wr_reg((op & 7) | (rb ? 8 : 0), 1, u8()); s.rip = start + pos; return; }
+    if (op >= 0xB0 && op <= 0xB7) { if (has_lock) throw UdEx{}; wr_reg((op & 7) | (rb ? 8 : 0), 1, u8()); s.rip = start + pos; return; }
     if (op >= 0xB8 && op <= 0xBF) {
+        if (has_lock) throw UdEx{};
         const int r = (op & 7) | (rb ? 8 : 0);
         if (rw) wr_reg(r, 8, u64());
         else if (p66) wr_reg(r, 2, u16());
@@ -2833,11 +2908,24 @@ void Exec::step() {
         return;
     }
     if (op >= 0x91 && op <= 0x97) {
+        if (has_lock) throw UdEx{};
         const int r = (op & 7) | (rb ? 8 : 0);
         const std::uint64_t a = rd_reg(0, opsz), b = rd_reg(r, opsz);
         wr_reg(0, opsz, b); wr_reg(r, opsz, a);
         s.rip = start + pos;
         return;
+    }
+
+    if (has_lock) {
+        switch (op) {
+        case 0x80: case 0x81: case 0x82: case 0x83:
+        case 0x86: case 0x87:
+        case 0xF6: case 0xF7:
+        case 0xFE: case 0xFF:
+            break;
+        default:
+            throw UdEx{};
+        }
     }
 
     switch (op) {
@@ -2884,11 +2972,14 @@ void Exec::step() {
         const Rm rm = decode_rm(rg, ib);
         const std::uint64_t imm = (op == 0x81) ? imm_of(opsz == 2 ? 2 : 4) : static_cast<std::uint64_t>(sext(u8(), 1));
         const int aluop = rg & 7;
+        if (aluop == 7) check_lock(false);
+        else check_lock(true, &rm);
         const std::uint64_t res = alu(aluop, rd_rm(rm, sz), imm, sz);
         if (aluop != 7) wr_rm(rm, sz, res);
         break;
     }
     case 0x84: case 0x85: {
+        check_lock(false);
         const int sz = (op == 0x84) ? 1 : opsz;
         const Rm rm = decode_rm(rg, 0);
         alu(4, rd_rm(rm, sz), rd_reg(rg, sz), sz);
@@ -2897,6 +2988,11 @@ void Exec::step() {
     case 0x86: case 0x87: {
         const int sz = (op == 0x86) ? 1 : opsz;
         const Rm rm = decode_rm(rg, 0);
+        if (has_lock) {
+            check_lock(true, &rm);
+        } else if (!rm.reg) {
+            bus_lock_ = std::unique_lock<std::mutex>(s_bus_lock_mutex);
+        }
         const std::uint64_t a = rd_rm(rm, sz), b = rd_reg(rg, sz);
         wr_rm(rm, sz, b); wr_reg(rg, sz, a);
         break;
@@ -2993,19 +3089,22 @@ void Exec::step() {
     case 0xCC: throw HaltEx{};
     case 0xF4: throw HaltEx{};
     case 0xE8: {
+        if (has_lock) throw UdEx{};
         const std::int32_t rel = static_cast<std::int32_t>(u32());
         const std::uint64_t ret = start + pos;
         push(ret);
         s.rip = ret + static_cast<std::int64_t>(rel);
         return;
     }
-    case 0xE9: { const std::int32_t rel = static_cast<std::int32_t>(u32()); s.rip = start + pos + static_cast<std::int64_t>(rel); return; }
-    case 0xEB: { const std::int8_t rel = static_cast<std::int8_t>(u8()); s.rip = start + pos + static_cast<std::int64_t>(rel); return; }
+    case 0xE9: { if (has_lock) throw UdEx{}; const std::int32_t rel = static_cast<std::int32_t>(u32()); s.rip = start + pos + static_cast<std::int64_t>(rel); return; }
+    case 0xEB: { if (has_lock) throw UdEx{}; const std::int8_t rel = static_cast<std::int8_t>(u8()); s.rip = start + pos + static_cast<std::int64_t>(rel); return; }
     case 0xF6: case 0xF7: {
         const int sz = (op == 0xF6) ? 1 : opsz;
         const int sub = (pos < n) ? ((buf[pos] >> 3) & 7) : 0;
         const int ib = (sub < 2) ? (sz == 1 ? 1 : (sz == 2 ? 2 : 4)) : 0;
         const Rm rm = decode_rm(rg, ib);
+        if ((rg & 7) == 2 || (rg & 7) == 3) check_lock(true, &rm);
+        else check_lock(false);
         // TEST has an immediate after ModRM; all other extensions do not.
         // Resolve RIP-relative addressing before accessing the operand.
         const std::uint64_t v = rd_rm(rm, sz);
@@ -3091,6 +3190,7 @@ void Exec::step() {
         const int sub = (pos < n) ? ((buf[pos] >> 3) & 7) : 0;
         if (op == 0xFE && sub > 1) throw Unsupported{};
         if (sub == 2 || sub == 4 || sub == 6) {
+            check_lock(false);
             const Rm rm = decode_rm(rg, 0);
             const std::uint64_t v = rd_rm(rm, 8);
             if (sub == 2) { const std::uint64_t ret = start + pos; push(ret); s.rip = v; return; }
@@ -3100,6 +3200,7 @@ void Exec::step() {
         }
         if (sub > 1) throw Unsupported{};
         const Rm rm = decode_rm(rg, 0);
+        check_lock(true, &rm);
         wr_rm(rm, sz, incdec(rd_rm(rm, sz), sz, (rg & 7) == 1));
         break;
     }
@@ -3125,6 +3226,7 @@ void Exec::step() {
     }
     default: throw Unsupported{};
     }
+    if (has_lock && !lock_consumed) throw UdEx{};
     s.rip = start + pos;
 }
 
@@ -3208,7 +3310,7 @@ X86Decoded decode_x86(const std::uint8_t* b, std::size_t n) {
             (op >= 0x54 && op <= 0x5F) || (op >= 0x58 && op <= 0x62) ||
             (op >= 0x60 && op <= 0x6D) || op == 0xDB || op == 0xDF || op == 0xEB ||
             (op >= 0xF8 && op <= 0xFE) || (op >= 0x74 && op <= 0x76) || (op >= 0x64 && op <= 0x66) || op == 0xD4 || op == 0xD5 || op == 0xD7 ||
-            op == 0x70 || op == 0xC6 || op == 0xC2 || (op >= 0x2A && op <= 0x2F) || op == 0xAE ||
+            op == 0x70 || op == 0xC6 || op == 0xC7 || op == 0xC2 || (op >= 0x2A && op <= 0x2F) || op == 0xAE ||
             (((op >= 0x71 && op <= 0x73) || (op >= 0xD1 && op <= 0xD3) || (op >= 0xE1 && op <= 0xE2) || (op >= 0xF1 && op <= 0xF3)) && pp == 1));
         if (vex3 && map == 2 && pp == 0 && (op == 0xF2 || op == 0xF3 || op == 0xF7) &&
             !(b[p - 2] & 4) && !legacy_prefix && !rex_prefix) d.supported = true;
@@ -3308,6 +3410,28 @@ void X86Interpreter::add_trap_range(std::uint64_t base, std::uint64_t size) {
     if (size) traps_.emplace_back(base, size);
 }
 
+void X86Interpreter::register_aot_block(std::uint64_t rip, AotBlockHandler handler) {
+    if (handler) {
+        aot_blocks_[rip] = std::move(handler);
+    }
+}
+
+void X86Interpreter::unregister_aot_block(std::uint64_t rip) {
+    aot_blocks_.erase(rip);
+}
+
+bool X86Interpreter::has_aot_block(std::uint64_t rip) const {
+    return aot_blocks_.find(rip) != aot_blocks_.end();
+}
+
+void X86Interpreter::clear_aot_blocks() {
+    aot_blocks_.clear();
+}
+
+std::size_t X86Interpreter::aot_block_count() const {
+    return aot_blocks_.size();
+}
+
 bool X86Interpreter::in_trap(std::uint64_t rip) const {
     for (const auto& t : traps_)
         if (rip >= t.first && rip - t.first < t.second) return true;
@@ -3319,13 +3443,56 @@ CpuRunResult X86Interpreter::run(std::uint64_t max_steps) {
     Exec e(state, mem_, tsc_);
     if (recent_traces_.empty()) recent_traces_.resize(1024);
     while (out.steps < max_steps) {
+        if ((out.steps & 0xFF) == 0 && pause_checker_ && pause_checker_()) {
+            out.stop = CpuStop::step_limit;
+            return out;
+        }
         out.rip = state.rip;
         recent_traces_[recent_rips_count_++ % 1024] = { state.rip, state.gpr[5], state.gpr[4] };
         if (in_trap(state.rip)) { out.stop = CpuStop::trap; return out; }
+
+        // Despacho de blocos de codigo compilados AOT com fallback seguro (T051)
+        auto aot_it = aot_blocks_.find(state.rip);
+        if (aot_it != aot_blocks_.end() && aot_it->second) {
+            auto aot_res = aot_it->second(state, mem_);
+            out.steps += aot_res.steps;
+            tsc_ += aot_res.steps;
+            if (aot_res.status == AotExecutionStatus::trap_encountered || in_trap(state.rip)) {
+                out.stop = CpuStop::trap;
+                out.rip = state.rip;
+                return out;
+            }
+            if (aot_res.status == AotExecutionStatus::fault) {
+                out.stop = CpuStop::memory_fault;
+                out.rip = state.rip;
+                return out;
+            }
+            if (aot_res.status == AotExecutionStatus::fallback_untranslated) {
+                if (aot_res.fallback_rip != 0) {
+                    state.rip = aot_res.fallback_rip;
+                }
+                out.rip = state.rip;
+                if (out.steps >= max_steps) {
+                    out.stop = CpuStop::step_limit;
+                    return out;
+                }
+                // Fallback seguro: continua o loop onde state.rip aponta para a instrucao nao traduzida,
+                // que sera decodificada e executada com precisao pelo interpretador
+                continue;
+            }
+            if (out.steps >= max_steps) {
+                out.rip = state.rip;
+                out.stop = CpuStop::step_limit;
+                return out;
+            }
+            continue;
+        }
+
         e.start = state.rip;
         e.pos = e.n = 0;
         e.p66 = e.rep = e.repne = e.rex = e.rw = e.rr = e.rx = e.rb = false;
         e.fs = e.gs = e.addr32 = e.branched = false;
+        e.has_lock = e.lock_consumed = false;
         if (mem_.load(e.start, e.buf, 15) == MemoryError::ok) e.n = 15;
         else {
             // Busca binária pelo prefixo acessível, preservando fault no byte exato.

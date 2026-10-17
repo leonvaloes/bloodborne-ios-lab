@@ -149,13 +149,21 @@ std::int32_t UserServiceManager::sceUserServiceGetUserName(GuestMemory& mem, Sce
     if (buffer_addr == 0 || size == 0) {
         return SCE_USER_SERVICE_ERROR_INVALID_ARG;
     }
-    std::vector<char> temp(size);
-    std::int32_t ret = sceUserServiceGetUserName(user_id, temp.data(), size);
-    if (ret != 0) {
-        return ret;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) {
+        return SCE_USER_SERVICE_ERROR_NOT_INITIALIZED;
     }
-    std::size_t written_len = std::strlen(temp.data()) + 1;
-    if (mem.store(buffer_addr, temp.data(), written_len) != MemoryError::ok) {
+    auto it = std::find_if(users_.begin(), users_.end(), [user_id](const UserProfile& u) {
+        return u.user_id == user_id && u.logged_in;
+    });
+    if (it == users_.end()) {
+        return SCE_USER_SERVICE_ERROR_NO_USER;
+    }
+    const std::size_t written_len = it->name.size() + 1;
+    if (size < written_len) {
+        return SCE_USER_SERVICE_ERROR_BUFFER_TOO_SMALL;
+    }
+    if (mem.store(buffer_addr, it->name.c_str(), written_len) != MemoryError::ok) {
         return SCE_USER_SERVICE_ERROR_INVALID_ARG;
     }
     return 0; // SCE_OK

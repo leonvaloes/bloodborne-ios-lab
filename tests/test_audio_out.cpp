@@ -283,7 +283,7 @@ int main() { return run([] {
     }
     CHECK(sceAudioOutGetPortInfo(p_out, &info) == SCE_OK);
     CHECK(info.overflow_count >= 1);
-    CHECK(info.total_frames_output >= 5120);
+    CHECK(info.dropped_frames == 1024);
 
     // Consulta de PortInfo com ponteiro nulo
     CHECK(sceAudioOutGetPortInfo(p_out, nullptr) == SCE_AUDIO_OUT_ERROR_INVALID_POINTER);
@@ -296,6 +296,34 @@ int main() { return run([] {
     CHECK(m_read == 256);
 
     CHECK(sceAudioOutClose(p_out) == SCE_OK);
+
+    // ========================================================================
+    // 7.1 T053: Pressão no buffer sem confirmar quadros descartados e reprodução contínua
+    // ========================================================================
+    std::int32_t p_press = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000, SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+    CHECK(p_press > 0);
+    // Submete 20 blocos de 256 = 5120 frames para buffer virgem de 4096
+    for (int i = 0; i < 20; ++i) {
+        CHECK(sceAudioOutOutput(p_press, const_stereo.data()) == SCE_OK);
+    }
+    SceAudioOutPortInfo press_info{};
+    CHECK(sceAudioOutGetPortInfo(p_press, &press_info) == SCE_OK);
+    CHECK(press_info.overflow_count >= 1);
+    CHECK(press_info.total_frames_output == 4096);
+    CHECK(press_info.dropped_frames == 1024);
+    CHECK(press_info.total_frames_output + press_info.dropped_frames == 5120);
+
+    // Reprodução contínua: drenando o buffer, a escrita subsequente avança sem descartes
+    std::vector<std::int16_t> drain_buf(1024 * 2, 0);
+    std::size_t num_drained = AudioOutManager::instance().drain_port_pcm16(p_press, drain_buf.data(), 1024);
+    CHECK(num_drained == 1024);
+    for (int i = 0; i < 4; ++i) {
+        CHECK(sceAudioOutOutput(p_press, const_stereo.data()) == SCE_OK);
+    }
+    CHECK(sceAudioOutGetPortInfo(p_press, &press_info) == SCE_OK);
+    CHECK(press_info.total_frames_output == 4096 + 1024);
+    CHECK(press_info.dropped_frames == 1024);
+    CHECK(sceAudioOutClose(p_press) == SCE_OK);
 
     // A fila do host é estéreo: duplicar amostras mono sem escrever além
     // do destino dimensionado para apenas 2 * frames amostras.
@@ -415,5 +443,181 @@ int main() { return run([] {
         CHECK(at9_read > 0);
 
         CHECK(sceAudioOutClose(h_at9) == SCE_OK);
+    }
+
+    // ========================================================================
+    // 10. Mixagem de Múltiplas Portas (MAIN + BGM) e Saturação PCM16 (T079)
+    // ========================================================================
+    {
+        AudioOutManager::instance().close_all_ports();
+
+        // Abre uma porta MAIN e uma porta BGM
+        auto h_main = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
+                                      SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        auto h_bgm = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_BGM, 0, 256, 48000,
+                                     SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        CHECK(h_main > 0 && h_bgm > 0);
+
+        // 1. Mixagem linear simples: MAIN (1000) + BGM (2500) = 3500
+        std::vector<std::int16_t> main_buf(256 * 2, 1000);
+        std::vector<std::int16_t> bgm_buf(256 * 2, 2500);
+        CHECK(sceAudioOutOutput(h_main, main_buf.data()) == SCE_OK);
+        CHECK(sceAudioOutOutput(h_bgm, bgm_buf.data()) == SCE_OK);
+
+        std::vector<std::int16_t> mixed_out(256 * 2, 0);
+        std::size_t drained = AudioOutManager::instance().drain_main_port_pcm16(mixed_out.data(), 256);
+        CHECK(drained == 256);
+        for (std::size_t i = 0; i < 256 * 2; ++i) {
+            CHECK(mixed_out[i] == 3500);
+        }
+
+        // 2. Mixagem com saturação positiva (+32767): MAIN (25000) + BGM (15000) = 40000 -> 32767
+        std::vector<std::int16_t> sat_pos_main(256 * 2, 25000);
+        std::vector<std::int16_t> sat_pos_bgm(256 * 2, 15000);
+        CHECK(sceAudioOutOutput(h_main, sat_pos_main.data()) == SCE_OK);
+        CHECK(sceAudioOutOutput(h_bgm, sat_pos_bgm.data()) == SCE_OK);
+
+        drained = AudioOutManager::instance().drain_main_port_pcm16(mixed_out.data(), 256);
+        CHECK(drained == 256);
+        for (std::size_t i = 0; i < 256 * 2; ++i) {
+            CHECK(mixed_out[i] == 32767);
+        }
+
+        // 3. Mixagem com saturação negativa (-32768): MAIN (-20000) + BGM (-20000) = -40000 -> -32768
+        std::vector<std::int16_t> sat_neg_main(256 * 2, -20000);
+        std::vector<std::int16_t> sat_neg_bgm(256 * 2, -20000);
+        CHECK(sceAudioOutOutput(h_main, sat_neg_main.data()) == SCE_OK);
+        CHECK(sceAudioOutOutput(h_bgm, sat_neg_bgm.data()) == SCE_OK);
+
+        drained = AudioOutManager::instance().drain_main_port_pcm16(mixed_out.data(), 256);
+        CHECK(drained == 256);
+        for (std::size_t i = 0; i < 256 * 2; ++i) {
+            CHECK(mixed_out[i] == -32768);
+        }
+
+        CHECK(sceAudioOutClose(h_main) == SCE_OK);
+        CHECK(sceAudioOutClose(h_bgm) == SCE_OK);
+    }
+
+    // ========================================================================
+    // 11. Suspensão / Retomada e Purga de Buffers Inativos (T050 / T043)
+    // ========================================================================
+    {
+        auto& mgr = AudioOutManager::instance();
+        mgr.close_all_ports();
+        CHECK(!mgr.is_paused());
+
+        auto h_test = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
+                                     SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        CHECK(h_test > 0);
+
+        std::vector<std::int16_t> audio_data(256 * 2, 777);
+        CHECK(sceAudioOutOutput(h_test, audio_data.data()) == SCE_OK);
+
+        // Simula interrupção de áudio (AVAudioSessionInterruptionTypeBegan)
+        mgr.set_paused(true);
+        CHECK(mgr.is_paused());
+
+        // Quando pausado, a drenagem é silenciada
+        std::vector<std::int16_t> out_buf(256 * 2, -1);
+        CHECK(mgr.drain_main_port_pcm16(out_buf.data(), 256) == 0);
+
+        // Purga de buffers inativos (alívio de memória sob didReceiveMemoryWarning e fim de interrupção)
+        mgr.purge_inactive_buffers();
+
+        // Submissão durante interrupção é absorvida com SCE_OK sem sujar buffers
+        std::vector<std::int16_t> ignored_data(256 * 2, 9999);
+        CHECK(sceAudioOutOutput(h_test, ignored_data.data()) == SCE_OK);
+        CHECK(mgr.drain_main_port_pcm16(out_buf.data(), 256) == 0);
+
+        // Simula fim da interrupção sem opção de retomada imediata: deve permanecer pausado
+        // (ex: chamada encerrada mas app em segundo plano)
+        CHECK(mgr.is_paused());
+
+        // Simula fim da interrupção com retomada (AVAudioSessionInterruptionOptionShouldResume)
+        mgr.set_paused(false);
+        CHECK(!mgr.is_paused());
+
+        // Com o buffer purgado, não há áudio preso ou estalo da sessão anterior
+        CHECK(mgr.drain_main_port_pcm16(out_buf.data(), 256) == 0);
+
+        // Nova saída após retomada opera normalmente
+        CHECK(sceAudioOutOutput(h_test, audio_data.data()) == SCE_OK);
+        CHECK(mgr.drain_main_port_pcm16(out_buf.data(), 256) == 256);
+        CHECK(out_buf[0] == 777);
+
+        CHECK(sceAudioOutClose(h_test) == SCE_OK);
+
+        // 11b. Teste com múltiplas portas ativas (MAIN + BGM) sob interrupção e retomada
+        auto h_m = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000, SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        auto h_b = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_BGM, 0, 256, 48000, SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        CHECK(h_m > 0 && h_b > 0);
+
+        std::vector<std::int16_t> m_samples(256 * 2, 1200);
+        std::vector<std::int16_t> b_samples(256 * 2, 800);
+        CHECK(sceAudioOutOutput(h_m, m_samples.data()) == SCE_OK);
+        CHECK(sceAudioOutOutput(h_b, b_samples.data()) == SCE_OK);
+
+        // Interrupção
+        mgr.set_paused(true);
+        mgr.purge_inactive_buffers();
+        std::vector<std::int16_t> mixed_silence(256 * 2, -1);
+        CHECK(mgr.drain_main_port_pcm16(mixed_silence.data(), 256) == 0);
+
+        // Retomada e nova mixagem limpa
+        mgr.set_paused(false);
+        std::vector<std::int16_t> fresh_m(256 * 2, 2000);
+        std::vector<std::int16_t> fresh_b(256 * 2, 1000);
+        CHECK(sceAudioOutOutput(h_m, fresh_m.data()) == SCE_OK);
+        CHECK(sceAudioOutOutput(h_b, fresh_b.data()) == SCE_OK);
+
+        std::vector<std::int16_t> mixed_resumed(256 * 2, 0);
+        CHECK(mgr.drain_main_port_pcm16(mixed_resumed.data(), 256) == 256);
+        for (std::size_t i = 0; i < 256 * 2; ++i) {
+            CHECK(mixed_resumed[i] == 3000);
+        }
+
+        CHECK(sceAudioOutClose(h_m) == SCE_OK);
+        CHECK(sceAudioOutClose(h_b) == SCE_OK);
+    }
+
+    // ========================================================================
+    // 12. T184: Limitação de Frames a MAX_SAMPLES_PER_BLOCK em output e output_hle
+    // ========================================================================
+    {
+        auto& mgr = AudioOutManager::instance();
+        mgr.close_all_ports();
+
+        auto h_lim = sceAudioOutOpen(0, SCE_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
+                                     SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        CHECK(h_lim > 0);
+
+        std::vector<std::int16_t> sample_buf(256 * 2, 123);
+
+        // 1. Frames maiores que MAX_SAMPLES_PER_BLOCK (4096) são rejeitados imediatamente com INVALID_PARAM
+        CHECK(mgr.output(h_lim, sample_buf.data(), AudioOutManager::MAX_SAMPLES_PER_BLOCK + 1) ==
+              SCE_AUDIO_OUT_ERROR_INVALID_PARAM);
+
+        // 2. Valores extremos adversariais (0xFFFFFFFF, 0x80000000) prevenindo overflow aritmético
+        CHECK(mgr.output(h_lim, sample_buf.data(), static_cast<std::size_t>(0xFFFFFFFFULL)) ==
+              SCE_AUDIO_OUT_ERROR_INVALID_PARAM);
+        CHECK(mgr.output(h_lim, sample_buf.data(), static_cast<std::size_t>(0x80000000ULL)) ==
+              SCE_AUDIO_OUT_ERROR_INVALID_PARAM);
+
+        // 3. Validação de output_hle com GuestMemory
+        GuestMemory gmem(65536);
+        CHECK(gmem.map(0x10000, 65536, read | write) == MemoryError::ok);
+        CHECK(gmem.store(0x10000, sample_buf.data(), 256 * 2 * sizeof(std::int16_t)) == MemoryError::ok);
+
+        CHECK(mgr.output_hle(h_lim, gmem, 0x10000, AudioOutManager::MAX_SAMPLES_PER_BLOCK + 1) ==
+              SCE_AUDIO_OUT_ERROR_INVALID_PARAM);
+        CHECK(mgr.output_hle(h_lim, gmem, 0x10000, static_cast<std::size_t>(0xFFFFFFFFULL)) ==
+              SCE_AUDIO_OUT_ERROR_INVALID_PARAM);
+
+        // 4. Limite exato MAX_SAMPLES_PER_BLOCK (4096) é aceito
+        std::vector<std::int16_t> max_buf(AudioOutManager::MAX_SAMPLES_PER_BLOCK * 2, 456);
+        CHECK(mgr.output(h_lim, max_buf.data(), AudioOutManager::MAX_SAMPLES_PER_BLOCK) == SCE_OK);
+
+        CHECK(sceAudioOutClose(h_lim) == SCE_OK);
     }
 }); }

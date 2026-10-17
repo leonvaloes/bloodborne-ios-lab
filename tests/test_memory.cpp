@@ -34,7 +34,8 @@ int main() { return run([] {
     CHECK(m.load(64, &output, 1) == MemoryError::unmapped);
     CHECK(m.store(63, result.data(), 2) == MemoryError::unmapped);
     CHECK(m.load(63, &output, 1) == MemoryError::ok && output == input);
-    CHECK(m.load(15, result.data(), 2) == MemoryError::unmapped);
+    CHECK(m.load(15, result.data(), 2) == MemoryError::ok);
+    CHECK(m.load(63, result.data(), 2) == MemoryError::unmapped);
     CHECK(m.load(0, nullptr, 1) == MemoryError::invalid);
     CHECK(m.store(0, nullptr, 1) == MemoryError::invalid);
     CHECK(m.load(0, &output, 0) == MemoryError::invalid);
@@ -56,6 +57,56 @@ int main() { return run([] {
     CHECK(m.map(max - 32, 32, read | write) == MemoryError::ok);
     CHECK(m.store(max - 1, &input, 1) == MemoryError::ok);
     CHECK(m.load(max - 1, &output, 1) == MemoryError::ok && output == input);
+
+    // ========================================================================
+    // T076: GuestMemory::unmap(address, size) com corte e divisão de regiões
+    // ========================================================================
+    {
+        GuestMemory gm(256);
+        CHECK(gm.map(0x2000, 64, read | write) == MemoryError::ok);
+        std::vector<std::uint8_t> payload(64);
+        for (std::size_t i = 0; i < 64; ++i) payload[i] = static_cast<std::uint8_t>(i + 1);
+        CHECK(gm.store(0x2000, payload.data(), 64) == MemoryError::ok);
+
+        // 1. Erros de validação
+        CHECK(gm.unmap(0x2000, 0) == MemoryError::invalid);
+        CHECK(gm.unmap(max, 10) == MemoryError::invalid);
+        CHECK(gm.unmap(0x9000, 16) == MemoryError::unmapped);
+
+        // 2. Unmap no início da região (0x2000..0x200F)
+        CHECK(gm.unmap(0x2000, 16) == MemoryError::ok);
+        CHECK(gm.used() == 48);
+        std::uint8_t byte_val = 0;
+        CHECK(gm.load(0x2000, &byte_val, 1) == MemoryError::unmapped);
+        CHECK(gm.load(0x200F, &byte_val, 1) == MemoryError::unmapped);
+        CHECK(gm.load(0x2010, &byte_val, 1) == MemoryError::ok && byte_val == 17);
+
+        // 3. Unmap no final da região (0x2030..0x203F)
+        CHECK(gm.unmap(0x2030, 16) == MemoryError::ok);
+        CHECK(gm.used() == 32);
+        CHECK(gm.load(0x2030, &byte_val, 1) == MemoryError::unmapped);
+        CHECK(gm.load(0x202F, &byte_val, 1) == MemoryError::ok && byte_val == 48);
+
+        // 4. Unmap no meio da região (0x2018..0x201F), dividindo em duas sub-regiões
+        CHECK(gm.unmap(0x2018, 8) == MemoryError::ok);
+        CHECK(gm.used() == 24);
+        CHECK(gm.load(0x2017, &byte_val, 1) == MemoryError::ok && byte_val == 24);
+        CHECK(gm.load(0x2018, &byte_val, 1) == MemoryError::unmapped);
+        CHECK(gm.load(0x201F, &byte_val, 1) == MemoryError::unmapped);
+        CHECK(gm.load(0x2020, &byte_val, 1) == MemoryError::ok && byte_val == 33);
+        CHECK(gm.load(0x202F, &byte_val, 1) == MemoryError::ok && byte_val == 48);
+
+        // 5. Unmap abrangendo uma das sub-regiões inteiras (0x2010..0x2017)
+        CHECK(gm.unmap(0x2010, 8) == MemoryError::ok);
+        CHECK(gm.used() == 16);
+        CHECK(gm.load(0x2010, &byte_val, 1) == MemoryError::unmapped);
+        CHECK(gm.load(0x2020, &byte_val, 1) == MemoryError::ok && byte_val == 33);
+
+        // 6. Unmap da sub-região restante
+        CHECK(gm.unmap(0x2020, 16) == MemoryError::ok);
+        CHECK(gm.used() == 0);
+        CHECK(gm.load(0x2020, &byte_val, 1) == MemoryError::unmapped);
+    }
 
     // Random transfers against a flat reference model, including crossing bounds.
     GuestMemory random_memory(256);

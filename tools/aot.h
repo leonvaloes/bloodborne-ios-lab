@@ -1,4 +1,5 @@
 #pragma once
+#include "x86_interp.h"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -142,6 +143,12 @@ std::string generate_batch_cpp(const std::vector<LiftedFunction>& funcs, const s
 std::string generate_batch_header(const std::vector<LiftedFunction>& funcs);
 std::string generate_batch_registry(const std::vector<LiftedFunction>& funcs);
 std::string generate_batch_manifest(const std::vector<LiftedFunction>& funcs, const std::string& source_id = "eboot.elf");
+
+// ============================================================================
+// 4. AOT Dispatcher Integration & Safe Fallback Engine (T051)
+// ============================================================================
+std::string emit_aot_block_cpp(const LiftedFunction& fn);
+AotBlockHandler create_aot_block_executor(const LiftedFunction& fn);
 
 AotBatchResult batch_translate_elf(const std::string& elf_path, const std::string& output_dir, const AotBatchConfig& config = {});
 

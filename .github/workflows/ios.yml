@@ -4,6 +4,17 @@ on:
   push:
     paths:
       - core/**
+      - third_party/**
+      - fixtures/**
+      - tools/**
+      - host/ios/**
+      - tests/**
+      - CMakeLists.txt
+      - .github/workflows/ios.yml
+  pull_request:
+    paths:
+      - core/**
+      - third_party/**
       - fixtures/**
       - tools/**
       - host/ios/**
@@ -27,7 +38,7 @@ jobs:
         run: |
           cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release -DBB_BUILD_ID=${{ github.sha }}
           cmake --build build-host --parallel 4
-          ctest --test-dir build-host --output-on-failure
+          ctest --test-dir build-host --output-on-failure --timeout 30
       - name: Compile for physical iOS arm64
         run: |
           xcodebuild -version
@@ -46,10 +57,25 @@ jobs:
           set -euo pipefail
           app="$PWD/build-ios/Release-iphoneos/BBHost.app"
           test -f "$app/BBHost"
-          xcrun lipo -archs "$app/BBHost" | grep -q arm64
+          test "$(xcrun lipo -archs "$app/BBHost")" = arm64
           plutil -lint "$app/Info.plist"
-          # Validação de ausência de entitlements corporativos ou certificados restritos (T034)
-          ! codesign -d --entitlements :- "$app" 2>&1 | grep -E "com.apple.developer.team-identifier|get-task-allow" || true
+          # O artefato é explicitamente sem assinatura; não distribuir uma assinatura inesperada.
+          if codesign --verify "$app" >/dev/null 2>&1; then
+            echo 'App assinado inesperadamente' >&2
+            exit 1
+          fi
+          if test -e "$app/_CodeSignature" || test -e "$app/embedded.mobileprovision"; then
+            echo 'Assinatura ou provisioning incorporado ao app unsigned' >&2
+            exit 1
+          fi
+          # App sem assinatura: se houver entitlements, não aceitar privilégios restritos.
+          if codesign -d --entitlements :- "$app" > entitlements-check.plist 2>/dev/null; then
+            if grep -E -q 'com\.apple\.developer\.team-identifier|com\.apple\.security\.application-groups|com\.apple\.developer\.networking\.networkextension' entitlements-check.plist; then
+              echo 'Entitlements restritos detectados' >&2
+              exit 1
+            fi
+          fi
+          rm -f entitlements-check.plist
           mkdir -p out/Payload
           cp -R "$app" out/Payload/
           (cd out && zip -qry BBHost-unsigned.ipa Payload)

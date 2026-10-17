@@ -783,4 +783,35 @@ BinderError Bnd4Reader::read_file(const std::string &name, std::vector<std::uint
     return read_file(entry->id, out_data);
 }
 
+BinderError Bnd4Reader::stream_file(std::int32_t id, std::uint64_t offset_in_file, void *dest, std::size_t bytes_to_read, std::size_t &out_bytes_read) const {
+    out_bytes_read = 0;
+    if (!impl_ || !impl_->is_open) return BinderError::not_open;
+    const auto *entry = get_entry(id);
+    if (!entry) return BinderError::file_not_found;
+
+    if (offset_in_file >= entry->compressed_size) {
+        return BinderError::ok;
+    }
+
+    std::size_t available = static_cast<std::size_t>(entry->compressed_size - offset_in_file);
+    std::size_t to_read = std::min(bytes_to_read, available);
+    if (to_read == 0) return BinderError::ok;
+    if (!dest) return BinderError::out_of_bounds;
+
+    if (entry->data_offset > UINT64_MAX - offset_in_file ||
+        entry->data_offset + offset_in_file + to_read > impl_->buffer.size()) {
+        return BinderError::corrupted_data;
+    }
+
+    std::memcpy(dest, impl_->buffer.data() + entry->data_offset + offset_in_file, to_read);
+    out_bytes_read = to_read;
+    return BinderError::ok;
+}
+
+BinderError Bnd4Reader::stream_file(const std::string &name, std::uint64_t offset_in_file, void *dest, std::size_t bytes_to_read, std::size_t &out_bytes_read) const {
+    const auto *entry = get_entry(name);
+    if (!entry) return BinderError::file_not_found;
+    return stream_file(entry->id, offset_in_file, dest, bytes_to_read, out_bytes_read);
+}
+
 } // namespace bb

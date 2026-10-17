@@ -15,7 +15,8 @@ enum class RasterizerStatus {
     InvalidVertexBuffer,
     InvalidIndexBuffer,
     BufferOverflow,
-    UnsupportedFormat
+    UnsupportedFormat,
+    Error
 };
 
 struct RasterizerStats {

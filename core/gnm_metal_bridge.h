@@ -150,6 +150,57 @@ struct MetalComputePipelineConfig {
 };
 
 // =============================================================================
+// Chaves de Cache de Estados Metal (T108, T131, T133)
+// =============================================================================
+struct MetalPipelineCacheKey {
+    std::uint64_t vs_hash = 0;
+    std::uint64_t ps_hash = 0;
+    std::array<std::uint32_t, 8> color_formats{};
+    std::array<bool, 8> blend_enabled{};
+    std::array<std::uint32_t, 8> src_rgb_blend{};
+    std::array<std::uint32_t, 8> dst_rgb_blend{};
+    std::array<std::uint32_t, 8> rgb_blend_op{};
+    std::array<std::uint32_t, 8> src_alpha_blend{};
+    std::array<std::uint32_t, 8> dst_alpha_blend{};
+    std::array<std::uint32_t, 8> alpha_blend_op{};
+    std::array<std::uint8_t, 8> write_mask{};
+    std::uint32_t active_color_attachments = 0;
+    std::uint32_t depth_format = 0;
+    std::uint32_t stencil_format = 0;
+    std::uint32_t primitive_type = 0;
+
+    bool operator==(const MetalPipelineCacheKey& o) const;
+    static MetalPipelineCacheKey from_pipeline_config(const MetalRenderPipelineConfig& cfg);
+};
+
+struct MetalPipelineCacheKeyHash {
+    std::size_t operator()(const MetalPipelineCacheKey& k) const noexcept;
+};
+
+struct MetalDepthStencilCacheKey {
+    std::uint32_t depth_pixel_format = 0;
+    std::uint32_t stencil_pixel_format = 0;
+    bool depth_test_enabled = false;
+    bool depth_write_enabled = false;
+    std::uint32_t depth_compare_function = 0;
+    bool stencil_test_enabled = false;
+    bool stencil_write_enabled = false;
+    std::uint32_t stencil_compare_function = 0;
+    std::uint8_t stencil_read_mask = 0xFF;
+    std::uint8_t stencil_write_mask = 0xFF;
+
+    bool operator==(const MetalDepthStencilCacheKey& o) const;
+    static MetalDepthStencilCacheKey from_config(const MetalDepthStencilConfig& cfg);
+};
+
+struct MetalDepthStencilCacheKeyHash {
+    std::size_t operator()(const MetalDepthStencilCacheKey& k) const noexcept;
+};
+
+// Construtor combinado de fontes MSL (T131)
+std::string build_combined_msl_source(const std::string& vs_msl, const std::string& ps_msl);
+
+// =============================================================================
 // Estruturas de Bindings de Recursos Metal
 // =============================================================================
 struct MetalBufferBinding {
@@ -178,6 +229,10 @@ struct MetalSamplerBinding {
     std::uint32_t mip_filter = 0;
     float min_lod = 0.0f;
     float max_lod = 15.0f;
+    std::uint32_t clamp_x = 0;
+    std::uint32_t clamp_y = 0;
+    std::uint32_t clamp_z = 0;
+    std::uint32_t max_anisotropy = 1;
     bool valid = false;
 };
 
@@ -200,6 +255,96 @@ struct MetalResourceBindings {
     void clear();
 };
 
+struct MetalSamplerCacheKey {
+    std::uint32_t min_filter = 0;
+    std::uint32_t mag_filter = 0;
+    std::uint32_t mip_filter = 0;
+    float min_lod = 0.0f;
+    float max_lod = 15.0f;
+    std::uint32_t clamp_x = 0;
+    std::uint32_t clamp_y = 0;
+    std::uint32_t clamp_z = 0;
+    std::uint32_t max_anisotropy = 1;
+
+    bool operator==(const MetalSamplerCacheKey& o) const;
+    static MetalSamplerCacheKey from_binding(const MetalSamplerBinding& b);
+};
+
+struct MetalSamplerCacheKeyHash {
+    std::size_t operator()(const MetalSamplerCacheKey& k) const noexcept;
+};
+
+// =============================================================================
+// Chaves de Cache de Recursos Metal e Coerência (T159)
+// =============================================================================
+struct MetalBufferCacheKey {
+    std::uint64_t guest_address = 0;
+    std::size_t size = 0;
+
+    bool operator==(const MetalBufferCacheKey& o) const noexcept;
+};
+
+struct MetalBufferCacheKeyHash {
+    std::size_t operator()(const MetalBufferCacheKey& k) const noexcept;
+};
+
+struct MetalTextureCacheKey {
+    std::uint64_t guest_address = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t pitch = 0;
+    MetalPixelFormat format = MetalPixelFormat::Invalid;
+    std::uint32_t num_mips = 1;
+
+    bool operator==(const MetalTextureCacheKey& o) const noexcept;
+};
+
+struct MetalTextureCacheKeyHash {
+    std::size_t operator()(const MetalTextureCacheKey& k) const noexcept;
+};
+
+struct MetalDrawCommand;
+struct MetalDispatchCommand;
+
+// Validação de leituras guest (T158)
+bool validate_guest_buffer_read(const void* data, std::size_t size);
+bool validate_guest_texture_read(const void* data, std::uint32_t width, std::uint32_t height, std::uint32_t bpp);
+bool validate_guest_index_read(const void* data, std::size_t index_count, GnmIndexType type);
+
+// Invalidação de recursos para coerência de caches (T159)
+void gnm_bridge_invalidate_buffer(std::uint64_t guest_address);
+void gnm_bridge_invalidate_texture(std::uint64_t guest_address);
+
+// Attachments Depth/Stencil Offscreen (T160)
+MetalDepthStencilConfig get_active_depth_stencil_config(const MetalDrawCommand* commands, std::uint32_t count);
+bool is_depth_stencil_attachment_compatible(const MetalDepthStencilConfig& ds, std::uint32_t dest_width, std::uint32_t dest_height);
+
+// Cadeia de Mipmaps e Amostragem Segura (T169)
+struct MipLevelBounds {
+    std::uint32_t level = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t pitch = 0;
+    std::size_t byte_size = 0;
+};
+
+std::vector<MipLevelBounds> calculate_texture_mipmap_levels(
+    MetalPixelFormat format,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t pitch,
+    std::uint32_t num_mips
+);
+
+bool should_clamp_sampler_lod(std::uint32_t texture_mips, std::uint32_t initialized_mips);
+
+// Validação de recursos compute (T171)
+BridgeResult<bool> validate_compute_resources(
+    const MetalDispatchCommand& cmd,
+    bool has_textures,
+    bool has_buffers
+);
+
 // =============================================================================
 // Comandos de Desenho e Computação Prontos para Metal
 // =============================================================================
@@ -220,6 +365,13 @@ struct MetalDrawCommand {
     Viewport viewport{};
     ScissorRect scissor{};
 
+    // Cor constante de blend e Depth Bias (T173)
+    std::array<float, 4> blend_color = {0.0f, 0.0f, 0.0f, 0.0f};
+    bool depth_bias_enable = false;
+    float depth_bias = 0.0f;
+    float slope_scaled_depth_bias = 0.0f;
+    float depth_bias_clamp = 0.0f;
+
     bool valid = false;
 };
 
@@ -236,6 +388,17 @@ struct MetalDispatchCommand {
 
     bool valid = false;
 };
+
+// Validador de comandos compute (T134)
+BridgeResult<bool> validate_compute_dispatch(const MetalDispatchCommand& cmd);
+
+// Validador de execução de draws (T135)
+bool validate_draw_execution_preconditions(const MetalDrawCommand* commands, std::uint32_t count);
+
+// Utilitários de cálculo de tamanho de texel e limites de textura (T172)
+std::uint32_t get_texel_byte_size(MetalPixelFormat format);
+std::uint32_t calculate_bytes_per_row(MetalPixelFormat format, std::uint32_t pitch);
+bool validate_texture_upload_bounds(MetalPixelFormat format, std::uint32_t width, std::uint32_t height, std::uint32_t pitch, std::size_t buffer_size);
 
 // =============================================================================
 // Wrappers GcnDecoder e GcnMslTranslator
@@ -270,14 +433,15 @@ public:
 
     explicit ShaderCache(std::size_t max_entries = 1024);
 
-    BridgeResult<const CachedShader*> get_or_compile(
+    BridgeResult<std::shared_ptr<const CachedShader>> get_or_compile(
         const GuestMemory& memory,
         std::uint64_t guest_address,
         ShaderStage stage
     );
 
     void insert(std::uint64_t hash, CachedShader shader);
-    const CachedShader* find(std::uint64_t hash) const;
+    void insert(std::uint64_t hash, std::shared_ptr<const CachedShader> shader);
+    std::shared_ptr<const CachedShader> find(std::uint64_t hash) const;
 
     std::size_t size() const;
     std::uint64_t hit_count() const { return hit_count_.load(); }
@@ -288,7 +452,7 @@ public:
 
 private:
     mutable std::mutex mutex_;
-    std::unordered_map<std::uint64_t, CachedShader> cache_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const CachedShader>> cache_;
     std::size_t max_entries_;
     mutable std::atomic<std::uint64_t> hit_count_{0};
     mutable std::atomic<std::uint64_t> miss_count_{0};
@@ -348,5 +512,8 @@ private:
     MetalResourceBindings ps_bindings_{};
     MetalResourceBindings cs_bindings_{};
 };
+
+// Limpeza de caches de GPU Metal sob aviso de memoria / didReceiveMemoryWarning (T043 / FR-009)
+void gnm_bridge_clear_caches();
 
 } // namespace bb

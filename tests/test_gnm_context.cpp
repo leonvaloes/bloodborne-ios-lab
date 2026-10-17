@@ -554,5 +554,227 @@ int main() {
             CHECK(!ctx.read_texture_descriptor(0x1000 + mem_size - 16, bound_tex)); // Faltam bytes para 32 bytes
             CHECK(!bound_tex.is_valid());
         }
+
+        // =====================================================================
+        // Teste 11: T153 - Eventos PM4 de escrita, DMA e sincronização
+        // =====================================================================
+        {
+            ctx.reset();
+            CHECK(ctx.sync_events().empty());
+
+            // 1. IT_WRITE_DATA (op 0x37, count 4): addr 0x60000, data 0xDEADBEEF
+            // 2. IT_DMA_DATA (op 0x50, count 6): DMA sync
+            // 3. IT_RELEASE_MEM (op 0x49, count 7): release fence/timestamp
+            // 4. IT_WAIT_REG_MEM (op 0x3c, count 6): wait sync
+            // 5. IT_ACQUIRE_MEM (op 0x58, count 6): cache invalidate
+            // 6. IT_EVENT_WRITE (op 0x46, count 1): event write
+            // 7. IT_EVENT_WRITE_EOP (op 0x47, count 5): EOP event
+            // 8. IT_EVENT_WRITE_EOS (op 0x48, count 4): EOS event
+            std::vector<std::uint32_t> sync_cmds{
+                header(0x37, 4), 0, 0x60000, 0, 0xDEADBEEF,
+                header(0x50, 6), 0, 0x1000, 0, 0x2000, 0, 64,
+                header(0x49, 7), 0, 0, 0x70000, 0, 42, 0, 0,
+                header(0x3c, 6), 0, 0x80000, 0, 1, 0xFFFFFFFF, 10,
+                header(0x58, 6), 0, 0xFFFFFFFF, 0, 0, 0, 0,
+                header(0x46, 1), 5,
+                header(0x47, 5), 0, 0x90000, 0, 100, 0,
+                header(0x48, 4), 0, 0xA0000, 0, 200
+            };
+
+            constexpr std::uint64_t sync_addr = 0x6000;
+            put(memory, sync_addr, sync_cmds);
+
+            auto status = ctx.submit(sync_addr, static_cast<std::uint32_t>(sync_cmds.size()));
+            CHECK(status == bb::Pm4Status::ok);
+
+            const auto& events = ctx.sync_events();
+            CHECK(events.size() == 8);
+
+            CHECK(events[0].kind == bb::Pm4Kind::write_data);
+            CHECK(events[0].address == 0x60000);
+            CHECK(events[0].args[3] == 0xDEADBEEF);
+
+            CHECK(events[1].kind == bb::Pm4Kind::dma_data);
+            CHECK(events[2].kind == bb::Pm4Kind::release_mem);
+            CHECK(events[3].kind == bb::Pm4Kind::wait_reg_mem);
+            CHECK(events[4].kind == bb::Pm4Kind::acquire_mem);
+            CHECK(events[5].kind == bb::Pm4Kind::event_write);
+            CHECK(events[6].kind == bb::Pm4Kind::event_eop);
+            CHECK(events[6].address == 0x90000);
+            CHECK(events[7].kind == bb::Pm4Kind::event_eos);
+            CHECK(events[7].address == 0xA0000);
+
+            // T153: Validacao dos efeitos genuinos aplicados na memoria guest
+            std::uint32_t val_write = 0;
+            CHECK(memory.load(0x60000, &val_write, sizeof(val_write)) == bb::MemoryError::ok);
+            CHECK(val_write == 0xDEADBEEF);
+
+            std::uint32_t val_rel = 0;
+            CHECK(memory.load(0x70000, &val_rel, sizeof(val_rel)) == bb::MemoryError::ok);
+            CHECK(val_rel == 42);
+
+            std::uint32_t val_eop = 0;
+            CHECK(memory.load(0x90000, &val_eop, sizeof(val_eop)) == bb::MemoryError::ok);
+            CHECK(val_eop == 100);
+
+            std::uint32_t val_eos = 0;
+            CHECK(memory.load(0xA0000, &val_eos, sizeof(val_eos)) == bb::MemoryError::ok);
+            CHECK(val_eos == 200);
+
+            CHECK(ctx.write_data_count() == 1);
+            CHECK(ctx.dma_count() == 1);
+            CHECK(ctx.cache_invalidate_count() == 1);
+            CHECK(ctx.caches_invalidated());
+            CHECK(ctx.sync_error_count() == 0);
+
+            // clear_calls() deve limpar os sync_events acumulados
+            ctx.clear_calls();
+            CHECK(ctx.sync_events().empty());
+        }
+
+        // =====================================================================
+        // Teste 12: T153 - Efeitos e Validacao Rigorosa de DMA, Timestamp, Registradores e Resiliencia
+        // =====================================================================
+        {
+            ctx.reset();
+
+            // 1. DMA real: Prepara dados conhecidos na regiao de origem (0x15000)
+            std::vector<std::uint8_t> dma_pattern(128, 0xAB);
+            for (std::size_t i = 0; i < dma_pattern.size(); ++i) {
+                dma_pattern[i] = static_cast<std::uint8_t>(i ^ 0x5A);
+            }
+            CHECK(memory.store(0x15000, dma_pattern.data(), dma_pattern.size()) == bb::MemoryError::ok);
+
+            // Limpa regiao de destino (0x25000)
+            std::vector<std::uint8_t> zeroes(128, 0);
+            CHECK(memory.store(0x25000, zeroes.data(), zeroes.size()) == bb::MemoryError::ok);
+
+            // Emite DMA: src=0x15000, dst=0x25000, 128 bytes
+            bb::Pm4Event dma_ev{};
+            dma_ev.kind = bb::Pm4Kind::dma_data;
+            dma_ev.args[0] = 0;
+            dma_ev.args[1] = 0x15000; // src lo
+            dma_ev.args[2] = 0;       // src hi
+            dma_ev.args[3] = 0x25000; // dst lo
+            dma_ev.args[4] = 0;       // dst hi
+            dma_ev.args[5] = 128;     // byte count
+            ctx.on_pm4_event(dma_ev);
+
+            CHECK(ctx.dma_count() == 1);
+            std::vector<std::uint8_t> read_dst(128, 0);
+            CHECK(memory.load(0x25000, read_dst.data(), read_dst.size()) == bb::MemoryError::ok);
+            CHECK(read_dst == dma_pattern);
+
+            // 2. Release Mem com data_sel = 2 (64-bit data)
+            bb::Pm4Event rel64_ev{};
+            rel64_ev.kind = bb::Pm4Kind::release_mem;
+            rel64_ev.args[0] = (2u << 29); // data_sel = 2 (64-bit)
+            rel64_ev.args[2] = 0x35000;    // addr lo
+            rel64_ev.args[3] = 0;          // addr hi
+            rel64_ev.args[4] = 0x11223344; // data lo
+            rel64_ev.args[5] = 0x55667788; // data hi
+            ctx.on_pm4_event(rel64_ev);
+
+            std::uint64_t rel64_val = 0;
+            CHECK(memory.load(0x35000, &rel64_val, sizeof(rel64_val)) == bb::MemoryError::ok);
+            CHECK(rel64_val == 0x5566778811223344ULL);
+
+            // 3. Release Mem com data_sel = 3 (GPU timestamp)
+            bb::Pm4Event rel_ts_ev{};
+            rel_ts_ev.kind = bb::Pm4Kind::release_mem;
+            rel_ts_ev.args[0] = (3u << 29); // data_sel = 3 (timestamp)
+            rel_ts_ev.args[2] = 0x36000;    // addr lo
+            rel_ts_ev.args[3] = 0;          // addr hi
+            ctx.on_pm4_event(rel_ts_ev);
+
+            std::uint64_t ts_val = 0;
+            CHECK(memory.load(0x36000, &ts_val, sizeof(ts_val)) == bb::MemoryError::ok);
+            CHECK(ts_val > 0);
+
+            // 4. Write Data para Registrador MMIO (dst_sel == 0, reg < 0x4000)
+            bb::Pm4Event reg_wr_ev{};
+            reg_wr_ev.kind = bb::Pm4Kind::write_data;
+            reg_wr_ev.words = 4;
+            reg_wr_ev.args[0] = 0; // dst_sel = 0
+            reg_wr_ev.args[1] = bb::gcn_reg::CB_COLOR0_BASE;
+            reg_wr_ev.args[2] = 0;
+            reg_wr_ev.args[3] = 0x777; // 0x777 << 8 = 0x77700
+            ctx.on_pm4_event(reg_wr_ev);
+
+            CHECK(ctx.context_reg(bb::gcn_reg::CB_COLOR0_BASE) == 0x777);
+            CHECK(ctx.current_render_targets().targets[0].base_address == 0x77700);
+
+            // 5. Casos adversariais com diagnostico de erro
+            CHECK(ctx.sync_error_count() == 0);
+
+            // a) Write Data com endereco nulo
+            bb::Pm4Event null_wr{};
+            null_wr.kind = bb::Pm4Kind::write_data;
+            null_wr.args[0] = (1u << 8); // mem
+            null_wr.args[1] = 0;
+            null_wr.args[2] = 0;
+            ctx.on_pm4_event(null_wr);
+            CHECK(ctx.sync_error_count() == 1);
+            CHECK(!ctx.last_error().empty());
+
+            // b) Write Data para regiao nao mapeada
+            bb::Pm4Event unmapped_wr{};
+            unmapped_wr.kind = bb::Pm4Kind::write_data;
+            unmapped_wr.words = 4;
+            unmapped_wr.args[0] = (1u << 8);
+            unmapped_wr.args[1] = 0x900000; // fora da regiao mapeada (mem_size = 1MB)
+            unmapped_wr.args[2] = 0;
+            unmapped_wr.args[3] = 0x1234;
+            ctx.on_pm4_event(unmapped_wr);
+            CHECK(ctx.sync_error_count() == 2);
+
+            // c) DMA com endereco nulo
+            bb::Pm4Event null_dma{};
+            null_dma.kind = bb::Pm4Kind::dma_data;
+            null_dma.args[1] = 0;
+            null_dma.args[3] = 0x25000;
+            ctx.on_pm4_event(null_dma);
+            CHECK(ctx.sync_error_count() == 3);
+
+            // d) DMA com regiao nao mapeada
+            bb::Pm4Event unmapped_dma{};
+            unmapped_dma.kind = bb::Pm4Kind::dma_data;
+            unmapped_dma.args[1] = 0x15000;
+            unmapped_dma.args[3] = 0x900000;
+            unmapped_dma.args[5] = 64;
+            ctx.on_pm4_event(unmapped_dma);
+            CHECK(ctx.sync_error_count() == 4);
+
+            // e) Release Mem com endereco nulo
+            bb::Pm4Event null_rel{};
+            null_rel.kind = bb::Pm4Kind::release_mem;
+            null_rel.args[2] = 0;
+            null_rel.args[3] = 0;
+            ctx.on_pm4_event(null_rel);
+            CHECK(ctx.sync_error_count() == 5);
+
+            // f) Wait Reg Mem com endereco nulo
+            bb::Pm4Event null_wait{};
+            null_wait.kind = bb::Pm4Kind::wait_reg_mem;
+            null_wait.args[1] = 0;
+            null_wait.args[2] = 0;
+            ctx.on_pm4_event(null_wait);
+            CHECK(ctx.sync_error_count() == 6);
+
+            // 6. Contexto criado a partir de const GuestMemory& (sem gravador)
+            const bb::GuestMemory& const_mem = memory;
+            bb::GnmContext read_only_ctx(const_mem);
+            CHECK(read_only_ctx.sync_error_count() == 0);
+
+            bb::Pm4Event ro_wr{};
+            ro_wr.kind = bb::Pm4Kind::write_data;
+            ro_wr.words = 4;
+            ro_wr.args[0] = (1u << 8);
+            ro_wr.args[1] = 0x10000;
+            ro_wr.args[3] = 0x999;
+            read_only_ctx.on_pm4_event(ro_wr);
+            CHECK(read_only_ctx.sync_error_count() == 1);
+            CHECK(!read_only_ctx.last_error().empty());
+        }
     });
 }

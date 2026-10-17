@@ -1,5 +1,6 @@
 #include "check.h"
 #include "fios2_hle.h"
+#include "save_data.h"
 #include "vfs.h"
 #include "guest_memory.h"
 #include <filesystem>
@@ -251,8 +252,61 @@ int main() { return run([] {
     CHECK(mgr.sceFiosStatSync(new_dir + "/profile.json", stat_res) == SCE_FIOS_ERROR_NOT_FOUND);
     CHECK(mgr.sceFiosStatSync(new_dir + "/profile_renamed.json", stat_res) == SCE_FIOS_OK);
 
+    // ========================================================================
+    // T117: Preservar destino se sceFiosRenameSync falhar
+    // ========================================================================
+    const std::string src_file = new_dir + "/rename_src.dat";
+    const std::string dst_file = new_dir + "/rename_dst.dat";
+    {
+        SceFiosFH fs = mgr.sceFiosFHOpenSync(src_file, SCE_FIOS_O_WRONLY | SCE_FIOS_O_CREAT);
+        CHECK(fs > 0);
+        const char sdata[] = "SOURCE_DATA";
+        CHECK(mgr.sceFiosFHWriteSync(fs, sdata, sizeof(sdata)) == sizeof(sdata));
+        CHECK(mgr.sceFiosFHCloseSync(fs) == SCE_FIOS_OK);
+
+        SceFiosFH fd = mgr.sceFiosFHOpenSync(dst_file, SCE_FIOS_O_WRONLY | SCE_FIOS_O_CREAT);
+        CHECK(fd > 0);
+        const char ddata[] = "DEST_PRESERVED_DATA";
+        CHECK(mgr.sceFiosFHWriteSync(fd, ddata, sizeof(ddata)) == sizeof(ddata));
+        CHECK(mgr.sceFiosFHCloseSync(fd) == SCE_FIOS_OK);
+    }
+
+    // Tentativa de renomear um arquivo inexistente para o destino não pode apagar ou corromper o destino
+    CHECK(mgr.sceFiosRenameSync(new_dir + "/no_such_src.dat", dst_file) == SCE_FIOS_ERROR_NOT_FOUND);
+    {
+        SceFiosFH fd = mgr.sceFiosFHOpenSync(dst_file, SCE_FIOS_O_RDONLY);
+        CHECK(fd > 0);
+        char check_buf[32] = {};
+        CHECK(mgr.sceFiosFHReadSync(fd, check_buf, sizeof("DEST_PRESERVED_DATA")) == sizeof("DEST_PRESERVED_DATA"));
+        CHECK(std::string(check_buf) == "DEST_PRESERVED_DATA");
+        CHECK(mgr.sceFiosFHCloseSync(fd) == SCE_FIOS_OK);
+    }
+
+    // Renomear com travessia inválida preserva ambos
+    CHECK(mgr.sceFiosRenameSync(src_file, dst_file + "/../escape") == SCE_FIOS_ERROR_PATH_TRAVERSAL);
+    {
+        SceFiosFH fd = mgr.sceFiosFHOpenSync(dst_file, SCE_FIOS_O_RDONLY);
+        CHECK(fd > 0);
+        char check_buf[32] = {};
+        CHECK(mgr.sceFiosFHReadSync(fd, check_buf, sizeof("DEST_PRESERVED_DATA")) == sizeof("DEST_PRESERVED_DATA"));
+        CHECK(std::string(check_buf) == "DEST_PRESERVED_DATA");
+        CHECK(mgr.sceFiosFHCloseSync(fd) == SCE_FIOS_OK);
+    }
+
+    // Renomeação válida sobrescrevendo destino existente
+    CHECK(mgr.sceFiosRenameSync(src_file, dst_file) == SCE_FIOS_OK);
+    {
+        SceFiosFH fd = mgr.sceFiosFHOpenSync(dst_file, SCE_FIOS_O_RDONLY);
+        CHECK(fd > 0);
+        char check_buf[32] = {};
+        CHECK(mgr.sceFiosFHReadSync(fd, check_buf, sizeof("SOURCE_DATA")) == sizeof("SOURCE_DATA"));
+        CHECK(std::string(check_buf) == "SOURCE_DATA");
+        CHECK(mgr.sceFiosFHCloseSync(fd) == SCE_FIOS_OK);
+    }
+
     // Exclusão de arquivo
     CHECK(mgr.sceFiosFileDeleteSync(new_dir + "/profile_renamed.json") == SCE_FIOS_OK);
+    CHECK(mgr.sceFiosFileDeleteSync(dst_file) == SCE_FIOS_OK);
     CHECK(mgr.sceFiosStatSync(new_dir + "/profile_renamed.json", stat_res) == SCE_FIOS_ERROR_NOT_FOUND);
 
     // ========================================================================
@@ -436,8 +490,12 @@ int main() { return run([] {
         f.write("ARCHIVE_DATA_12345", 18);
     }
 
+    // T136: Confinar aos mounts autorizados do VFS; rejeitar caminho absoluto do host
+    CHECK(mgr.sceFiosArchiveMountSync(arc_dir.string(), "/mounted_arc") == SCE_FIOS_ERROR_NOT_FOUND);
+    vfs.mount("/host_arc", arc_dir.string(), true);
+
     SceFiosFH arc_fh = 0;
-    CHECK(mgr.sceFiosArchiveMountSync(arc_dir.string(), "/mounted_arc", &arc_fh) == SCE_FIOS_OK);
+    CHECK(mgr.sceFiosArchiveMountSync("/host_arc", "/mounted_arc", &arc_fh) == SCE_FIOS_OK);
     CHECK(vfs.is_mounted("/mounted_arc"));
 
     SceFiosFH asset_fh = mgr.sceFiosFHOpenSync("/mounted_arc/archived_asset.dat", SCE_FIOS_O_RDONLY);
@@ -452,9 +510,9 @@ int main() { return run([] {
 
     // Rejeição de caminhos inválidos e traversal em ArchiveMountSync
     CHECK(mgr.sceFiosArchiveMountSync("/app0/../bad", "/mount") == SCE_FIOS_ERROR_PATH_TRAVERSAL);
-    CHECK(mgr.sceFiosArchiveMountSync(arc_dir.string(), "/mount/../bad") == SCE_FIOS_ERROR_PATH_TRAVERSAL);
+    CHECK(mgr.sceFiosArchiveMountSync("/host_arc", "/mount/../bad") == SCE_FIOS_ERROR_PATH_TRAVERSAL);
     CHECK(mgr.sceFiosArchiveMountSync("", "/mount") == SCE_FIOS_ERROR_INVALID_ARGUMENT);
-    CHECK(mgr.sceFiosArchiveMountSync(arc_dir.string(), "") == SCE_FIOS_ERROR_INVALID_ARGUMENT);
+    CHECK(mgr.sceFiosArchiveMountSync("/host_arc", "") == SCE_FIOS_ERROR_INVALID_ARGUMENT);
     CHECK(mgr.sceFiosArchiveMountSync("/nonexistent/arc.bhd5", "/mount") == SCE_FIOS_ERROR_NOT_FOUND);
 
     // ========================================================================
@@ -512,6 +570,65 @@ int main() { return run([] {
     }
     CHECK(threads_passed.load());
     CHECK(mgr.total_handle_count() == 0);
+
+    // ========================================================================
+    // 12. T144: Truncate e Quota em _work (sceFiosFHTruncateSync, sceFiosFileTruncateSync)
+    // ========================================================================
+    {
+        auto& sdm = SaveDataManager::instance();
+        sdm.terminate();
+        CHECK(sdm.initialize(save_dir.string(), 1024, &vfs));
+
+        SceSaveDataDirName sdir{};
+        std::strncpy(sdir.data, "SPRJ0001", sizeof(sdir.data));
+        SceSaveDataMount sreq{};
+        sreq.user = 0;
+        sreq.dir = &sdir;
+        sreq.mode = SCE_SAVEDATA_MOUNT_MODE_CREATE;
+        SceSaveDataMountResult sres{};
+        CHECK(sceSaveDataMount(&sreq, &sres) == SCE_SAVEDATA_OK);
+        CHECK(vfs.is_mounted("/savedata0"));
+
+        const std::string quota_path = "/savedata0/quota_test.bin";
+        SceFiosFH qfh = mgr.sceFiosFHOpenSync(quota_path, SCE_FIOS_O_WRONLY | SCE_FIOS_O_CREAT | SCE_FIOS_O_TRUNC);
+        CHECK(qfh > 0);
+
+        std::vector<char> buf500(500, 'A');
+        CHECK(mgr.sceFiosFHWriteSync(qfh, buf500.data(), 500) == 500);
+
+        // Tentativa de gravar mais 600 bytes (500 + 600 = 1100 > 1024 quota)
+        std::vector<char> buf600(600, 'B');
+        CHECK(mgr.sceFiosFHWriteSync(qfh, buf600.data(), 600) == SCE_FIOS_ERROR_DISK_FULL);
+
+        // Truncate via handle: 2048 bytes estoura a cota (1024)
+        CHECK(mgr.sceFiosFHTruncateSync(qfh, 2048) == SCE_FIOS_ERROR_DISK_FULL);
+
+        // Truncate válido dentro da cota: 800 bytes
+        CHECK(mgr.sceFiosFHTruncateSync(qfh, 800) == SCE_FIOS_OK);
+        CHECK(mgr.sceFiosFHCloseSync(qfh) == SCE_FIOS_OK);
+
+        // Truncate via caminho: 2048 bytes estoura a cota
+        CHECK(mgr.sceFiosFileTruncateSync(quota_path, 2048) == SCE_FIOS_ERROR_DISK_FULL);
+
+        // Truncate válido via caminho: 600 bytes
+        CHECK(mgr.sceFiosFileTruncateSync(quota_path, 600) == SCE_FIOS_OK);
+
+        // Truncate assíncrono com op
+        SceFiosOp top = 0;
+        CHECK(mgr.sceFiosFileTruncateSync(&top, quota_path.c_str(), 400) == SCE_FIOS_OK);
+        CHECK(top > 0);
+        CHECK(mgr.sceFiosOpWait(top) == SCE_FIOS_OK);
+        CHECK(mgr.sceFiosOpGetActualCount(top) == 400);
+        CHECK(mgr.sceFiosOpDelete(top) == SCE_FIOS_OK);
+
+        // Truncate com argumentos inválidos
+        CHECK(mgr.sceFiosFileTruncateSync(quota_path, -5) == SCE_FIOS_ERROR_INVALID_ARGUMENT);
+        CHECK(mgr.sceFiosFileTruncateSync("/app0/param.sfo", 100) == SCE_FIOS_ERROR_ACCESS_DENIED);
+        CHECK(mgr.sceFiosFileTruncateSync("/savedata0/nonexistent.bin", 100) == SCE_FIOS_ERROR_NOT_FOUND);
+
+        CHECK(sceSaveDataUmount(&sres.point, SCE_SAVEDATA_UMOUNT_FLAG_DISCARD) == SCE_SAVEDATA_OK);
+        sdm.terminate();
+    }
 
     // Limpeza da sandbox de teste
     std::filesystem::remove_all(sandbox, ec);

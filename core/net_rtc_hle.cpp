@@ -182,8 +182,15 @@ int32_t RtcManager::sceRtcGetCurrentClock(GuestMemory& mem, uint64_t clock_addr,
 }
 
 int32_t RtcManager::sceRtcGetCurrentClockLocalTime(SceRtcDateTime* clock) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return sceRtcGetCurrentClock(clock, tz_offset_minutes_);
+    if (clock == nullptr) {
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    }
+    int32_t offset_minutes = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        offset_minutes = tz_offset_minutes_;
+    }
+    return sceRtcGetCurrentClock(clock, offset_minutes);
 }
 
 int32_t RtcManager::sceRtcGetCurrentClockLocalTime(GuestMemory& mem, uint64_t clock_addr) {

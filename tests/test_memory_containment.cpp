@@ -2,6 +2,8 @@
 #include "stability.h"
 #include "flver_parser.h"
 #include "guest_memory.h"
+#include "audio_out.h"
+#include "gnm_metal_bridge.h"
 #include <vector>
 #include <cstdint>
 #include <memory>
@@ -67,5 +69,65 @@ int main() {
         // Após trim, o sistema continua estável dentro dos limites
         CHECK(!monitor.is_budget_exceeded());
         CHECK(monitor.get_peak_footprint_bytes() < RSS_LIMIT_3_5_GB);
+
+        // 2. Seção T043 / FR-009: Orçamento de 5,5 GiB (iPhone 15 Pro com 8 GB) e purga coordenada de áudio e texturas
+        {
+            MemoryMonitor ios15pro_monitor;
+            constexpr std::uint64_t BUDGET_5_5_GIB = 5632ULL << 20; // 5,905,580,032 bytes
+            ios15pro_monitor.set_budget_bytes(BUDGET_5_5_GIB);
+            CHECK(ios15pro_monitor.get_budget_bytes() == BUDGET_5_5_GIB);
+
+            // Valida paginação sob demanda virtual em GuestMemory
+            GuestMemory virtual_guest_mem(BUDGET_5_5_GIB);
+            CHECK(virtual_guest_mem.budget() == BUDGET_5_5_GIB);
+
+            // Mapeia regiões de código (0x400000) e heap
+            CHECK(virtual_guest_mem.map(0x400000, 64 * 1024 * 1024, read | write) == MemoryError::ok);
+
+            // Registra múltiplos callbacks coordenados de trim sob pressão Jetsam
+            bool textures_purged = false;
+            bool audio_purged = false;
+
+            std::vector<std::vector<std::uint8_t>> active_textures;
+            active_textures.push_back(std::vector<std::uint8_t>(1024 * 1024, 0xAA));
+
+            // Configura áudio com porta e buffers ativos
+            auto& audio_mgr = AudioOutManager::instance();
+            std::int32_t audio_port = audio_mgr.open_port(0, 0, 0, 2048, 48000, 2);
+            CHECK(audio_port >= 0);
+
+            bool metal_cache_cleared = false;
+            ios15pro_monitor.register_trim_callback([&]() {
+                gnm_bridge_clear_caches();
+                metal_cache_cleared = true;
+            });
+
+            ios15pro_monitor.register_trim_callback([&]() {
+                active_textures.clear();
+                textures_purged = true;
+            });
+
+            ios15pro_monitor.register_trim_callback([&]() {
+                audio_mgr.purge_inactive_buffers();
+                audio_purged = true;
+            });
+
+            // Dispara aviso de pressão de memória (didReceiveMemoryWarning)
+            ios15pro_monitor.trigger_low_memory_warning();
+
+            CHECK(metal_cache_cleared);
+            CHECK(textures_purged);
+            CHECK(audio_purged);
+            CHECK(active_textures.empty());
+
+            // Limpa porta de áudio
+            CHECK(audio_mgr.close_port(audio_port) == 0);
+
+            // Mede footprint no orçamento de 5,5 GiB
+            std::uint64_t post_trim_footprint = ios15pro_monitor.query_physical_footprint_bytes();
+            CHECK(post_trim_footprint < BUDGET_5_5_GIB);
+            CHECK(ios15pro_monitor.get_peak_footprint_bytes() < BUDGET_5_5_GIB);
+            CHECK(!ios15pro_monitor.is_budget_exceeded());
+        }
     });
 }

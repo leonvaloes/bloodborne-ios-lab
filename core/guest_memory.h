@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -9,22 +10,28 @@ namespace bb {
 enum class MemoryError { ok, invalid, overlap, budget, unmapped, denied, allocation };
 enum Permission : unsigned { read = 1, write = 2 };
 
+class MemoryStorage;
+
 class MemoryBuffer {
 public:
     MemoryBuffer() noexcept = default;
     explicit MemoryBuffer(std::size_t size);
+    MemoryBuffer(std::shared_ptr<MemoryStorage> storage, std::size_t offset, std::size_t size) noexcept;
     ~MemoryBuffer();
     MemoryBuffer(const MemoryBuffer&) = delete;
     MemoryBuffer& operator=(const MemoryBuffer&) = delete;
     MemoryBuffer(MemoryBuffer&& other) noexcept;
     MemoryBuffer& operator=(MemoryBuffer&& other) noexcept;
 
-    std::uint8_t* data() noexcept { return data_; }
-    const std::uint8_t* data() const noexcept { return data_; }
+    MemoryBuffer slice(std::size_t offset, std::size_t size) const;
+
+    std::uint8_t* data() noexcept;
+    const std::uint8_t* data() const noexcept;
     std::size_t size() const noexcept { return size_; }
 
 private:
-    std::uint8_t* data_ = nullptr;
+    std::shared_ptr<MemoryStorage> storage_;
+    std::size_t offset_ = 0;
     std::size_t size_ = 0;
 };
 
@@ -35,7 +42,9 @@ public:
     explicit GuestMemory(std::size_t budget) : budget_(budget) {}
     MemoryError map(std::uint64_t address, std::size_t size, unsigned permissions);
     MemoryError unmap(std::uint64_t address);
+    MemoryError unmap(std::uint64_t address, std::size_t size);
     MemoryError protect(std::uint64_t address, unsigned permissions);
+    MemoryError protect(std::uint64_t address, std::size_t size, unsigned permissions);
     MemoryError load(std::uint64_t address, void* destination, std::size_t size) const;
     MemoryError store(std::uint64_t address, const void* source, std::size_t size);
     std::size_t used() const;

@@ -7,6 +7,166 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <vector>
+#include <limits>
+
+namespace {
+
+class Sha256 {
+public:
+    Sha256() { reset(); }
+
+    void reset() {
+        state_[0] = 0x6a09e667;
+        state_[1] = 0xbb67ae85;
+        state_[2] = 0x3c6ef372;
+        state_[3] = 0xa54ff53a;
+        state_[4] = 0x510e527f;
+        state_[5] = 0x9b05688c;
+        state_[6] = 0x1f83d9ab;
+        state_[7] = 0x5be0cd19;
+        count_ = 0;
+        buffer_len_ = 0;
+    }
+
+    void update(const void *data, std::size_t len) {
+        const auto *p = static_cast<const uint8_t *>(data);
+        count_ += len;
+        while (len > 0) {
+            std::size_t to_copy = std::min(len, 64 - buffer_len_);
+            std::memcpy(buffer_ + buffer_len_, p, to_copy);
+            buffer_len_ += to_copy;
+            p += to_copy;
+            len -= to_copy;
+            if (buffer_len_ == 64) {
+                transform(buffer_);
+                buffer_len_ = 0;
+            }
+        }
+    }
+
+    std::string finalize() {
+        uint64_t total_bits = count_ * 8;
+        uint8_t pad = 0x80;
+        update(&pad, 1);
+        uint8_t zero = 0;
+        while (buffer_len_ != 56) {
+            update(&zero, 1);
+        }
+        for (int i = 7; i >= 0; --i) {
+            uint8_t b = static_cast<uint8_t>((total_bits >> (i * 8)) & 0xff);
+            update(&b, 1);
+        }
+
+        std::ostringstream ss;
+        ss << std::hex << std::setfill('0');
+        for (uint32_t val : state_) {
+            ss << std::setw(8) << val;
+        }
+        return ss.str();
+    }
+
+private:
+    static inline uint32_t rotr(uint32_t x, uint32_t n) {
+        return (x >> n) | (x << (32 - n));
+    }
+
+    static inline uint32_t ch(uint32_t x, uint32_t y, uint32_t z) {
+        return (x & y) ^ (~x & z);
+    }
+
+    static inline uint32_t maj(uint32_t x, uint32_t y, uint32_t z) {
+        return (x & y) ^ (x & z) ^ (y & z);
+    }
+
+    static inline uint32_t sigma0(uint32_t x) {
+        return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22);
+    }
+
+    static inline uint32_t sigma1(uint32_t x) {
+        return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25);
+    }
+
+    static inline uint32_t gamma0(uint32_t x) {
+        return rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3);
+    }
+
+    static inline uint32_t gamma1(uint32_t x) {
+        return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10);
+    }
+
+    void transform(const uint8_t chunk[64]) {
+        static const uint32_t K[64] = {
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+            0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+            0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+            0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+            0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+        };
+
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (static_cast<uint32_t>(chunk[i * 4]) << 24) |
+                   (static_cast<uint32_t>(chunk[i * 4 + 1]) << 16) |
+                   (static_cast<uint32_t>(chunk[i * 4 + 2]) << 8) |
+                   (static_cast<uint32_t>(chunk[i * 4 + 3]));
+        }
+        for (int i = 16; i < 64; ++i) {
+            w[i] = gamma1(w[i - 2]) + w[i - 7] + gamma0(w[i - 15]) + w[i - 16];
+        }
+
+        uint32_t a = state_[0];
+        uint32_t b = state_[1];
+        uint32_t c = state_[2];
+        uint32_t d = state_[3];
+        uint32_t e = state_[4];
+        uint32_t f = state_[5];
+        uint32_t g = state_[6];
+        uint32_t h = state_[7];
+
+        for (int i = 0; i < 64; ++i) {
+            uint32_t t1 = h + sigma1(e) + ch(e, f, g) + K[i] + w[i];
+            uint32_t t2 = sigma0(a) + maj(a, b, c);
+            h = g;
+            g = f;
+            f = e;
+            e = d + t1;
+            d = c;
+            c = b;
+            b = a;
+            a = t1 + t2;
+        }
+
+        state_[0] += a;
+        state_[1] += b;
+        state_[2] += c;
+        state_[3] += d;
+        state_[4] += e;
+        state_[5] += f;
+        state_[6] += g;
+        state_[7] += h;
+    }
+
+    uint32_t state_[8];
+    uint64_t count_;
+    uint8_t buffer_[64];
+    std::size_t buffer_len_;
+};
+
+} // namespace
 
 namespace bb {
 
@@ -26,47 +186,60 @@ bool SaveDataManager::initialize(const std::string &base_directory,
                                  VirtualFileSystem *vfs) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (base_directory.empty()) return false;
+    if (initialized_) {
+        if (base_dir_ != base_directory) return false; // não descartar slots montados
+        max_quota_per_slot_ = max_quota > 0 ? max_quota : DEFAULT_MAX_QUOTA_PER_SLOT;
+        vfs_ = vfs;
+        return true;
+    }
+
+    // Verificar ambos os diretórios antes de publicar estado: create_directories
+    // pode falhar (ou encontrar um arquivo) sem lançar quando recebe error_code.
+    std::filesystem::path root(base_directory);
+    if (root.filename() != "savedata") root /= "savedata";
+    std::error_code ec;
+    const bool root_created = std::filesystem::create_directories(root, ec);
+    if (ec || !std::filesystem::is_directory(root, ec) || ec) return false;
+    std::filesystem::create_directories(root / "_work", ec);
+    if (ec || !std::filesystem::is_directory(root / "_work", ec) || ec) {
+        if (root_created) {
+            std::error_code cleanup_ec;
+            std::filesystem::remove(root, cleanup_ec); // só se vazio; nunca remove dados preexistentes
+        }
+        return false;
+    }
+
     base_dir_ = base_directory;
     max_quota_per_slot_ = max_quota > 0 ? max_quota : DEFAULT_MAX_QUOTA_PER_SLOT;
     vfs_ = vfs;
-
-    std::error_code ec;
-    std::filesystem::create_directories(base_dir_, ec);
-    std::filesystem::create_directories(std::filesystem::path(base_dir_) / "_work", ec);
-
-    for (auto &slot : slots_) {
-        slot = SaveSlotInfo{};
-    }
-
+    for (auto &slot : slots_) slot = SaveSlotInfo{};
     initialized_ = true;
+    recover_interrupted_commits();
     return true;
 }
 
 bool SaveDataManager::terminate() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!initialized_) return false;
-
-    std::error_code ec;
-    for (std::size_t i = 0; i < MAX_SLOTS; ++i) {
-        if (slots_[i].used) {
-            if (vfs_) {
-                vfs_->unmount(slots_[i].mount_point);
+    // umount() owns mutex_ and is the only path that coordinates data, metadata
+    // and checksum rollback. Never discard a mounted work directory on failure.
+    for (;;) {
+        std::string mount_point;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!initialized_) return false;
+            for (const auto &slot : slots_) {
+                if (slot.used) {
+                    mount_point = slot.mount_point;
+                    break;
+                }
             }
-            if (!slots_[i].work_path.empty()) {
-                std::filesystem::remove_all(slots_[i].work_path, ec);
+            if (mount_point.empty()) {
+                user_memories_.clear();
+                initialized_ = false;
+                return true;
             }
-            slots_[i] = SaveSlotInfo{};
         }
+        if (umount(mount_point, true) != SCE_SAVEDATA_OK) return false;
     }
-
-    if (!base_dir_.empty()) {
-        std::filesystem::remove_all(std::filesystem::path(base_dir_) / "_work", ec);
-    }
-
-    memory_path_.clear();
-    memory_size_ = 0;
-    initialized_ = false;
-    return true;
 }
 
 bool SaveDataManager::is_initialized() const {
@@ -114,30 +287,228 @@ VirtualFileSystem* SaveDataManager::get_vfs() const {
     return vfs_;
 }
 
+std::filesystem::path SaveDataManager::resolve_savedata_root() const {
+    std::filesystem::path b(base_dir_);
+    while (b.filename().empty() && b.has_parent_path() && b != b.root_path()) {
+        b = b.parent_path();
+    }
+    if (b.filename() == "savedata") {
+        return b;
+    }
+    return b / "savedata";
+}
+
+bool SaveDataManager::is_confined_to_savedata_root(const std::filesystem::path &target) const {
+    std::filesystem::path root = resolve_savedata_root();
+    std::error_code ec;
+    std::filesystem::path canonical_root = std::filesystem::weakly_canonical(root, ec);
+    if (ec || canonical_root.empty()) return false;
+
+    std::filesystem::path canonical_target = std::filesystem::weakly_canonical(target, ec);
+    if (ec || canonical_target.empty()) return false;
+
+    // Check if target or any existing component of target is a symlink pointing outside canonical_root
+    std::filesystem::path curr = target;
+    while (!curr.empty() && curr != curr.root_path()) {
+        if (std::filesystem::is_symlink(curr, ec)) {
+            std::filesystem::path sym_dest = std::filesystem::canonical(curr, ec);
+            if (ec) return false;
+            auto sym_rel = std::filesystem::relative(sym_dest, canonical_root, ec);
+            auto first_sym = sym_rel.begin() != sym_rel.end() ? sym_rel.begin()->string() : "";
+            if (ec || sym_rel.empty() || first_sym == ".." || sym_rel.is_absolute()) {
+                return false;
+            }
+        }
+        if (curr == root) break;
+        curr = curr.parent_path();
+    }
+
+    auto rel = std::filesystem::relative(canonical_target, canonical_root, ec);
+    auto first_elem = rel.begin() != rel.end() ? rel.begin()->string() : "";
+    if (ec || rel.empty() || first_elem == ".." || rel.is_absolute()) {
+        return false;
+    }
+    return true;
+}
+
+void SaveDataManager::recover_interrupted_commits() {
+    std::error_code ec;
+    std::filesystem::path root = resolve_savedata_root();
+    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) return;
+
+    std::filesystem::path work_dir = root / "_work";
+    if (std::filesystem::exists(work_dir, ec) && std::filesystem::is_directory(work_dir, ec)) {
+        for (const auto &w_entry : std::filesystem::directory_iterator(work_dir, ec)) {
+            bool is_active = false;
+            for (const auto &slot : slots_) {
+                if (slot.used && !slot.work_path.empty()) {
+                    std::error_code eq_ec;
+                    if (std::filesystem::equivalent(slot.work_path, w_entry.path(), eq_ec)) {
+                        is_active = true;
+                        break;
+                    }
+                }
+            }
+            if (!is_active) {
+                std::filesystem::remove_all(w_entry.path(), ec);
+            }
+        }
+    }
+
+    for (const auto &user_entry : std::filesystem::directory_iterator(root, ec)) {
+        if (!user_entry.is_directory(ec)) continue;
+        if (user_entry.path().filename() == "_work") continue;
+
+        for (const auto &title_entry : std::filesystem::directory_iterator(user_entry.path(), ec)) {
+            if (!title_entry.is_directory(ec)) continue;
+
+            std::vector<std::filesystem::path> bak_dirs;
+            std::vector<std::filesystem::path> tmp_dirs;
+            std::vector<std::filesystem::path> delbak_dirs;
+
+            for (const auto &entry : std::filesystem::directory_iterator(title_entry.path(), ec)) {
+                std::string fname = entry.path().filename().string();
+                if (fname.find(".delbak") != std::string::npos) {
+                    delbak_dirs.push_back(entry.path());
+                } else if (fname.find(".bak") != std::string::npos) {
+                    bak_dirs.push_back(entry.path());
+                } else if (fname.find(".tmp") != std::string::npos) {
+                    tmp_dirs.push_back(entry.path());
+                }
+            }
+
+            for (const auto &delbak_p : delbak_dirs) {
+                std::string fname = delbak_p.filename().string();
+                std::size_t pos = fname.find(".delbak");
+                std::string base_name = fname.substr(0, pos);
+                std::filesystem::path dest = title_entry.path() / base_name;
+                std::filesystem::path meta = title_entry.path() / (base_name + ".sce_sys");
+
+                bool dest_exists = std::filesystem::exists(dest, ec);
+                bool meta_exists = std::filesystem::exists(meta, ec);
+
+                if (!dest_exists && meta_exists) {
+                    // T148: Interrupção/crash durante exclusão com metadados ainda presentes; restaura dados
+                    std::filesystem::rename(delbak_p, dest, ec);
+                    if (ec) {
+                        ec.clear();
+                        std::filesystem::copy(delbak_p, dest, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+                        if (!ec) {
+                            std::filesystem::remove_all(delbak_p, ec);
+                        }
+                    }
+                } else {
+                    std::filesystem::remove_all(delbak_p, ec);
+                }
+            }
+
+            for (const auto &bak_p : bak_dirs) {
+                std::string fname = bak_p.filename().string();
+                std::size_t pos = fname.find(".bak");
+                std::string base_name = fname.substr(0, pos);
+                std::filesystem::path dest = title_entry.path() / base_name;
+
+                bool dest_exists = std::filesystem::exists(dest, ec);
+                bool should_restore = !dest_exists;
+                if (dest_exists && base_name.rfind(".sce_sys") == std::string::npos) {
+                    std::filesystem::path meta_path = title_entry.path() / (base_name + ".sce_sys");
+                    if (std::filesystem::exists(meta_path, ec)) {
+                        if (!verify_checksum(dest, meta_path)) {
+                            // Inconsistência detectada entre dados e metadados; restaura backup consistente
+                            should_restore = true;
+                            std::filesystem::remove_all(dest, ec);
+                        }
+                    }
+                } else if (dest_exists && base_name.rfind(".sce_sys") != std::string::npos) {
+                    // Se metadados existem mas param.bin ou checksum.sha256 estão ausentes, metadados estão corrompidos
+                    if (!std::filesystem::exists(dest / "param.bin", ec) || !std::filesystem::exists(dest / "checksum.sha256", ec)) {
+                        should_restore = true;
+                        std::filesystem::remove_all(dest, ec);
+                    }
+                }
+
+                if (should_restore) {
+                    std::filesystem::rename(bak_p, dest, ec);
+                    if (ec) {
+                        ec.clear();
+                        std::filesystem::copy(bak_p, dest, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+                        if (!ec) {
+                            std::filesystem::remove_all(bak_p, ec);
+                        }
+                    }
+                } else {
+                    std::filesystem::remove_all(bak_p, ec);
+                }
+            }
+
+            for (const auto &tmp_p : tmp_dirs) {
+                std::filesystem::remove_all(tmp_p, ec);
+            }
+        }
+    }
+}
+
+bool SaveDataManager::check_work_quota(const std::string &file_path, std::int64_t current_file_size, std::int64_t new_file_size) const {
+    if (new_file_size <= current_file_size) return true;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) return true;
+
+    std::filesystem::path fp(file_path);
+    std::error_code ec;
+    std::filesystem::path canonical_fp = std::filesystem::weakly_canonical(fp, ec);
+    if (ec) canonical_fp = fp;
+
+    for (const auto &slot : slots_) {
+        if (!slot.used || slot.work_path.empty()) continue;
+        std::filesystem::path wp(slot.work_path);
+        std::filesystem::path canonical_wp = std::filesystem::weakly_canonical(wp, ec);
+        if (ec) canonical_wp = wp;
+
+        auto rel = std::filesystem::relative(canonical_fp, canonical_wp, ec);
+        if (!ec && !rel.empty() && rel != "." && rel.begin()->string() != ".." && !rel.is_absolute()) {
+            std::size_t cur_dir_size = calculate_directory_size(slot.work_path);
+            std::uint64_t disk_sz = 0;
+            if (std::filesystem::exists(canonical_fp, ec) && !std::filesystem::is_directory(canonical_fp, ec)) {
+                disk_sz = std::filesystem::file_size(canonical_fp, ec);
+                if (ec) disk_sz = 0;
+            }
+            std::size_t other_size = (cur_dir_size >= disk_sz) ? (cur_dir_size - disk_sz) : 0;
+            std::size_t prospective_total = other_size + static_cast<std::size_t>(new_file_size);
+            if (prospective_total > max_quota_per_slot_) {
+                return false;
+            }
+            return true;
+        }
+    }
+    return true;
+}
+
 std::string SaveDataManager::resolve_save_dir(int32_t user, const char *title, const char *dir_name) const {
     const std::string t = (title && title[0] != '\0') ? title : default_title_id_;
-    std::filesystem::path p = std::filesystem::path(base_dir_) / "savedata" / std::to_string(user) / t / dir_name;
+    std::filesystem::path p = resolve_savedata_root() / std::to_string(user) / t / dir_name;
     return p.string();
 }
 
 std::string SaveDataManager::resolve_meta_dir(int32_t user, const char *title, const char *dir_name) const {
     const std::string t = (title && title[0] != '\0') ? title : default_title_id_;
-    std::filesystem::path p = std::filesystem::path(base_dir_) / "savedata" / std::to_string(user) / t / (std::string(dir_name) + ".sce_sys");
+    std::filesystem::path p = resolve_savedata_root() / std::to_string(user) / t / (std::string(dir_name) + ".sce_sys");
     return p.string();
 }
 
-void SaveDataManager::write_meta_param(const std::string &meta_dir, const SceSaveDataParam &param) {
+bool SaveDataManager::write_meta_param(const std::string &meta_dir, const SceSaveDataParam &param) {
     std::error_code ec;
     std::filesystem::create_directories(meta_dir, ec);
+    if (ec) return false;
     std::filesystem::path param_file = std::filesystem::path(meta_dir) / "param.bin";
     std::ofstream out(param_file, std::ios::binary | std::ios::trunc);
-    if (out.is_open()) {
-        SceSaveDataParam copy = param;
-        if (copy.mtime == 0) {
-            copy.mtime = static_cast<int64_t>(std::time(nullptr));
-        }
-        out.write(reinterpret_cast<const char *>(&copy), sizeof(copy));
+    if (!out.is_open()) return false;
+    SceSaveDataParam copy = param;
+    if (copy.mtime == 0) {
+        copy.mtime = static_cast<int64_t>(std::time(nullptr));
     }
+    out.write(reinterpret_cast<const char *>(&copy), sizeof(copy));
+    out.close();
+    return out.good();
 }
 
 bool SaveDataManager::read_meta_param(const std::string &meta_dir, SceSaveDataParam &param) const {
@@ -159,6 +530,10 @@ int32_t SaveDataManager::mount(int32_t user, const char *title, const char *dir_
 
     const std::string host_path = resolve_save_dir(user, title, dir_name);
     const std::string meta_path = resolve_meta_dir(user, title, dir_name);
+
+    if (!is_confined_to_savedata_root(host_path) || !is_confined_to_savedata_root(meta_path)) {
+        return SCE_SAVEDATA_ERROR_PATH_TRAVERSAL;
+    }
 
     std::error_code ec;
     bool exists = std::filesystem::exists(host_path, ec) && std::filesystem::is_directory(host_path, ec);
@@ -188,24 +563,41 @@ int32_t SaveDataManager::mount(int32_t user, const char *title, const char *dir_
     if (slot_idx < 0) return SCE_SAVEDATA_ERROR_MOUNT_FULL;
 
     // Cria diretorio de trabalho isolado (staging)
-    std::filesystem::path work_path = std::filesystem::path(base_dir_) / "_work" / ("slot_" + std::to_string(slot_idx));
+    std::filesystem::path work_path = resolve_savedata_root() / "_work" / ("slot_" + std::to_string(slot_idx));
     std::filesystem::remove_all(work_path, ec);
     std::filesystem::create_directories(work_path, ec);
     if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
 
     if (exists) {
+        // Validação de integridade SHA-256 persistida (T122)
+        if (!verify_checksum(host_path, meta_path)) {
+            return SCE_SAVEDATA_ERROR_BROKEN;
+        }
         std::filesystem::copy(host_path, work_path,
                               std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
         if (ec) {
             std::filesystem::remove_all(work_path, ec);
             return SCE_SAVEDATA_ERROR_INTERNAL;
         }
-        apply_bloodborne_sound_hack(work_path.string());
+        if (sound_hack_enabled_ && !(mode & SCE_SAVEDATA_MOUNT_MODE_RDONLY)) {
+            apply_bloodborne_sound_hack(work_path.string());
+        }
     } else {
         std::filesystem::create_directories(meta_path, ec);
         SceSaveDataParam empty{};
         std::strncpy(empty.title, dir_name, sizeof(empty.title) - 1);
-        write_meta_param(meta_path, empty);
+        if (!write_meta_param(meta_path, empty)) {
+            std::filesystem::remove_all(work_path, ec);
+            std::filesystem::remove_all(meta_path, ec);
+            return SCE_SAVEDATA_ERROR_INTERNAL;
+        }
+        // Grava checksum inicial para o novo slot
+        std::string initial_sha = compute_directory_sha256(host_path);
+        if (test_write_failure_phase_ == WriteFailurePhase::Checksum || !write_checksum(meta_path, initial_sha)) {
+            std::filesystem::remove_all(work_path, ec);
+            std::filesystem::remove_all(meta_path, ec);
+            return SCE_SAVEDATA_ERROR_INTERNAL;
+        }
     }
 
     SaveSlotInfo &slot = slots_[slot_idx];
@@ -220,6 +612,27 @@ int32_t SaveDataManager::mount(int32_t user, const char *title, const char *dir_
     slot.mode = mode;
     slot.read_only = (mode & SCE_SAVEDATA_MOUNT_MODE_RDONLY) != 0;
     slot.blocks = blocks;
+
+    if (exists) {
+        slot.created_slot = false;
+        slot.original_param_exists = read_meta_param(meta_path, slot.original_param);
+        std::filesystem::path icon_p = std::filesystem::path(meta_path) / "icon0.png";
+        if (std::filesystem::exists(icon_p, ec)) {
+            slot.original_icon_exists = true;
+            std::ifstream ifile(icon_p, std::ios::binary);
+            if (ifile.is_open()) {
+                slot.original_icon = std::vector<uint8_t>((std::istreambuf_iterator<char>(ifile)), std::istreambuf_iterator<char>());
+            }
+        } else {
+            slot.original_icon_exists = false;
+            slot.original_icon.clear();
+        }
+    } else {
+        slot.created_slot = true;
+        slot.original_param_exists = false;
+        slot.original_icon_exists = false;
+        slot.original_icon.clear();
+    }
 
     if (vfs_) {
         vfs_->mount(slot.mount_point, slot.work_path, slot.read_only);
@@ -240,8 +653,34 @@ int32_t SaveDataManager::umount(const std::string &mount_point, bool commit) {
     SaveSlotInfo &slot = slots_[slot_idx];
     std::error_code ec;
 
+    if (!is_confined_to_savedata_root(slot.host_path) || !is_confined_to_savedata_root(slot.meta_path)) {
+        return SCE_SAVEDATA_ERROR_PATH_TRAVERSAL;
+    }
+
     if (slot.read_only || !commit) {
         // Rollback / descarte: apenas desmonta e descarta copia de trabalho
+        if (!commit) {
+            if (slot.created_slot) {
+                std::filesystem::remove_all(slot.meta_path, ec);
+            } else {
+                if (slot.original_param_exists) {
+                    write_meta_param(slot.meta_path, slot.original_param);
+                    std::string sha = compute_directory_sha256(slot.host_path);
+                    write_checksum(slot.meta_path, sha);
+                } else {
+                    std::filesystem::remove(std::filesystem::path(slot.meta_path) / "param.bin", ec);
+                }
+                std::filesystem::path icon_p = std::filesystem::path(slot.meta_path) / "icon0.png";
+                if (slot.original_icon_exists) {
+                    std::ofstream ofile(icon_p, std::ios::binary | std::ios::trunc);
+                    if (ofile.is_open() && !slot.original_icon.empty()) {
+                        ofile.write(reinterpret_cast<const char*>(slot.original_icon.data()), static_cast<std::streamsize>(slot.original_icon.size()));
+                    }
+                } else {
+                    std::filesystem::remove(icon_p, ec);
+                }
+            }
+        }
         if (vfs_) {
             vfs_->unmount(slot.mount_point);
         }
@@ -256,18 +695,89 @@ int32_t SaveDataManager::umount(const std::string &mount_point, bool commit) {
         return SCE_SAVEDATA_ERROR_QUOTA_EXCEEDED;
     }
 
+    // T111: Backup coordenado de dados e metadados para garantir rollback atômico e recuperável
+    std::filesystem::path meta_dir(slot.meta_path);
+    auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::filesystem::path meta_bak = meta_dir.parent_path() / (meta_dir.filename().string() + ".bak." + std::to_string(now_ns));
+    bool meta_existed = std::filesystem::exists(meta_dir, ec);
+    if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+    if (meta_existed) {
+        std::filesystem::copy(meta_dir, meta_bak, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+    }
+
+    std::filesystem::path host_dir(slot.host_path);
+    std::filesystem::path host_bak = host_dir.parent_path() / (host_dir.filename().string() + ".bak." + std::to_string(now_ns));
+    bool host_existed = std::filesystem::exists(host_dir, ec);
+    if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+    if (host_existed) {
+        std::filesystem::copy(host_dir, host_bak, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+    }
+
     // Substituicao atomica com rollback em caso de falha
-    bool ok = atomic_commit_directory(slot.work_path, slot.host_path);
+    bool ok = test_write_failure_phase_ != WriteFailurePhase::Checksum &&
+              atomic_commit_directory(slot.work_path, slot.host_path);
     if (!ok) {
+        // A falha pode ter ocorrido depois de mover o destino para um backup.
+        // Nao apagar a unica copia recuperavel antes de verificar o estado em disco.
+        // A recuperacao na proxima inicializacao decide se o backup e necessario.
         return SCE_SAVEDATA_ERROR_INTERNAL;
     }
 
-    // Atualiza mtime nos metadados
-    SceSaveDataParam p{};
-    if (read_meta_param(slot.meta_path, p)) {
-        p.mtime = static_cast<int64_t>(std::time(nullptr));
-        write_meta_param(slot.meta_path, p);
+    // Atualiza mtime nos metadados e calcula/persiste checksum SHA-256
+    bool meta_ok = true;
+    if (test_write_failure_phase_ == WriteFailurePhase::MetadataUpdate) {
+        meta_ok = false;
+    } else {
+        SceSaveDataParam p{};
+        if (read_meta_param(slot.meta_path, p)) {
+            p.mtime = static_cast<int64_t>(std::time(nullptr));
+            if (!write_meta_param(slot.meta_path, p)) meta_ok = false;
+        }
+        if (meta_ok) {
+            std::string sha = compute_directory_sha256(slot.host_path);
+            if (!write_checksum(slot.meta_path, sha)) meta_ok = false;
+        }
     }
+
+    if (!meta_ok) {
+        // T111 / T146: Rollback determinístico de dados e metadados se a atualização dos metadados falhar
+        if (host_existed) {
+            std::filesystem::remove_all(host_dir, ec);
+            std::filesystem::rename(host_bak, host_dir, ec);
+            if (ec) {
+                ec.clear();
+                std::filesystem::copy(host_bak, host_dir, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+                if (!ec) {
+                    std::filesystem::remove_all(host_bak, ec);
+                }
+            }
+        } else {
+            std::filesystem::remove_all(host_dir, ec);
+        }
+
+        if (meta_existed) {
+            std::filesystem::remove_all(meta_dir, ec);
+            std::filesystem::rename(meta_bak, meta_dir, ec);
+            if (ec) {
+                ec.clear();
+                std::filesystem::copy(meta_bak, meta_dir, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+                if (!ec) {
+                    std::filesystem::remove_all(meta_bak, ec);
+                }
+            }
+        } else {
+            std::filesystem::remove_all(meta_dir, ec);
+        }
+
+        // Keep the staging directory and mounted slot for retry or recovery.
+        // A failed metadata/checksum update must not silently erase user changes.
+        return SCE_SAVEDATA_ERROR_INTERNAL;
+    }
+
+    if (meta_existed) std::filesystem::remove_all(meta_bak, ec);
+    if (host_existed) std::filesystem::remove_all(host_bak, ec);
 
     if (vfs_) {
         vfs_->unmount(slot.mount_point);
@@ -278,6 +788,10 @@ int32_t SaveDataManager::umount(const std::string &mount_point, bool commit) {
 }
 
 bool SaveDataManager::atomic_commit_directory(const std::string &staging_dir, const std::string &dest_dir) {
+    if (test_write_failure_phase_ == WriteFailurePhase::TmpWrite) {
+        return false;
+    }
+
     std::error_code ec;
     std::filesystem::path dest(dest_dir);
     std::filesystem::path parent = dest.parent_path();
@@ -302,7 +816,7 @@ bool SaveDataManager::atomic_commit_directory(const std::string &staging_dir, co
         return false;
     }
 
-    // Passo 2: Troca atomica (atomic rename) com fallback seguro para Windows
+    // Passo 2: Troca atomica (atomic rename) com fallback transacional seguro
     bool dest_existed = std::filesystem::exists(dest, ec);
     if (dest_existed) {
         std::filesystem::rename(dest, bak_dir, ec);
@@ -318,32 +832,57 @@ bool SaveDataManager::atomic_commit_directory(const std::string &staging_dir, co
             return false;
         }
 
+        if (test_write_failure_phase_ == WriteFailurePhase::Backup) {
+            std::error_code rollback_ec;
+            std::filesystem::rename(bak_dir, dest, rollback_ec);
+            if (rollback_ec) return false; // backup retained for recovery
+            std::filesystem::remove_all(temp_dir, rollback_ec);
+            return false;
+        }
+
         ec.clear();
         std::filesystem::rename(temp_dir, dest, ec);
         if (ec) {
-            // Fallback de copia se rename falhar temporariamente por lock no Windows
+            // Fallback transacional se rename falhar temporariamente por lock no Windows
             ec.clear();
             std::filesystem::create_directories(dest, ec);
             std::filesystem::copy(temp_dir, dest, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
             if (ec) {
-                // Rollback: restaura backup
+                // Rollback estrito: remove dest parcial e restaura backup
                 std::error_code r_ec;
+                std::filesystem::remove_all(dest, r_ec);
                 std::filesystem::rename(bak_dir, dest, r_ec);
+                if (r_ec) {
+                    r_ec.clear();
+                    std::filesystem::copy(bak_dir, dest, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, r_ec);
+                }
                 std::filesystem::remove_all(temp_dir, r_ec);
                 return false;
             }
+        }
+
+        if (test_write_failure_phase_ == WriteFailurePhase::Replacement) {
+            std::error_code rollback_ec;
+            std::filesystem::remove_all(dest, rollback_ec);
+            if (rollback_ec) return false;
+            std::filesystem::rename(bak_dir, dest, rollback_ec);
+            if (rollback_ec) return false; // backup retained for recovery
+            std::filesystem::remove_all(temp_dir, rollback_ec);
+            return false;
         }
 
         // Remocao do backup e do temp apos substituicao concluida com sucesso
         std::filesystem::remove_all(temp_dir, ec);
         std::filesystem::remove_all(bak_dir, ec);
     } else {
+        ec.clear();
         std::filesystem::rename(temp_dir, dest, ec);
         if (ec) {
             ec.clear();
             std::filesystem::create_directories(dest, ec);
             std::filesystem::copy(temp_dir, dest, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
             if (ec) {
+                std::filesystem::remove_all(dest, ec);
                 std::filesystem::remove_all(temp_dir, ec);
                 return false;
             }
@@ -352,6 +891,11 @@ bool SaveDataManager::atomic_commit_directory(const std::string &staging_dir, co
     }
 
     return true;
+}
+
+void SaveDataManager::set_delete_filesystem_for_testing(SaveDeleteFilesystem *filesystem) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    delete_filesystem_for_testing_ = filesystem;
 }
 
 int32_t SaveDataManager::delete_save(int32_t user, const char *title, const char *dir_name) {
@@ -364,6 +908,10 @@ int32_t SaveDataManager::delete_save(int32_t user, const char *title, const char
     const std::string host_path = resolve_save_dir(user, title, dir_name);
     const std::string meta_path = resolve_meta_dir(user, title, dir_name);
 
+    if (!is_confined_to_savedata_root(host_path) || !is_confined_to_savedata_root(meta_path)) {
+        return SCE_SAVEDATA_ERROR_PATH_TRAVERSAL;
+    }
+
     // Nao pode remover slot montado
     for (const auto &slot : slots_) {
         if (slot.used && slot.host_path == host_path) {
@@ -372,12 +920,72 @@ int32_t SaveDataManager::delete_save(int32_t user, const char *title, const char
     }
 
     std::error_code ec;
-    if (!std::filesystem::exists(host_path, ec)) {
-        return SCE_SAVEDATA_ERROR_NOT_FOUND;
+    auto exists = [&](const std::filesystem::path &path) {
+        return delete_filesystem_for_testing_ ? delete_filesystem_for_testing_->exists(path, ec)
+                                              : std::filesystem::exists(path, ec);
+    };
+    auto remove = [&](const std::filesystem::path &path) {
+        return delete_filesystem_for_testing_ ? delete_filesystem_for_testing_->remove_all(path, ec)
+                                              : std::filesystem::remove_all(path, ec);
+    };
+    const bool present = exists(host_path);
+    if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+    if (!present) return SCE_SAVEDATA_ERROR_NOT_FOUND;
+
+    // Consulte os dois caminhos antes de alterar qualquer um: erro no metadata
+    // nao deve apagar o save principal sem sequer tentar validar seu acesso.
+    const bool meta_present = exists(meta_path);
+    if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+
+    std::filesystem::path host_p(host_path);
+    std::filesystem::path parent = host_p.parent_path();
+    auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::filesystem::path host_bak = parent / (host_p.filename().string() + ".delbak." + std::to_string(now_ns));
+
+    // T148: Se meta_path estiver presente, cria backup protetivo de host_path para rollback
+    // transacional caso a remoção de metadados falhe no meio da operação.
+    if (meta_present) {
+        std::filesystem::copy(host_p, host_bak, std::filesystem::copy_options::recursive, ec);
+        if (ec) {
+            ec.clear();
+            std::filesystem::remove_all(host_bak, ec);
+            return SCE_SAVEDATA_ERROR_INTERNAL;
+        }
     }
 
-    std::filesystem::remove_all(host_path, ec);
-    std::filesystem::remove_all(meta_path, ec);
+    remove(host_path);
+    if (ec) {
+        if (meta_present) {
+            std::error_code r_ec;
+            std::filesystem::remove_all(host_bak, r_ec);
+        }
+        return SCE_SAVEDATA_ERROR_INTERNAL;
+    }
+
+    if (meta_present) {
+        remove(meta_path);
+        if (ec) {
+            // T148: Falha intermediária na exclusão dos metadados:
+            // Rollback transacional para recompor host_path a partir do backup,
+            // impedindo que o save sofra perda parcial e seja corrompido!
+            std::error_code r_ec;
+            std::filesystem::rename(host_bak, host_p, r_ec);
+            if (r_ec) {
+                r_ec.clear();
+                std::filesystem::copy(host_bak, host_p,
+                                      std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing,
+                                      r_ec);
+                if (!r_ec) {
+                    std::filesystem::remove_all(host_bak, r_ec);
+                }
+            }
+            return SCE_SAVEDATA_ERROR_INTERNAL;
+        }
+        // Exclusão bem-sucedida: limpa o backup protetivo
+        std::error_code r_ec;
+        std::filesystem::remove_all(host_bak, r_ec);
+    }
+
     return SCE_SAVEDATA_OK;
 }
 
@@ -387,11 +995,15 @@ int32_t SaveDataManager::dir_name_search(int32_t user, const char *title, const 
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) return SCE_SAVEDATA_ERROR_NOT_INITIALIZED;
     if (user < 0) return SCE_SAVEDATA_ERROR_INVALID_USER;
-    if (title && !is_valid_title_id(title)) return SCE_SAVEDATA_ERROR_PARAMETER;
+
+    const std::string t = (title && title[0] != '\0') ? title : default_title_id_;
+    if (!is_valid_title_id(t.c_str())) return SCE_SAVEDATA_ERROR_PARAMETER;
 
     out_entries.clear();
-    const std::string t = (title && title[0] != '\0') ? title : default_title_id_;
-    std::filesystem::path search_base = std::filesystem::path(base_dir_) / "savedata" / std::to_string(user) / t;
+    std::filesystem::path search_base = resolve_savedata_root() / std::to_string(user) / t;
+    if (!is_confined_to_savedata_root(search_base)) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
 
     std::error_code ec;
     if (!std::filesystem::exists(search_base, ec) || !std::filesystem::is_directory(search_base, ec)) {
@@ -402,6 +1014,8 @@ int32_t SaveDataManager::dir_name_search(int32_t user, const char *title, const 
 
     for (const auto &entry : std::filesystem::directory_iterator(search_base, ec)) {
         if (!entry.is_directory(ec)) continue;
+        if (entry.is_symlink(ec)) continue;
+        if (!is_confined_to_savedata_root(entry.path())) continue;
 
         std::string filename = entry.path().filename().string();
         if (filename.empty() || filename[0] == '.') continue;
@@ -410,10 +1024,14 @@ int32_t SaveDataManager::dir_name_search(int32_t user, const char *title, const 
 
         if (!pattern_matches(filename, pat)) continue;
 
+        std::filesystem::path meta_dir = entry.path().string() + ".sce_sys";
+        if (std::filesystem::is_symlink(meta_dir, ec) || !is_confined_to_savedata_root(meta_dir)) {
+            continue;
+        }
+
         SaveSearchEntry se{};
         se.dir_name = filename;
-        std::string meta_dir = (entry.path().string() + ".sce_sys");
-        read_meta_param(meta_dir, se.param);
+        read_meta_param(meta_dir.string(), se.param);
         se.blocks = 32768;
         se.free_blocks = 16384;
         out_entries.push_back(se);
@@ -440,11 +1058,12 @@ int32_t SaveDataManager::dir_name_search(int32_t user, const char *title, const 
 int32_t SaveDataManager::set_param(const std::string &mount_point, uint32_t type, const void *buf, std::size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) return SCE_SAVEDATA_ERROR_NOT_INITIALIZED;
-    if (!buf) return SCE_SAVEDATA_ERROR_PARAMETER;
+    if (!buf || size == 0 || size > 65536) return SCE_SAVEDATA_ERROR_PARAMETER;
     int slot_idx = find_slot(mount_point);
     if (slot_idx < 0) return SCE_SAVEDATA_ERROR_NOT_MOUNTED;
 
     SaveSlotInfo &slot = slots_[slot_idx];
+    if (slot.read_only) return SCE_SAVEDATA_ERROR_PARAMETER;
     SceSaveDataParam p{};
     read_meta_param(slot.meta_path, p);
 
@@ -473,8 +1092,7 @@ int32_t SaveDataManager::set_param(const std::string &mount_point, uint32_t type
         return SCE_SAVEDATA_ERROR_PARAMETER;
     }
 
-    write_meta_param(slot.meta_path, p);
-    return SCE_SAVEDATA_OK;
+    return write_meta_param(slot.meta_path, p) ? SCE_SAVEDATA_OK : SCE_SAVEDATA_ERROR_INTERNAL;
 }
 
 int32_t SaveDataManager::get_param(const std::string &mount_point, SceSaveDataParam &out_param) const {
@@ -493,13 +1111,16 @@ int32_t SaveDataManager::get_param(const std::string &mount_point, SceSaveDataPa
 int32_t SaveDataManager::save_icon(const std::string &mount_point, const void *data, std::size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) return SCE_SAVEDATA_ERROR_NOT_INITIALIZED;
-    if (!data || size == 0) return SCE_SAVEDATA_ERROR_PARAMETER;
+    constexpr std::size_t kMaxIconSize = 2 * 1024 * 1024;
+    if (!data || size == 0 || size > kMaxIconSize) return SCE_SAVEDATA_ERROR_PARAMETER;
     int slot_idx = find_slot(mount_point);
     if (slot_idx < 0) return SCE_SAVEDATA_ERROR_NOT_MOUNTED;
 
     const SaveSlotInfo &slot = slots_[slot_idx];
+    if (slot.read_only) return SCE_SAVEDATA_ERROR_PARAMETER;
     std::error_code ec;
     std::filesystem::create_directories(slot.meta_path, ec);
+    if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
 
     std::filesystem::path icon_path = std::filesystem::path(slot.meta_path) / "icon0.png";
     std::ofstream out(icon_path, std::ios::binary | std::ios::trunc);
@@ -515,36 +1136,102 @@ int32_t SaveDataManager::setup_memory(int32_t user, uint64_t size, const SceSave
     if (size == 0) return SCE_SAVEDATA_ERROR_PARAMETER;
     if (size > max_quota_per_slot_) return SCE_SAVEDATA_ERROR_QUOTA_EXCEEDED;
 
-    std::filesystem::path mem_dir = std::filesystem::path(base_dir_) / "savedata" / std::to_string(user) / (default_title_id_ + ".memory");
+    // T156: Confinar canonicamente e validar title_id
+    if (!is_valid_title_id(default_title_id_.c_str())) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
+
+    std::filesystem::path mem_dir = resolve_savedata_root() / std::to_string(user) / (default_title_id_ + ".memory");
+    std::filesystem::path mem_file = mem_dir / "memory.dat";
+
+    if (!is_confined_to_savedata_root(mem_dir) || !is_confined_to_savedata_root(mem_file)) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
+
     std::error_code ec;
     std::filesystem::create_directories(mem_dir, ec);
     if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
 
-    memory_path_ = (mem_dir / "memory.dat").string();
-    std::ofstream f(memory_path_, std::ios::binary | std::ios::trunc);
-    if (!f.is_open()) return SCE_SAVEDATA_ERROR_INTERNAL;
-    std::vector<char> zero(static_cast<std::size_t>(size), 0);
-    f.write(zero.data(), zero.size());
-    if (!f.good()) return SCE_SAVEDATA_ERROR_INTERNAL;
-    f.close();
+    std::string mem_path = mem_file.string();
+    bool exists = std::filesystem::exists(mem_file, ec);
+    if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
 
-    memory_size_ = size;
+    // T147: Impedir truncamento destrutivo de memory.dat preexistente
+    if (!exists) {
+        std::ofstream f(mem_path, std::ios::binary | std::ios::trunc);
+        if (!f.is_open()) return SCE_SAVEDATA_ERROR_INTERNAL;
+        std::vector<char> zero(static_cast<std::size_t>(size), 0);
+        f.write(zero.data(), zero.size());
+        if (!f.good()) return SCE_SAVEDATA_ERROR_INTERNAL;
+        f.close();
+    } else {
+        auto fsz = std::filesystem::file_size(mem_file, ec);
+        if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+        if (fsz < size) {
+            std::fstream f(mem_path, std::ios::in | std::ios::out | std::ios::binary);
+            if (!f.is_open()) return SCE_SAVEDATA_ERROR_INTERNAL;
+            f.seekp(0, std::ios::end);
+            std::size_t diff = static_cast<std::size_t>(size - fsz);
+            std::vector<char> zero(diff, 0);
+            f.write(zero.data(), zero.size());
+            if (!f.good()) return SCE_SAVEDATA_ERROR_INTERNAL;
+            f.close();
+        } else if (fsz > size) {
+            std::filesystem::resize_file(mem_file, size, ec);
+            if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+        }
+    }
+
+    user_memories_[user] = UserMemoryState{mem_path, size};
 
     if (param) {
-        write_meta_param(mem_dir.string(), *param);
+        if (!write_meta_param(mem_dir.string(), *param)) return SCE_SAVEDATA_ERROR_INTERNAL;
     }
     return SCE_SAVEDATA_OK;
 }
 
 int32_t SaveDataManager::get_memory(int32_t user, void *buffer, uint64_t size, int64_t offset) {
-    (void)user;
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) return SCE_SAVEDATA_ERROR_NOT_INITIALIZED;
+    if (user < 0) return SCE_SAVEDATA_ERROR_INVALID_USER;
     if (!buffer || offset < 0) return SCE_SAVEDATA_ERROR_PARAMETER;
-    if (memory_size_ == 0 || memory_path_.empty()) return SCE_SAVEDATA_ERROR_MEMORY_NOT_READY;
-    if (static_cast<uint64_t>(offset) + size > memory_size_) return SCE_SAVEDATA_ERROR_PARAMETER;
+    if (size > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
 
-    std::ifstream f(memory_path_, std::ios::binary);
+    // T156: Validar title_id
+    if (!is_valid_title_id(default_title_id_.c_str())) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
+
+    auto it = user_memories_.find(user);
+    if (it == user_memories_.end()) {
+        std::filesystem::path mem_dir = resolve_savedata_root() / std::to_string(user) / (default_title_id_ + ".memory");
+        std::filesystem::path mem_file = mem_dir / "memory.dat";
+        if (!is_confined_to_savedata_root(mem_dir) || !is_confined_to_savedata_root(mem_file)) {
+            return SCE_SAVEDATA_ERROR_PARAMETER;
+        }
+        std::error_code ec;
+        if (std::filesystem::exists(mem_file, ec)) {
+            auto fsz = std::filesystem::file_size(mem_file, ec);
+            if (!ec && fsz > 0) {
+                it = user_memories_.emplace(user, UserMemoryState{mem_file.string(), static_cast<uint64_t>(fsz)}).first;
+            }
+        }
+    }
+    if (it == user_memories_.end() || it->second.size == 0 || it->second.path.empty()) {
+        return SCE_SAVEDATA_ERROR_MEMORY_NOT_READY;
+    }
+    if (!is_confined_to_savedata_root(it->second.path)) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
+    const uint64_t u_offset = static_cast<uint64_t>(offset);
+    if (u_offset > it->second.size || size > (it->second.size - u_offset)) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
+    if (size == 0) return SCE_SAVEDATA_OK;
+
+    std::ifstream f(it->second.path, std::ios::binary);
     if (!f.is_open()) return SCE_SAVEDATA_ERROR_INTERNAL;
     f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!f.read(reinterpret_cast<char *>(buffer), static_cast<std::streamsize>(size))) {
@@ -554,14 +1241,47 @@ int32_t SaveDataManager::get_memory(int32_t user, void *buffer, uint64_t size, i
 }
 
 int32_t SaveDataManager::set_memory(int32_t user, const void *buffer, uint64_t size, int64_t offset) {
-    (void)user;
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) return SCE_SAVEDATA_ERROR_NOT_INITIALIZED;
+    if (user < 0) return SCE_SAVEDATA_ERROR_INVALID_USER;
     if (!buffer || offset < 0) return SCE_SAVEDATA_ERROR_PARAMETER;
-    if (memory_size_ == 0 || memory_path_.empty()) return SCE_SAVEDATA_ERROR_MEMORY_NOT_READY;
-    if (static_cast<uint64_t>(offset) + size > memory_size_) return SCE_SAVEDATA_ERROR_PARAMETER;
+    if (size > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
 
-    std::fstream f(memory_path_, std::ios::in | std::ios::out | std::ios::binary);
+    // T156: Validar title_id
+    if (!is_valid_title_id(default_title_id_.c_str())) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
+
+    auto it = user_memories_.find(user);
+    if (it == user_memories_.end()) {
+        std::filesystem::path mem_dir = resolve_savedata_root() / std::to_string(user) / (default_title_id_ + ".memory");
+        std::filesystem::path mem_file = mem_dir / "memory.dat";
+        if (!is_confined_to_savedata_root(mem_dir) || !is_confined_to_savedata_root(mem_file)) {
+            return SCE_SAVEDATA_ERROR_PARAMETER;
+        }
+        std::error_code ec;
+        if (std::filesystem::exists(mem_file, ec)) {
+            auto fsz = std::filesystem::file_size(mem_file, ec);
+            if (!ec && fsz > 0) {
+                it = user_memories_.emplace(user, UserMemoryState{mem_file.string(), static_cast<uint64_t>(fsz)}).first;
+            }
+        }
+    }
+    if (it == user_memories_.end() || it->second.size == 0 || it->second.path.empty()) {
+        return SCE_SAVEDATA_ERROR_MEMORY_NOT_READY;
+    }
+    if (!is_confined_to_savedata_root(it->second.path)) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
+    const uint64_t u_offset = static_cast<uint64_t>(offset);
+    if (u_offset > it->second.size || size > (it->second.size - u_offset)) {
+        return SCE_SAVEDATA_ERROR_PARAMETER;
+    }
+    if (size == 0) return SCE_SAVEDATA_OK;
+
+    std::fstream f(it->second.path, std::ios::in | std::ios::out | std::ios::binary);
     if (!f.is_open()) return SCE_SAVEDATA_ERROR_INTERNAL;
     f.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!f.write(reinterpret_cast<const char *>(buffer), static_cast<std::streamsize>(size))) {
@@ -571,6 +1291,42 @@ int32_t SaveDataManager::set_memory(int32_t user, const void *buffer, uint64_t s
     return f.good() ? SCE_SAVEDATA_OK : SCE_SAVEDATA_ERROR_INTERNAL;
 }
 
+static bool is_confined_to_work_path(const std::string &work_path_str, const std::string &relative_path, std::filesystem::path &out_target) {
+    if (relative_path.empty() || SaveDataManager::contains_traversal(relative_path)) {
+        return false;
+    }
+    std::filesystem::path rel_p(relative_path);
+    if (rel_p.is_absolute() || rel_p.has_root_name() || rel_p.has_root_directory()) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::path work = std::filesystem::weakly_canonical(std::filesystem::path(work_path_str), ec);
+    if (ec || work.empty()) return false;
+
+    std::filesystem::path target = std::filesystem::path(work_path_str) / relative_path;
+    std::filesystem::path canonical_target = std::filesystem::weakly_canonical(target, ec);
+    if (ec || canonical_target.empty()) return false;
+
+    if (std::filesystem::is_symlink(target, ec)) {
+        std::filesystem::path sym_dest = std::filesystem::canonical(target, ec);
+        if (ec) return false;
+        auto sym_rel = std::filesystem::relative(sym_dest, work, ec);
+        auto first_sym = sym_rel.begin() != sym_rel.end() ? sym_rel.begin()->string() : "";
+        if (ec || sym_rel.empty() || sym_rel == "." || first_sym == ".." || sym_rel.is_absolute()) {
+            return false;
+        }
+    }
+
+    auto rel = std::filesystem::relative(canonical_target, work, ec);
+    auto first_elem = rel.begin() != rel.end() ? rel.begin()->string() : "";
+    if (ec || rel.empty() || rel == "." || first_elem == ".." || rel.is_absolute()) {
+        return false;
+    }
+    out_target = target;
+    return true;
+}
+
 int32_t SaveDataManager::write_file(const std::string &mount_point, const std::string &relative_path,
                                     const void *data, std::size_t size, bool atomic) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -578,18 +1334,26 @@ int32_t SaveDataManager::write_file(const std::string &mount_point, const std::s
     int slot_idx = find_slot(mount_point);
     if (slot_idx < 0) return SCE_SAVEDATA_ERROR_NOT_MOUNTED;
     if (slots_[slot_idx].read_only) return SCE_SAVEDATA_ERROR_PARAMETER;
-    if (relative_path.empty() || contains_traversal(relative_path)) {
+    // Rejeitar antes de tocar o filesystem: nullptr com bytes a gravar não é arquivo vazio.
+    if (size > 0 && data == nullptr) return SCE_SAVEDATA_ERROR_PARAMETER;
+
+    std::filesystem::path target;
+    if (!is_confined_to_work_path(slots_[slot_idx].work_path, relative_path, target)) {
         return SCE_SAVEDATA_ERROR_PARAMETER;
     }
-
-    std::filesystem::path target = std::filesystem::path(slots_[slot_idx].work_path) / relative_path;
     std::error_code ec;
     std::size_t old_size = 0;
-    if (std::filesystem::exists(target, ec)) {
-        old_size = static_cast<std::size_t>(std::filesystem::file_size(target, ec));
+    bool exists = std::filesystem::exists(target, ec);
+    if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+    if (exists) {
+        auto fsz = std::filesystem::file_size(target, ec);
+        if (ec) return SCE_SAVEDATA_ERROR_INTERNAL;
+        old_size = static_cast<std::size_t>(fsz);
     }
     std::size_t current_total = calculate_directory_size(slots_[slot_idx].work_path);
-    if (current_total - old_size + size > max_quota_per_slot_) {
+    // T178: Calcular quota sem underflow (current_total < old_size) ou overflow (net_total + size)
+    std::size_t net_total = (current_total >= old_size) ? (current_total - old_size) : 0;
+    if (size > max_quota_per_slot_ || net_total > max_quota_per_slot_ - size) {
         return SCE_SAVEDATA_ERROR_QUOTA_EXCEEDED;
     }
 
@@ -598,7 +1362,11 @@ int32_t SaveDataManager::write_file(const std::string &mount_point, const std::s
     }
 
     if (atomic) {
-        // Protocolo de gravação em 4 fases: tmp -> checksum -> backup -> rename atômico (T025)
+        // Protocolo de gravação em 4 fases: tmp -> checksum -> backup -> rename atômico (T025, T042)
+        if (test_write_failure_phase_ == WriteFailurePhase::TmpWrite) {
+            return SCE_SAVEDATA_ERROR_INTERNAL;
+        }
+
         auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
         std::filesystem::path tmp = target.string() + ".tmp." + std::to_string(ts);
         std::filesystem::path bak = target.string() + ".bak." + std::to_string(ts);
@@ -617,50 +1385,88 @@ int32_t SaveDataManager::write_file(const std::string &mount_point, const std::s
             }
         }
 
-        // Fase 2: Verificação de integridade via checksum CRC32 dos dados gravados
+        // Fase 2: Verificação de integridade dos dados gravados em blocos (T162)
+        if (test_write_failure_phase_ == WriteFailurePhase::Checksum) {
+            std::filesystem::remove(tmp, ec);
+            return SCE_SAVEDATA_ERROR_INTERNAL;
+        }
         if (size > 0 && data) {
             std::ifstream in(tmp, std::ios::binary);
             if (!in.is_open()) {
                 std::filesystem::remove(tmp, ec);
                 return SCE_SAVEDATA_ERROR_INTERNAL;
             }
-            std::vector<uint8_t> verify_buf(size);
-            in.read(reinterpret_cast<char *>(verify_buf.data()), static_cast<std::streamsize>(size));
-            if (!in.good() && !in.eof()) {
-                std::filesystem::remove(tmp, ec);
-                return SCE_SAVEDATA_ERROR_INTERNAL;
-            }
-            uint32_t expected_crc = VirtualFileSystem::compute_crc32(data, size);
-            uint32_t actual_crc = VirtualFileSystem::compute_crc32(verify_buf.data(), verify_buf.size());
-            if (expected_crc != actual_crc) {
-                std::filesystem::remove(tmp, ec);
-                return SCE_SAVEDATA_ERROR_INTERNAL;
+            // T162: Verificação em blocos fixos na stack sem alocação proporcional à quota
+            constexpr std::size_t VERIFY_CHUNK_SIZE = 64 * 1024;
+            std::array<uint8_t, VERIFY_CHUNK_SIZE> chunk;
+            std::size_t bytes_verified = 0;
+            const auto *orig_bytes = static_cast<const uint8_t *>(data);
+
+            while (bytes_verified < size) {
+                std::size_t to_read = std::min(VERIFY_CHUNK_SIZE, size - bytes_verified);
+                in.read(reinterpret_cast<char *>(chunk.data()), static_cast<std::streamsize>(to_read));
+                std::streamsize got = in.gcount();
+                if (got != static_cast<std::streamsize>(to_read)) {
+                    std::filesystem::remove(tmp, ec);
+                    return SCE_SAVEDATA_ERROR_INTERNAL;
+                }
+                if (std::memcmp(chunk.data(), orig_bytes + bytes_verified, to_read) != 0) {
+                    std::filesystem::remove(tmp, ec);
+                    return SCE_SAVEDATA_ERROR_INTERNAL;
+                }
+                bytes_verified += to_read;
             }
         }
 
         // Fase 3: Backup do arquivo de destino existente para .bak
         bool target_existed = std::filesystem::exists(target, ec);
         if (target_existed) {
-            std::filesystem::copy_file(target, bak, std::filesystem::copy_options::overwrite_existing, ec);
-        }
-
-        // Fase 4: Rename atômico de .tmp para target com garantia de rollback
-        std::filesystem::rename(tmp, target, ec);
-        if (ec) {
-            std::filesystem::remove(target, ec);
-            std::filesystem::rename(tmp, target, ec);
-            if (ec) {
-                if (target_existed) {
-                    std::error_code r_ec;
-                    std::filesystem::copy_file(bak, target, std::filesystem::copy_options::overwrite_existing, r_ec);
-                }
+            if (test_write_failure_phase_ == WriteFailurePhase::Backup) {
                 std::filesystem::remove(tmp, ec);
-                std::filesystem::remove(bak, ec);
                 return SCE_SAVEDATA_ERROR_INTERNAL;
+            }
+            std::filesystem::rename(target, bak, ec);
+            if (ec) {
+                std::filesystem::copy_file(target, bak, std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    std::filesystem::remove(tmp, ec);
+                    return SCE_SAVEDATA_ERROR_INTERNAL;
+                }
             }
         }
 
+        // Fase 4: Rename atômico de .tmp para target com garantia de rollback
+        if (test_write_failure_phase_ == WriteFailurePhase::Replacement) {
+            if (target_existed) {
+                std::error_code roll_ec;
+                std::filesystem::rename(bak, target, roll_ec);
+                if (roll_ec) {
+                    std::filesystem::copy_file(bak, target, std::filesystem::copy_options::overwrite_existing, roll_ec);
+                }
+            }
+            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(bak, ec);
+            return SCE_SAVEDATA_ERROR_INTERNAL;
+        }
+
+        std::filesystem::rename(tmp, target, ec);
+        if (ec) {
+            if (target_existed) {
+                std::error_code roll_ec;
+                std::filesystem::rename(bak, target, roll_ec);
+                if (roll_ec) {
+                    std::filesystem::copy_file(bak, target, std::filesystem::copy_options::overwrite_existing, roll_ec);
+                }
+            }
+            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(bak, ec);
+            return SCE_SAVEDATA_ERROR_INTERNAL;
+        }
+
         // Limpeza do backup após rename com sucesso
+        if (target_existed) {
+            std::filesystem::remove(bak, ec);
+        }
         std::filesystem::remove(bak, ec);
     } else {
         std::ofstream out(target, std::ios::binary | std::ios::trunc);
@@ -680,11 +1486,12 @@ int32_t SaveDataManager::read_file(const std::string &mount_point, const std::st
     if (!initialized_) return SCE_SAVEDATA_ERROR_NOT_INITIALIZED;
     int slot_idx = find_slot(mount_point);
     if (slot_idx < 0) return SCE_SAVEDATA_ERROR_NOT_MOUNTED;
-    if (relative_path.empty() || contains_traversal(relative_path)) {
+
+    std::filesystem::path target;
+    if (!is_confined_to_work_path(slots_[slot_idx].work_path, relative_path, target)) {
         return SCE_SAVEDATA_ERROR_PARAMETER;
     }
 
-    std::filesystem::path target = std::filesystem::path(slots_[slot_idx].work_path) / relative_path;
     std::ifstream file(target, std::ios::binary | std::ios::ate);
     if (!file.is_open()) return SCE_SAVEDATA_ERROR_NOT_FOUND;
     auto size = file.tellg();
@@ -704,11 +1511,12 @@ int32_t SaveDataManager::remove_file(const std::string &mount_point, const std::
     int slot_idx = find_slot(mount_point);
     if (slot_idx < 0) return SCE_SAVEDATA_ERROR_NOT_MOUNTED;
     if (slots_[slot_idx].read_only) return SCE_SAVEDATA_ERROR_PARAMETER;
-    if (relative_path.empty() || contains_traversal(relative_path)) {
+
+    std::filesystem::path target;
+    if (!is_confined_to_work_path(slots_[slot_idx].work_path, relative_path, target)) {
         return SCE_SAVEDATA_ERROR_PARAMETER;
     }
 
-    std::filesystem::path target = std::filesystem::path(slots_[slot_idx].work_path) / relative_path;
     std::error_code ec;
     if (!std::filesystem::exists(target, ec)) {
         return SCE_SAVEDATA_ERROR_NOT_FOUND;
@@ -722,9 +1530,12 @@ bool SaveDataManager::file_exists(const std::string &mount_point, const std::str
     if (!initialized_) return false;
     int slot_idx = find_slot(mount_point);
     if (slot_idx < 0) return false;
-    if (relative_path.empty() || contains_traversal(relative_path)) return false;
 
-    std::filesystem::path target = std::filesystem::path(slots_[slot_idx].work_path) / relative_path;
+    std::filesystem::path target;
+    if (!is_confined_to_work_path(slots_[slot_idx].work_path, relative_path, target)) {
+        return false;
+    }
+
     std::error_code ec;
     return std::filesystem::exists(target, ec);
 }
@@ -842,6 +1653,11 @@ bool SaveDataManager::pattern_matches(const std::string &str, const std::string 
     return it_p == pattern.end();
 }
 
+void SaveDataManager::set_sound_hack_enabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sound_hack_enabled_ = enabled;
+}
+
 void SaveDataManager::apply_bloodborne_sound_hack(const std::string &work_path) {
     const char *env = std::getenv("BB_SOUND_HACK");
     if (env && env[0] == '0') return;
@@ -864,6 +1680,66 @@ void SaveDataManager::apply_bloodborne_sound_hack(const std::string &work_path) 
         f.write(&flag, 1);
         f.flush();
     }
+}
+
+std::string SaveDataManager::compute_directory_sha256(const std::filesystem::path &dir_path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(dir_path, ec) || !std::filesystem::is_directory(dir_path, ec)) {
+        Sha256 hasher;
+        return hasher.finalize();
+    }
+
+    std::vector<std::filesystem::path> paths;
+    for (const auto &entry : std::filesystem::recursive_directory_iterator(dir_path, ec)) {
+        if (entry.is_regular_file(ec)) {
+            paths.push_back(entry.path());
+        }
+    }
+    std::sort(paths.begin(), paths.end());
+
+    Sha256 hasher;
+    for (const auto &p : paths) {
+        std::string rel = std::filesystem::relative(p, dir_path, ec).generic_string();
+        hasher.update(rel.data(), rel.size());
+        std::ifstream in(p, std::ios::binary);
+        if (in.is_open()) {
+            char buf[4096];
+            while (in.read(buf, sizeof(buf))) {
+                hasher.update(buf, in.gcount());
+            }
+            if (in.gcount() > 0) {
+                hasher.update(buf, in.gcount());
+            }
+        }
+    }
+    return hasher.finalize();
+}
+
+bool SaveDataManager::write_checksum(const std::filesystem::path &meta_dir, const std::string &checksum) {
+    std::error_code ec;
+    std::filesystem::create_directories(meta_dir, ec);
+    if (ec) return false;
+    std::filesystem::path chk_file = meta_dir / "checksum.sha256";
+    std::ofstream out(chk_file, std::ios::trunc);
+    if (!out.is_open()) return false;
+    out << checksum << "\n";
+    return out.good();
+}
+
+bool SaveDataManager::verify_checksum(const std::filesystem::path &host_dir, const std::filesystem::path &meta_dir) {
+    std::filesystem::path chk_file = meta_dir / "checksum.sha256";
+    std::error_code ec;
+    if (!std::filesystem::exists(chk_file, ec)) {
+        return true;
+    }
+    std::ifstream in(chk_file);
+    if (!in.is_open()) return false;
+    std::string expected;
+    in >> expected;
+    if (expected.empty()) return true;
+
+    std::string actual = compute_directory_sha256(host_dir);
+    return actual == expected;
 }
 
 } // namespace bb

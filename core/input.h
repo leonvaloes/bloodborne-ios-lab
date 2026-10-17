@@ -3,9 +3,17 @@
 
 #include <cstdint>
 #include <mutex>
+#include <array>
 #include "guest_memory.h"
 
 namespace bb {
+
+// Origem da entrada (Touch virtual x Gamepad físico)
+enum class InputSource : std::uint8_t {
+    Touch = 0,
+    Gamepad = 1,
+    Count = 2
+};
 
 // Códigos de botões padrão DualShock 4 / PS4
 enum PadButtons : std::uint32_t {
@@ -43,16 +51,19 @@ class InputManager {
 public:
     InputManager();
 
-    void set_button(std::uint32_t button, bool pressed);
-    void set_buttons_mask(std::uint32_t mask);
-    void set_left_stick(float x, float y);
-    void set_right_stick(float x, float y);
-    void set_triggers(float l2, float r2);
+    void set_button(std::uint32_t button, bool pressed, InputSource source = InputSource::Gamepad);
+    void set_buttons_mask(std::uint32_t mask, InputSource source = InputSource::Gamepad);
+    void set_left_stick(float x, float y, InputSource source = InputSource::Gamepad);
+    void set_right_stick(float x, float y, InputSource source = InputSource::Gamepad);
+    void set_triggers(float l2, float r2, InputSource source = InputSource::Gamepad);
     void set_connected(bool connected);
+    void set_connected(bool connected, InputSource source);
     void set_deadzone(float deadzone);
-    void set_pad_state(const PadData &state);
+    void set_pad_state(const PadData &state, InputSource source = InputSource::Gamepad);
+    void clear_source(InputSource source);
 
     PadData poll() const;
+    PadData poll_source(InputSource source) const;
     void reset();
 
     // HLE: Escreve estrutura ScePadData formatada para a memória guest
@@ -62,9 +73,20 @@ public:
     static float apply_deadzone(float val, float threshold);
     static void apply_radial_deadzone(float in_x, float in_y, float threshold, float &out_x, float &out_y);
 
+    // Multi-controller identity tracking (T113 / FR-007)
+    bool register_controller(std::uint64_t controller_id);
+    bool unregister_controller(std::uint64_t controller_id);
+    bool set_active_controller(std::uint64_t controller_id);
+    std::uint64_t active_controller_id() const;
+    std::size_t connected_controllers_count() const;
+    bool is_controller_active(std::uint64_t controller_id) const;
+
 private:
     mutable std::mutex mutex_;
-    PadData state_;
+    std::array<PadData, static_cast<std::size_t>(InputSource::Count)> sources_{};
+    std::vector<std::uint64_t> registered_controllers_;
+    std::uint64_t active_controller_id_{0};
+    bool connected_{true};
     float deadzone_{0.15f};
 };
 

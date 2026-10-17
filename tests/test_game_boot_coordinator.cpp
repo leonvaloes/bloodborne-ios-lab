@@ -10,6 +10,9 @@
 #include <iostream>
 #include <memory>
 #include <algorithm>
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 namespace {
 
@@ -648,6 +651,224 @@ int main() { return run([] {
         input.set_button(PAD_CROSS, true);
         auto pad_data = coordinator.runtime()->pad_manager().format_pad_data(input.poll());
         CHECK(pad_data.buttons & PAD_CROSS);
+
+        // T073: Template TLS registrado no runtime HLE a partir do eboot
+        CHECK(coordinator.runtime()->tls_template().filesz == coordinator.image().tls.filesz);
+        CHECK(coordinator.runtime()->tls_template().memsz == coordinator.image().tls.memsz);
+        CHECK(coordinator.runtime()->tls_template().filesz == 4);
+        CHECK(coordinator.runtime()->tls_template().memsz == 16);
+    }
+
+    // ========================================================================
+    // 9. T072: Captura de exceção em step() e transição para BootState::error
+    // ========================================================================
+    {
+        std::cout << "[test_game_boot_coordinator] 9. Testando captura de excecao no step()...\n";
+        std::filesystem::path test_dir = sandbox / "exception_trap_boot";
+        std::filesystem::create_directories(test_dir / "dvdroot_ps4", ec);
+
+        auto essential_assets = create_essential_assets_payload();
+        CHECK(create_synthetic_bhd5_bdt(test_dir / "dvdroot_ps4" / "data0.bhd5",
+                                        test_dir / "dvdroot_ps4" / "data0.bdt",
+                                        essential_assets));
+
+        // eboot.bin com import para símbolo desconhecido gerando exceção no runtime HLE
+        auto eboot_bytes = synthesize_elf(false, true, "");
+        // Altera apenas o NID (11 bytes), mantendo os sufixos #B#B intactos
+        std::memcpy(eboot_bytes.data() + 0x800 + 13, "UNRESOLV111", 11);
+        std::ofstream elf_out(test_dir / "eboot.elf", std::ios::binary);
+        elf_out.write(reinterpret_cast<const char*>(eboot_bytes.data()), eboot_bytes.size());
+        elf_out.close();
+
+        GameBootCoordinator coordinator;
+        BootConfig config;
+        config.base_dir = test_dir.string();
+
+        CHECK(coordinator.initialize(config));
+        CHECK(coordinator.state() == BootState::modules_initialized);
+
+        // Executar step(): o import desconhecido lança std::runtime_error("import não implementado")
+        // O coordenador não deixa vazar exceção, capturando e definindo BootState::error
+        std::uint64_t steps = coordinator.step(50);
+        CHECK(steps > 0);
+        CHECK(coordinator.state() == BootState::error);
+        CHECK(coordinator.diagnostics().last_error.find("import não implementado") != std::string::npos);
+    }
+
+    // ========================================================================
+    // 10. T091: Snapshot seguro de GameBootCoordinator::diagnostics() concorrente
+    // ========================================================================
+    {
+        std::cout << "[test_game_boot_coordinator] 10. Testando snapshot concorrente de diagnostics()...\n";
+        std::filesystem::path test_dir = sandbox / "concurrent_diag_boot";
+        std::filesystem::create_directories(test_dir / "dvdroot_ps4", ec);
+
+        auto essential_assets = create_essential_assets_payload();
+        CHECK(create_synthetic_bhd5_bdt(test_dir / "dvdroot_ps4" / "data0.bhd5",
+                                        test_dir / "dvdroot_ps4" / "data0.bdt",
+                                        essential_assets));
+
+        // Loop x86-64 com 50.000 iteracoes:
+        // 0: 48 c7 c1 50 c3 00 00  ; mov rcx, 50000
+        // 7: 48 83 e9 01           ; sub rcx, 1
+        // 11: 75 fa                ; jnz -6 (to 7)
+        // 13: 48 c7 c0 64 00 00 00 ; mov rax, 100
+        // 20: c3                   ; ret
+        Bytes elf = synthesize_elf(false, false);
+        const std::uint8_t loop_code[] = {
+            0x48, 0xc7, 0xc1, 0x50, 0xc3, 0x00, 0x00,
+            0x48, 0x83, 0xe9, 0x01,
+            0x75, 0xfa,
+            0x48, 0xc7, 0xc0, 0x64, 0x00, 0x00, 0x00,
+            0xc3
+        };
+        std::memcpy(elf.data() + 0x400, loop_code, sizeof(loop_code));
+
+        std::ofstream eboot_out(test_dir / "eboot.bin", std::ios::binary);
+        eboot_out.write(reinterpret_cast<const char*>(elf.data()), elf.size());
+        eboot_out.close();
+
+        GameBootCoordinator coordinator;
+        BootConfig config;
+        config.base_dir = test_dir.string();
+
+        CHECK(coordinator.initialize(config));
+        CHECK(coordinator.state() == BootState::modules_initialized);
+
+        std::atomic<bool> worker_done{false};
+        std::atomic<std::uint64_t> total_stepped{0};
+
+        std::thread worker([&]() {
+            while (!worker_done.load(std::memory_order_relaxed)) {
+                std::uint64_t s = coordinator.step(500);
+                total_stepped.fetch_add(s, std::memory_order_relaxed);
+                if (coordinator.state() == BootState::halted || coordinator.state() == BootState::error) {
+                    break;
+                }
+            }
+        });
+
+        // Amostragem concorrente pelo "thread da UI"
+        std::size_t sample_count = 0;
+        for (int i = 0; i < 200; ++i) {
+            auto diag = coordinator.diagnostics();
+            CHECK(diag.state == BootState::modules_initialized ||
+                  diag.state == BootState::running ||
+                  diag.state == BootState::halted);
+            CHECK(!diag.summary().empty());
+            CHECK(diag.guest_budget_bytes > 0);
+            ++sample_count;
+            if (i == 50) {
+                coordinator.pause();
+                CHECK(coordinator.is_paused());
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                coordinator.resume();
+                CHECK(!coordinator.is_paused());
+            }
+            std::this_thread::yield();
+        }
+
+        worker_done.store(true, std::memory_order_relaxed);
+        worker.join();
+
+        auto final_diag = coordinator.diagnostics();
+        CHECK(final_diag.total_steps > 0);
+        CHECK(sample_count == 200);
+        std::cout << "[test_game_boot_coordinator] Concorrencia validada: " << sample_count
+                  << " amostras colhidas com sucesso durante " << final_diag.total_steps << " passos de CPU.\n";
+    }
+
+    // ========================================================================
+    // 11. T045: Validacao de subdiretorio de Documentos no iOS (dvdroot_ps4 aninhado)
+    // ========================================================================
+    {
+        std::cout << "[test_game_boot_coordinator] 11. Testando descoberta de dvdroot_ps4 em subpasta...\n";
+        std::filesystem::path test_dir = sandbox / "nested_documents_boot";
+        std::filesystem::path sub_game_dir = test_dir / "Bloodborne" / "dvdroot_ps4";
+        std::filesystem::create_directories(sub_game_dir, ec);
+
+        auto essential_assets = create_essential_assets_payload();
+        CHECK(create_synthetic_bhd5_bdt(sub_game_dir / "data0.bhd5",
+                                        sub_game_dir / "data0.bdt",
+                                        essential_assets));
+
+        auto eboot_bytes = synthesize_elf(false, false);
+        std::ofstream eboot_out(test_dir / "eboot.bin", std::ios::binary);
+        eboot_out.write(reinterpret_cast<const char*>(eboot_bytes.data()), eboot_bytes.size());
+        eboot_out.close();
+
+        GameBootCoordinator coordinator;
+        BootConfig config;
+        config.base_dir = test_dir.string();
+
+        CHECK(coordinator.initialize(config));
+        CHECK(coordinator.state() == BootState::modules_initialized);
+        CHECK(coordinator.vfs().is_mounted("/dvdroot"));
+        CHECK(coordinator.package_report().valid);
+        CHECK(coordinator.package_report().essential_files_found.size() == 6);
+
+        std::vector<std::uint8_t> asset_data;
+        CHECK(coordinator.vfs().read_file("/dvdroot/param/gameparam.parambnd.dcx", asset_data) == VfsError::ok);
+        CHECK(!asset_data.empty());
+
+        CHECK(coordinator.step(50) >= 2);
+        CHECK(coordinator.state() == BootState::halted);
+        std::cout << "[test_game_boot_coordinator] Descoberta transparente de subdiretorio validada com sucesso.\n";
+    }
+
+    // ========================================================================
+    // 12. T115: Preservar alteracoes de save montado ao reiniciar (reset)
+    // ========================================================================
+    {
+        std::cout << "[test_game_boot_coordinator] 12. Testando preservacao de save em reset()...\n";
+        std::filesystem::path test_dir = sandbox / "reset_save_preservation";
+        std::filesystem::create_directories(test_dir / "dvdroot_ps4", ec);
+
+        auto essential_assets = create_essential_assets_payload();
+        CHECK(create_synthetic_bhd5_bdt(test_dir / "dvdroot_ps4" / "data0.bhd5",
+                                        test_dir / "dvdroot_ps4" / "data0.bdt",
+                                        essential_assets));
+
+        auto eboot_bytes = synthesize_elf(false, false);
+        std::ofstream eboot_out(test_dir / "eboot.bin", std::ios::binary);
+        eboot_out.write(reinterpret_cast<const char*>(eboot_bytes.data()), eboot_bytes.size());
+        eboot_out.close();
+
+        GameBootCoordinator coordinator;
+        BootConfig config;
+        config.base_dir = test_dir.string();
+
+        CHECK(coordinator.initialize(config));
+        CHECK(coordinator.state() == BootState::modules_initialized);
+        CHECK(coordinator.vfs().is_mounted("/savedata0"));
+
+        // Escreve dados no save montado sem desmontar explicitamente
+        const std::string dirty_payload = "DIRTY_HUNTER_SAVE_TO_BE_PRESERVED_ON_RESET";
+        CHECK(SaveDataManager::instance().write_file("/savedata0", "userdata0010",
+                                                     dirty_payload.data(), dirty_payload.size()) == SCE_SAVEDATA_OK);
+
+        // Reinicia o coordenador chamando reset() diretamente
+        coordinator.reset();
+        CHECK(coordinator.state() == BootState::not_started);
+
+        // O arquivo persistente no disco DEVE conter as alterações salvas por commit seguro
+        std::filesystem::path persistent_save = test_dir / "savedata" / "0" / "CUSA03173" / "SPRJ0001" / "userdata0010";
+        CHECK(std::filesystem::exists(persistent_save));
+        {
+            std::ifstream ifs(persistent_save, std::ios::binary);
+            std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            CHECK(content == dirty_payload);
+        }
+
+        // Re-inicializa e verifica que os dados persistem e foram montados
+        CHECK(coordinator.initialize(config));
+        CHECK(coordinator.state() == BootState::modules_initialized);
+        std::vector<uint8_t> reloaded;
+        CHECK(SaveDataManager::instance().read_file("/savedata0", "userdata0010", reloaded) == SCE_SAVEDATA_OK);
+        CHECK(std::string(reinterpret_cast<char*>(reloaded.data()), reloaded.size()) == dirty_payload);
+
+        coordinator.reset();
+        std::cout << "[test_game_boot_coordinator] Preservacao de save em reset() validada com sucesso.\n";
     }
 
     std::filesystem::remove_all(sandbox, ec);

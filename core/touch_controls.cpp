@@ -105,6 +105,18 @@ TouchControlsOverlay::TouchControlsOverlay(InputManager* input, const ScreenLayo
 
 void TouchControlsOverlay::set_screen_layout(const ScreenLayoutConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!std::isfinite(config.width) || config.width <= 0.0f ||
+        !std::isfinite(config.height) || config.height <= 0.0f ||
+        !std::isfinite(config.safe_left) || config.safe_left < 0.0f ||
+        !std::isfinite(config.safe_right) || config.safe_right < 0.0f ||
+        !std::isfinite(config.safe_top) || config.safe_top < 0.0f ||
+        !std::isfinite(config.safe_bottom) || config.safe_bottom < 0.0f ||
+        (config.safe_left + config.safe_right >= config.width) ||
+        (config.safe_top + config.safe_bottom >= config.height)) {
+        std::fprintf(stderr, "[TouchControls] Invalid screen layout rejected: %.2fx%.2f safe=(%.2f, %.2f, %.2f, %.2f)\n",
+                     config.width, config.height, config.safe_left, config.safe_right, config.safe_top, config.safe_bottom);
+        return;
+    }
     layout_ = config;
     recalculate_layout_locked();
 }
@@ -219,10 +231,11 @@ void TouchControlsOverlay::recalculate_layout_locked() {
     buttons_.push_back({VirtualControlId::ButtonR1, TouchCircle{sr - 45.0f, st + 35.0f, 26.0f}, PAD_R1, false, 0});
     buttons_.push_back({VirtualControlId::ButtonR2, TouchCircle{sr - 115.0f, st + 35.0f, 26.0f}, PAD_R2, false, 0});
 
-    // 4. Lock-on (R3), L3 e Options
-    buttons_.push_back({VirtualControlId::ButtonR3,      TouchCircle{sr - 250.0f, st + 140.0f, 25.0f}, PAD_R3, false, 0});
-    buttons_.push_back({VirtualControlId::ButtonL3,      TouchCircle{sl + 185.0f, st + 35.0f, 22.0f}, PAD_L3, false, 0});
-    buttons_.push_back({VirtualControlId::ButtonOptions, TouchCircle{layout_.width * 0.5f, st + 30.0f, 22.0f}, PAD_OPTIONS, false, 0});
+    // 4. Lock-on (R3), L3, Options e TouchPad
+    buttons_.push_back({VirtualControlId::ButtonR3,       TouchCircle{sr - 250.0f, st + 140.0f, 25.0f}, PAD_R3, false, 0});
+    buttons_.push_back({VirtualControlId::ButtonL3,       TouchCircle{sl + 185.0f, st + 35.0f, 22.0f}, PAD_L3, false, 0});
+    buttons_.push_back({VirtualControlId::ButtonOptions,  TouchCircle{layout_.width * 0.5f + 40.0f, st + 30.0f, 20.0f}, PAD_OPTIONS, false, 0});
+    buttons_.push_back({VirtualControlId::ButtonTouchPad, TouchCircle{layout_.width * 0.5f - 40.0f, st + 30.0f, 22.0f}, PAD_TOUCH_PAD, false, 0});
 }
 
 TouchCircle TouchControlsOverlay::get_control_bounds(VirtualControlId id) const {
@@ -569,7 +582,7 @@ PadData TouchControlsOverlay::get_pad_state() const {
 void TouchControlsOverlay::update_pad(InputManager& input) const {
     std::lock_guard<std::mutex> lock(mutex_);
     input.set_deadzone(0.0f);
-    input.set_pad_state(state_);
+    input.set_pad_state(state_, InputSource::Touch);
 }
 
 void TouchControlsOverlay::set_pad_state(InputManager& input) const {
@@ -597,7 +610,7 @@ InputManager* TouchControlsOverlay::get_input_manager() const {
 
 void TouchControlsOverlay::sync_input_manager_locked() {
     if (input_manager_ != nullptr) {
-        input_manager_->set_pad_state(state_);
+        input_manager_->set_pad_state(state_, InputSource::Touch);
     }
 }
 

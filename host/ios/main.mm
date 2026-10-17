@@ -2,6 +2,7 @@
 #import <MetalKit/MetalKit.h>
 #import <GameController/GameController.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AVKit/AVKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <TargetConditionals.h>
 #include "smoke.h"
@@ -17,6 +18,8 @@
 #include "video_out.h"
 #include "touch_controls.h"
 #include "pacing_tracker.h"
+#include "dialog_hle.h"
+#include "gnm_metal_bridge.h"
 #include <exception>
 #include <sys/utsname.h>
 #include <simd/simd.h>
@@ -45,6 +48,8 @@
 @interface LabController : UIViewController <MTKViewDelegate>
 - (void)handleTouchId:(uint64_t)tid x:(float)x y:(float)y phase:(bb::TouchPhase)phase;
 - (void)fillAudioBuffer:(AudioQueueBufferRef)buffer;
+- (BOOL)handleGnmDrawCalls:(const std::vector<bb::DrawCall>&)draws;
+- (BOOL)handleGnmDispatchCalls:(const std::vector<bb::DispatchCall>&)dispatches;
 @end
 
 @implementation LabMTKView
@@ -92,6 +97,14 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     }
 }
 
+// Motivos de pausa distintos para governança de ciclo de vida (T112 / FR-010)
+enum PauseReason : uint32_t {
+    PauseReasonNone       = static_cast<uint32_t>(bb::PauseReason::none),
+    PauseReasonUser       = static_cast<uint32_t>(bb::PauseReason::user),
+    PauseReasonLifecycle  = static_cast<uint32_t>(bb::PauseReason::lifecycle),
+    PauseReasonDisconnect = static_cast<uint32_t>(bb::PauseReason::disconnect),
+};
+
 @implementation LabController {
     // Componentes de interface do jogo
     LabMTKView *_metal;
@@ -117,11 +130,30 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 
     // Estado de execução do motor
     BOOL _continuousExecution;
+    uint32_t _pauseReasons;
+    __weak GCController *_activeController;
     std::unique_ptr<bb::GameBootCoordinator> _bootCoordinator;
     bb::VideoOutManager _videoOutManager;
     struct GuestFlipSink : bb::VideoOutSink {
         void on_flip(const bb::FlipEvent&) override {}
     } _guestFlipSink;
+    class HostGnmSubmissionBridge : public bb::GnmSubmissionListener {
+    public:
+        explicit HostGnmSubmissionBridge(LabController *ctrl) : _ctrl(ctrl) {}
+        bool on_draw_calls(const std::vector<bb::DrawCall>& draws) override {
+            if (draws.empty()) return true;
+            LabController *s = _ctrl;
+            return s ? [s handleGnmDrawCalls:draws] : false;
+        }
+        bool on_dispatch_calls(const std::vector<bb::DispatchCall>& dispatches) override {
+            if (dispatches.empty()) return true;
+            LabController *s = _ctrl;
+            return s ? [s handleGnmDispatchCalls:dispatches] : false;
+        }
+    private:
+        __weak LabController *_ctrl;
+    };
+    std::unique_ptr<HostGnmSubmissionBridge> _gnmBridgeListener;
     bb::InputManager _inputManager;
     bb::TouchControlsOverlay _touchOverlay;
     dispatch_queue_t _guestExecutionQueue;
@@ -133,6 +165,9 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     std::atomic<std::uint32_t> _guestTriangles;
     std::atomic<std::uint64_t> _guestRasterizerFailures;
     std::atomic<int> _guestLastRasterizerStatus;
+    std::atomic<std::uint32_t> _guestCpuSliceBudget;
+    std::atomic<std::uint32_t> _guestCpuRescheduleDelayMs;
+    NSString *_selectedSaveSlot;
 
     // Subsistema Metal 3
     id<MTLCommandQueue> _queue;
@@ -209,6 +244,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _guestTriangles.store(0);
     _guestRasterizerFailures.store(0);
     _guestLastRasterizerStatus.store(static_cast<int>(bb::RasterizerStatus::Ok));
+    _guestCpuSliceBudget.store(50000);
+    _guestCpuRescheduleDelayMs.store(0);
     _guestExecutionQueue = dispatch_queue_create("org.bloodborne.lab.guest", DISPATCH_QUEUE_SERIAL);
     _touchOverlay.bind_input_manager(&_inputManager);
     _touchOverlay.set_left_stick_mode(bb::StickMode::Floating);
@@ -230,6 +267,22 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     [self setupGameControllers];
     [self setupAudio];
     [self setupLifecycleAndThermalMonitoring];
+    [self setupDialogIntegration];
+
+    // Callback de descarte de emergência sob pressão de memória Jetsam (T043 / FR-009)
+    __weak LabController *weakSelf = self;
+    _memoryMonitor.register_trim_callback([weakSelf]() {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LabController *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (strongSelf->_metal.paused || !strongSelf->_continuousExecution) {
+                strongSelf->_guestScreenTexture = nil;
+            }
+            bb::gnm_bridge_clear_caches();
+            bb::AudioOutManager::instance().purge_inactive_buffers();
+            strongSelf->_report[@"memory_trimmed"] = @YES;
+        });
+    });
 
     // Adia o auto-boot até a próxima passagem do loop principal. A inicialização
     // síncrona dos módulos ainda pode bloquear a interface: limite conhecido.
@@ -247,6 +300,90 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     err.numberOfLines = 0;
     err.font = [UIFont boldSystemFontOfSize:18];
     [self.view addSubview:err];
+}
+
+- (void)setupDialogIntegration {
+    __weak typeof(self) weakSelf = self;
+    bb::default_dialog_manager().set_msg_dialog_callback([weakSelf](const bb::MsgDialogRequest& req) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.isViewLoaded || strongSelf.view.window == nil) {
+                // Se a UI não estiver disponível ou app em background, responder headless
+                // para não travar o guest thread indefinidamente
+                bb::default_dialog_manager().submit_msg_result(bb::SceMsgDialogButtonId::OK);
+                return;
+            }
+            NSString *msg = [NSString stringWithUTF8String:req.message.c_str()];
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Bloodborne"
+                                                                           message:msg
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            switch (req.button_type) {
+                case bb::SceMsgDialogButtonType::YESNO: {
+                    [alert addAction:[UIAlertAction actionWithTitle:@"Sim" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                        bb::default_dialog_manager().submit_msg_result(bb::SceMsgDialogButtonId::YES);
+                    }]];
+                    [alert addAction:[UIAlertAction actionWithTitle:@"Não" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+                        bb::default_dialog_manager().submit_msg_result(bb::SceMsgDialogButtonId::NO);
+                    }]];
+                    break;
+                }
+                case bb::SceMsgDialogButtonType::OK_CANCEL: {
+                    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                        bb::default_dialog_manager().submit_msg_result(bb::SceMsgDialogButtonId::OK);
+                    }]];
+                    [alert addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+                        bb::default_dialog_manager().submit_msg_result(bb::SceMsgDialogButtonId::CANCEL);
+                    }]];
+                    break;
+                }
+                case bb::SceMsgDialogButtonType::RETRY_CANCEL: {
+                    [alert addAction:[UIAlertAction actionWithTitle:@"Tentar Novamente" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                        bb::default_dialog_manager().submit_msg_result(bb::SceMsgDialogButtonId::RETRY);
+                    }]];
+                    [alert addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+                        bb::default_dialog_manager().submit_msg_result(bb::SceMsgDialogButtonId::CANCEL);
+                    }]];
+                    break;
+                }
+                case bb::SceMsgDialogButtonType::OK:
+                default: {
+                    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                        bb::default_dialog_manager().submit_msg_result(bb::SceMsgDialogButtonId::OK);
+                    }]];
+                    break;
+                }
+            }
+            [strongSelf presentViewController:alert animated:YES completion:nil];
+        });
+    });
+
+    bb::default_dialog_manager().set_ime_dialog_callback([weakSelf](const bb::ImeDialogRequest& req) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.isViewLoaded || strongSelf.view.window == nil) {
+                // Responde com o texto inicial para evitar trava do guest thread
+                bb::default_dialog_manager().submit_ime_result(req.initial_text, bb::SCE_IME_DIALOG_END_STATUS_OK);
+                return;
+            }
+            NSString *title = [NSString stringWithUTF8String:req.title.c_str()];
+            NSString *initialText = [NSString stringWithUTF8String:req.initial_text.c_str()];
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:title.length ? title : @"Entrada de Texto"
+                                                                           message:@"Digite o texto solicitado pelo jogo:"
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+                textField.text = initialText;
+            }];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Confirmar" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                UITextField *field = alert.textFields.firstObject;
+                std::string resText = field && field.text ? [field.text UTF8String] : req.initial_text;
+                bb::default_dialog_manager().submit_ime_result(resText, bb::SCE_IME_DIALOG_END_STATUS_OK);
+            }]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+                bb::default_dialog_manager().submit_ime_result("", bb::SCE_IME_DIALOG_END_STATUS_USER_CANCELED);
+            }]];
+            [strongSelf presentViewController:alert animated:YES completion:nil];
+        });
+    });
 }
 
 #pragma mark - Metal View & Pipeline
@@ -578,7 +715,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     UIButton *btnLeft = [self createHudButtonWithTitle:@"◀" width:46 height:46 radius:10 fontSize:16];
     UIButton *btnRight = [self createHudButtonWithTitle:@"▶" width:46 height:46 radius:10 fontSize:16];
 
-    UIView *dpadContainer = [UIView new];
+    PassThroughView *dpadContainer = [PassThroughView new];
     dpadContainer.translatesAutoresizingMaskIntoConstraints = NO;
     [dpadContainer addSubview:btnUp];
     [dpadContainer addSubview:btnDown];
@@ -619,7 +756,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     UIButton *btnCircle = [self createHudButtonWithTitle:@"●" width:48 height:48 radius:24 fontSize:18];
     [btnCircle setTitleColor:[UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:1.0] forState:UIControlStateNormal];
 
-    UIView *actionsContainer = [UIView new];
+    PassThroughView *actionsContainer = [PassThroughView new];
     actionsContainer.translatesAutoresizingMaskIntoConstraints = NO;
     [actionsContainer addSubview:btnTriangle];
     [actionsContainer addSubview:btnCross];
@@ -646,13 +783,14 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         [btnCircle.trailingAnchor constraintEqualToAnchor:actionsContainer.trailingAnchor]
     ]];
 
-    // Botões utilitários centrais (L3, R3, Options)
+    // Botões utilitários centrais (L3, Touchpad, Options, R3)
     UIButton *btnL3 = [self createHudButtonWithTitle:@"L3" width:40 height:32 radius:8 fontSize:12];
-    UIButton *btnR3 = [self createHudButtonWithTitle:@"R3" width:40 height:32 radius:8 fontSize:12];
+    UIButton *btnTouchpad = [self createHudButtonWithTitle:@"TOUCH" width:56 height:32 radius:8 fontSize:12];
     UIButton *btnOpt = [self createHudButtonWithTitle:@"OPT" width:46 height:32 radius:8 fontSize:12];
+    UIButton *btnR3 = [self createHudButtonWithTitle:@"R3" width:40 height:32 radius:8 fontSize:12];
 
-    UIStackView *middleRow = [[UIStackView alloc] initWithArrangedSubviews:@[btnL3, btnOpt, btnR3]];
-    middleRow.spacing = 14;
+    UIStackView *middleRow = [[UIStackView alloc] initWithArrangedSubviews:@[btnL3, btnTouchpad, btnOpt, btnR3]];
+    middleRow.spacing = 10;
     middleRow.translatesAutoresizingMaskIntoConstraints = NO;
     [_controlsOverlay addSubview:middleRow];
 
@@ -702,6 +840,13 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     drawerTitle.textColor = [UIColor colorWithRed:0.95 green:0.85 blue:0.65 alpha:1.0];
     drawerTitle.text = @"⚔ Painel Bloodborne iOS — Controle e Diagnóstico";
     drawerTitle.textAlignment = NSTextAlignmentCenter;
+
+    UIButton *newGameBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [newGameBtn setTitle:@"🩸 Novo Jogo / Introdução (Vídeo & Criação)" forState:UIControlStateNormal];
+    newGameBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    newGameBtn.backgroundColor = [UIColor colorWithRed:0.75 green:0.15 blue:0.15 alpha:0.35];
+    newGameBtn.layer.cornerRadius = 8;
+    [newGameBtn addTarget:self action:@selector(startNewGameWithIntro) forControlEvents:UIControlEventTouchUpInside];
 
     _gameBootButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_gameBootButton setTitle:@"▶ Iniciar / Reiniciar Motor Bloodborne (Auto)" forState:UIControlStateNormal];
@@ -789,7 +934,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     _bootStatus = [UILabel new]; _bootStatus.numberOfLines = 0;
 
     UIStackView *drawerStack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        drawerTitle, _gameBootButton, _continueSaveButton, _continuousButton, toggleControlsBtn,
+        drawerTitle, newGameBtn, _gameBootButton, _continueSaveButton, _continuousButton, toggleControlsBtn,
         verifyDocsBtn, runTestsBtn, exportBtn, closeBtn,
         _gameBootStatus, _status, _gpuStatus, _subsystemStatus
     ]];
@@ -832,7 +977,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     NSURL *documents = [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
     NSString *saveDir = [documents.path stringByAppendingPathComponent:@"savedata"];
 
-    auto& sm = bb::SaveDataManager::instance();
+    auto& sm = _bootCoordinator ? _bootCoordinator->save_manager() : bb::SaveDataManager::instance();
     if (!sm.is_initialized()) {
         sm.initialize(saveDir.UTF8String, 16 * 1024 * 1024);
     }
@@ -847,9 +992,28 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     }
 
     const auto& latest = entries[0];
+    _selectedSaveSlot = [NSString stringWithUTF8String:latest.dir_name.c_str()];
     std::string mountPt;
     uint32_t status = 0;
     int32_t mRet = sm.mount(0, "CUSA03173", latest.dir_name.c_str(), SCE_SAVEDATA_MOUNT_MODE_RDWR, 8192, mountPt, status);
+    if (mRet == SCE_SAVEDATA_ERROR_BAD_MOUNTED) {
+        for (std::size_t i = 0; i < bb::SaveDataManager::MAX_SLOTS; ++i) {
+            const auto *slot = sm.get_slot(static_cast<int>(i));
+            if (slot && slot->dir_name == latest.dir_name) {
+                mountPt = slot->mount_point;
+                status = SCE_SAVEDATA_MOUNT_STATUS_EXISTING;
+                mRet = SCE_SAVEDATA_OK;
+                break;
+            }
+        }
+    }
+
+    if (mRet != SCE_SAVEDATA_OK) {
+        _gameBootStatus.text = [NSString stringWithFormat:@"Save: Erro ao montar slot (%d). Save anterior preservado com integridade.", mRet];
+        _topStatusLabel.text = @"⚠️ Falha ao Montar Save";
+        _report[@"save_error"] = [NSString stringWithFormat:@"Falha na montagem de save: erro %d; dados anteriores preservados.", mRet];
+        return;
+    }
 
     NSString *saveTitle = latest.param.title[0] != '\0' ? [NSString stringWithUTF8String:latest.param.title] : [NSString stringWithUTF8String:latest.dir_name.c_str()];
     _gameBootStatus.text = [NSString stringWithFormat:@"Save Carregado: %@ (Slot: %s, Status: %u)", saveTitle, latest.dir_name.c_str(), status];
@@ -1017,6 +1181,118 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 
 #pragma mark - Game Execution Engine
 
+- (void)startNewGameWithIntro {
+    NSURL *documents = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+        inDomains:NSUserDomainMask] firstObject];
+    NSString *docsPath = documents ? documents.path : @"";
+    NSString *introMoviePath = [docsPath stringByAppendingPathComponent:@"intro.mp4"];
+    NSString *dvdrootMoviePath = [docsPath stringByAppendingPathComponent:@"dvdroot_ps4/movies/intro.mp4"];
+
+    NSString *chosenPath = nil;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:introMoviePath]) {
+        chosenPath = introMoviePath;
+    } else if ([[NSFileManager defaultManager] fileExistsAtPath:dvdrootMoviePath]) {
+        chosenPath = dvdrootMoviePath;
+    }
+
+    if (chosenPath) {
+        // T114: Valida legibilidade básica do arquivo de mídia antes de inicializar o player
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:chosenPath error:nil];
+        if (!attrs || attrs.fileSize < 16) {
+            _report[@"intro_video_status"] = @"offline_fallback_unreadable_media";
+            _status.text = @"Mídia de introdução inválida ou ilegível. Fallback offline ativado para Novo Jogo.";
+            [self initGameBoot];
+            return;
+        }
+
+        _report[@"intro_video_status"] = @"playing";
+        _status.text = @"Reproduzindo introdução cinematográfica do jogo...";
+        NSURL *movieURL = [NSURL fileURLWithPath:chosenPath];
+        AVPlayerItem *playerItem = [AVPlayerItem playerItemWithURL:movieURL];
+        AVPlayer *player = [AVPlayer playerWithPlayerItem:playerItem];
+        AVPlayerViewController *playerVC = [AVPlayerViewController new];
+        playerVC.player = player;
+        playerVC.showsPlaybackControls = YES;
+
+        __weak LabController *weakSelf = self;
+        __block BOOL transitioned = NO;
+        __block id endObserver = nil;
+        __block id failObserver = nil;
+
+        void (^finishIntroAndBoot)(NSString *, NSString *) = ^(NSString *statusMsg, NSString *reportStatus) {
+            if (transitioned) return;
+            transitioned = YES;
+            if (endObserver) {
+                [[NSNotificationCenter defaultCenter] removeObserver:endObserver];
+                endObserver = nil;
+            }
+            if (failObserver) {
+                [[NSNotificationCenter defaultCenter] removeObserver:failObserver];
+                failObserver = nil;
+            }
+            [player pause];
+            [playerVC dismissViewControllerAnimated:YES completion:^{
+                LabController *sSelf = weakSelf;
+                if (!sSelf) return;
+                sSelf->_report[@"intro_video_status"] = reportStatus;
+                sSelf->_status.text = statusMsg;
+                [sSelf initGameBoot];
+            }];
+        };
+
+        // Botão de pular/cancelar reprodução na tela (T114 / US2/AC1)
+        UIButton *skipBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        skipBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        [skipBtn setTitle:@"⏩ Pular Introdução" forState:UIControlStateNormal];
+        skipBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        [skipBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        skipBtn.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.75];
+        skipBtn.layer.cornerRadius = 8;
+        skipBtn.layer.borderWidth = 1.0;
+        skipBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
+        [playerVC.contentOverlayView addSubview:skipBtn];
+        [NSLayoutConstraint activateConstraints:@[
+            [skipBtn.topAnchor constraintEqualToAnchor:playerVC.contentOverlayView.safeAreaLayoutGuide.topAnchor constant:16],
+            [skipBtn.trailingAnchor constraintEqualToAnchor:playerVC.contentOverlayView.safeAreaLayoutGuide.trailingAnchor constant:-16],
+            [skipBtn.widthAnchor constraintEqualToConstant:150],
+            [skipBtn.heightAnchor constraintEqualToConstant:36]
+        ]];
+
+        endObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
+                        object:playerItem
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification * _Nonnull note) {
+            (void)note;
+            finishIntroAndBoot(@"Introdução concluída. Transição para Novo Jogo...", @"finished");
+        }];
+
+        failObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVPlayerItemFailedToPlayToEndTimeNotification
+                        object:playerItem
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification * _Nonnull note) {
+            (void)note;
+            finishIntroAndBoot(@"Falha na reprodução da introdução. Ativando fallback offline...",
+                               @"offline_fallback_playback_failed");
+        }];
+
+        [self presentViewController:playerVC animated:YES completion:^{
+            if (playerItem.status == AVPlayerItemStatusFailed) {
+                finishIntroAndBoot(@"Mídia de introdução inválida ou ilegível. Ativando fallback offline...",
+                                   @"offline_fallback_unreadable_media");
+            } else {
+                [player play];
+            }
+        }];
+    } else {
+        // T059: Fallback offline explícito sem afirmar falso sucesso para dados inexistentes
+        _report[@"intro_video_status"] = @"offline_fallback_missing_media";
+        _status.text = @"Vídeo intro não encontrado em Documents. Fallback offline ativado para Novo Jogo.";
+        [self initGameBoot];
+    }
+}
+
 - (void)initGameBoot {
     if (_guestBooting.exchange(true)) {
         return;
@@ -1050,6 +1326,9 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     bb::BootConfig config;
     config.base_dir = gameDir.UTF8String;
     config.save_dir = [documents.path stringByAppendingPathComponent:@"savedata"].UTF8String;
+    if (_selectedSaveSlot && _selectedSaveSlot.length > 0) {
+        config.save_dir_name = _selectedSaveSlot.UTF8String;
+    }
     const unsigned long long physRam = [NSProcessInfo processInfo].physicalMemory;
     if (physRam >= (7ULL << 30)) {
         config.guest_memory_size = static_cast<std::size_t>(5632ULL << 20); // 5.5 GiB (iPhone 15 Pro / Pro Max com 8 GB)
@@ -1123,6 +1402,8 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         if (strongSelf->_bootCoordinator->runtime()) {
             strongSelf->_bootCoordinator->runtime()->pad_manager().set_default_input(&strongSelf->_inputManager);
             strongSelf->_bootCoordinator->runtime()->attach_video_out(&strongSelf->_videoOutManager);
+            strongSelf->_gnmBridgeListener = std::make_unique<HostGnmSubmissionBridge>(strongSelf);
+            strongSelf->_bootCoordinator->runtime()->set_gnm_listener(strongSelf->_gnmBridgeListener.get());
         }
 
         std::uint64_t steps = strongSelf->_bootCoordinator->step(100000);
@@ -1152,6 +1433,20 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
             }
 
             [sSelf updateCoordinatorReportAndUI:diag executedSteps:steps];
+
+            // T112: Se o app estiver em background ou houver pausa ativa ao concluir o boot,
+            // congela o coordenador e não agenda execução guest em background
+            BOOL inBackground = ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground);
+            if (inBackground) {
+                sSelf->_pauseReasons |= PauseReasonLifecycle;
+            }
+            if (sSelf->_pauseReasons != PauseReasonNone) {
+                if (sSelf->_bootCoordinator) {
+                    sSelf->_bootCoordinator->add_pause_reason(static_cast<bb::PauseReason>(sSelf->_pauseReasons));
+                }
+            } else if (sSelf->_continuousExecution) {
+                [sSelf scheduleGuestCpuStep];
+            }
         });
     });
 }
@@ -1160,10 +1455,80 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     if (!_guestCanStep.load()) return;
     _continuousExecution = !_continuousExecution;
     if (_continuousExecution) {
+        _pauseReasons &= ~PauseReasonUser;
+        if (_bootCoordinator) {
+            _bootCoordinator->clear_pause_reason(bb::PauseReason::user);
+        }
         [_continuousButton setTitle:@"⏸ Pausar Execução Contínua" forState:UIControlStateNormal];
+        if (_pauseReasons == PauseReasonNone) {
+            [self scheduleGuestCpuStep];
+        }
     } else {
+        _pauseReasons |= PauseReasonUser;
+        if (_bootCoordinator) {
+            _bootCoordinator->add_pause_reason(bb::PauseReason::user);
+        }
         [_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
     }
+}
+
+- (void)scheduleGuestCpuStep {
+    if (!_continuousExecution || _pauseReasons != PauseReasonNone || !_guestCanStep.load() || _guestBooting.load()) {
+        _guestStepping.store(false);
+        return;
+    }
+    if (_guestStepping.exchange(true)) {
+        return;
+    }
+    __weak LabController *weakSelf = self;
+    dispatch_async(_guestExecutionQueue, ^{
+        LabController *strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf->_continuousExecution || !strongSelf->_bootCoordinator) {
+            if (strongSelf) strongSelf->_guestStepping.store(false);
+            return;
+        }
+        std::uint32_t slice_budget = strongSelf->_guestCpuSliceBudget.load();
+        std::uint64_t steps = strongSelf->_bootCoordinator->step(slice_budget);
+        auto diag = strongSelf->_bootCoordinator->diagnostics();
+        if (auto *runtime = strongSelf->_bootCoordinator->runtime()) {
+            strongSelf->_guestSubmits.store(runtime->submit_count());
+            strongSelf->_guestTriangles.store(runtime->rasterizer_stats().triangles_drawn);
+            strongSelf->_guestRasterizerFailures.store(runtime->rasterizer_failure_count());
+            strongSelf->_guestLastRasterizerStatus.store(static_cast<int>(runtime->last_rasterizer_status()));
+        }
+        strongSelf->_guestCanStep.store(diag.state == bb::BootState::running ||
+                                        diag.state == bb::BootState::modules_initialized);
+        strongSelf->_guestStepping.store(false, std::memory_order_release);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LabController *sSelf = weakSelf;
+            if (!sSelf) return;
+            sSelf->_lastGuestSteps = diag.total_steps;
+            sSelf->_report[@"guest_steps_executed"] = @(diag.total_steps > 0);
+            if (diag.state == bb::BootState::error || diag.state == bb::BootState::halted) {
+                sSelf->_continuousExecution = NO;
+                [sSelf->_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
+            }
+            if (diag.state == bb::BootState::error || diag.state == bb::BootState::halted ||
+                diag.total_steps % 500000 < 50000) {
+                [sSelf updateCoordinatorReportAndUI:diag executedSteps:steps];
+            }
+            // Avanço autônomo desacoplado com controle de pressão térmica (T049 / T182 / US5/AC1)
+            if (sSelf->_continuousExecution && sSelf->_guestCanStep.load() && !sSelf->_guestBooting.load()) {
+                std::uint32_t delay_ms = sSelf->_guestCpuRescheduleDelayMs.load();
+                if (delay_ms > 0) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay_ms * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                        LabController *again = weakSelf;
+                        if (again && again->_continuousExecution && again->_guestCanStep.load() && !again->_guestBooting.load()) {
+                            [again scheduleGuestCpuStep];
+                        }
+                    });
+                } else {
+                    [sSelf scheduleGuestCpuStep];
+                }
+            }
+        });
+    });
 }
 
 - (void)updateCoordinatorReportAndUI:(const bb::BootDiagnostics&)diag executedSteps:(std::uint64_t)steps {
@@ -1218,66 +1583,31 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
 - (void)drawInMTKView:(MTKView *)view {
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
     id<CAMetalDrawable> drawable = view.currentDrawable;
-    if (!pass || !drawable || !_pipeline || !_vertexBuffer || !_indexBuffer) return;
+    if (!pass || !drawable) return;
 
     auto now = std::chrono::steady_clock::now();
     double frame_ms = std::chrono::duration<double, std::milli>(now - _lastFrameTime).count();
     _lastFrameTime = now;
     _pacingTracker.record_frame_ms(frame_ms);
 
-    if (_continuousExecution && _guestCanStep.load() && !_guestBooting.load()) {
-        if (!_guestStepping.exchange(true)) {
-            __weak LabController *weakSelf = self;
-            dispatch_async(_guestExecutionQueue, ^{
-                LabController *strongSelf = weakSelf;
-                if (!strongSelf) return;
-                if (!strongSelf->_bootCoordinator) {
-                    strongSelf->_guestStepping.store(false);
-                    return;
-                }
-                std::uint64_t steps = strongSelf->_bootCoordinator->step(50000);
-                auto diag = strongSelf->_bootCoordinator->diagnostics();
-                if (auto *runtime = strongSelf->_bootCoordinator->runtime()) {
-                    strongSelf->_guestSubmits.store(runtime->submit_count());
-                    strongSelf->_guestTriangles.store(runtime->rasterizer_stats().triangles_drawn);
-                    strongSelf->_guestRasterizerFailures.store(runtime->rasterizer_failure_count());
-                    strongSelf->_guestLastRasterizerStatus.store(static_cast<int>(runtime->last_rasterizer_status()));
-                }
-                strongSelf->_guestCanStep.store(diag.state == bb::BootState::running ||
-                                                diag.state == bb::BootState::modules_initialized);
-                strongSelf->_guestStepping.store(false, std::memory_order_release);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    LabController *sSelf = weakSelf;
-                    if (!sSelf) return;
-                    sSelf->_lastGuestSteps = diag.total_steps;
-                    sSelf->_report[@"guest_steps_executed"] = @(diag.total_steps > 0);
-                    if (diag.state == bb::BootState::error || diag.state == bb::BootState::halted) {
-                        sSelf->_continuousExecution = NO;
-                        [sSelf->_continuousButton setTitle:@"▶ Executar Continuamente (60 FPS)" forState:UIControlStateNormal];
-                    }
-                    if (diag.state == bb::BootState::error || diag.state == bb::BootState::halted ||
-                        diag.total_steps % 500000 < 50000) {
-                        [sSelf updateCoordinatorReportAndUI:diag executedSteps:steps];
-                    }
-                });
-            });
-        }
-    }
-
     if (_videoOutManager.has_new_frame()) {
-        bb::HostFrameBuffer guestFrame;
-        if (_videoOutManager.read_current_frame_pixels(guestFrame) && guestFrame.valid &&
-            guestFrame.bytes_per_pixel == 4 && guestFrame.width > 0 && guestFrame.height > 0 &&
-            guestFrame.pitch >= guestFrame.width && !guestFrame.is_tiled &&
-            guestFrame.pixel_format == 0x80000000 &&
-            guestFrame.pixel_data.size() >= static_cast<size_t>(guestFrame.pitch) * 4 * guestFrame.height) {
+        bb::PresentationFrame guestFrame;
+        if (_videoOutManager.read_presentation_frame(guestFrame) && guestFrame.valid &&
+            (guestFrame.bytes_per_pixel == 4 || guestFrame.bytes_per_pixel == 8) &&
+            guestFrame.width > 0 && guestFrame.height > 0 &&
+            guestFrame.pitch >= guestFrame.width && !guestFrame.pixel_data.empty()) {
             _report[@"guest_frame_flipped"] = @YES;
             _report[@"guest_frame_seq"] = @(guestFrame.flip_sequence);
             _report[@"guest_frame_w"] = @(guestFrame.width);
             _report[@"guest_frame_h"] = @(guestFrame.height);
+            _report[@"guest_frame_bpp"] = @(guestFrame.bytes_per_pixel);
+            _report[@"guest_frame_was_tiled"] = @(guestFrame.was_tiled ? YES : NO);
 
-            if (!_guestScreenTexture || _guestScreenTexture.width != guestFrame.width || _guestScreenTexture.height != guestFrame.height) {
-                MTLTextureDescriptor *screenDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            MTLPixelFormat mtl_pixel_fmt = (guestFrame.bytes_per_pixel == 8) ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+
+            if (!_guestScreenTexture || _guestScreenTexture.width != guestFrame.width ||
+                _guestScreenTexture.height != guestFrame.height || _guestScreenTexture.pixelFormat != mtl_pixel_fmt) {
+                MTLTextureDescriptor *screenDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mtl_pixel_fmt
                                                                                                      width:guestFrame.width
                                                                                                     height:guestFrame.height
                                                                                                  mipmapped:NO];
@@ -1288,7 +1618,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                 [_guestScreenTexture replaceRegion:MTLRegionMake2D(0, 0, guestFrame.width, guestFrame.height)
                                        mipmapLevel:0
                                          withBytes:guestFrame.pixel_data.data()
-                                       bytesPerRow:static_cast<NSUInteger>(guestFrame.pitch) * 4];
+                                       bytesPerRow:static_cast<NSUInteger>(guestFrame.pitch) * guestFrame.bytes_per_pixel];
                 const std::uint64_t submits = _guestSubmits.load();
                 const std::uint32_t tris = _guestTriangles.load();
                 _report[@"gnm_submit_count"] = @(submits);
@@ -1296,14 +1626,16 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                 _report[@"gnm_cpu_rasterizer_failures"] = @(_guestRasterizerFailures.load());
                 _report[@"gnm_cpu_last_rasterizer_status_code"] = @(_guestLastRasterizerStatus.load());
                 _report[@"gnm_draws_executed_offscreen"] = @NO;
-                _report[@"guest_frame_status"] = @"Pixels lineares guest enviados à textura Metal; origem e sincronização com PM4 não comprovadas.";
+                _report[@"guest_frame_status"] = [NSString stringWithFormat:@"Pixels convertidos guest (%s, %u bpp) enviados a textura Metal.",
+                                                  guestFrame.diagnostic.c_str(), guestFrame.bytes_per_pixel];
             } else {
                 _report[@"guest_frame_status"] = @"Falha ao alocar textura de vídeo guest.";
             }
         } else {
             _guestScreenTexture = nil;
             _report[@"guest_frame_presented_to_metal"] = @NO;
-            _report[@"guest_frame_status"] = @"Sem pixels BGRA8 lineares em formato/tiling aceitos; flip não demonstra imagem.";
+            const char* diag = guestFrame.diagnostic.empty() ? _videoOutManager.last_conversion_diagnostic().c_str() : guestFrame.diagnostic.c_str();
+            _report[@"guest_frame_status"] = [NSString stringWithFormat:@"Quadro rejeitado na conversao: %s", (diag && diag[0]) ? diag : "formato/tiling nao suportados"];
         }
         _videoOutManager.consume_new_frame();
     }
@@ -1363,63 +1695,72 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         return;
     }
 
-    [encoder setRenderPipelineState:_pipeline];
-    if (_depthState) {
-        [encoder setDepthStencilState:_depthState];
-    }
-    [encoder setCullMode:MTLCullModeNone];
+    // Rota 2: Modo demonstrativo 3D independente da rota guest
+    if (_pipeline && _vertexBuffer && _indexBuffer) {
+        [encoder setRenderPipelineState:_pipeline];
+        if (_depthState) {
+            [encoder setDepthStencilState:_depthState];
+        }
+        [encoder setCullMode:MTLCullModeNone];
 
-    [encoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
-    [encoder setVertexBytes:&mvpUniforms length:sizeof(mvpUniforms) atIndex:1];
-    [encoder setFragmentBuffer:_lightingBuffer offset:0 atIndex:1];
+        [encoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
+        [encoder setVertexBytes:&mvpUniforms length:sizeof(mvpUniforms) atIndex:1];
+        [encoder setFragmentBuffer:_lightingBuffer offset:0 atIndex:1];
 
-    if (_diffuseTexture) {
-        [encoder setFragmentTexture:_diffuseTexture atIndex:0];
-    }
-    if (_samplerState) {
-        [encoder setFragmentSamplerState:_samplerState atIndex:0];
-    }
+        if (_diffuseTexture) {
+            [encoder setFragmentTexture:_diffuseTexture atIndex:0];
+        }
+        if (_samplerState) {
+            [encoder setFragmentSamplerState:_samplerState atIndex:0];
+        }
 
-    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                        indexCount:_indexCount
-                         indexType:MTLIndexTypeUInt32
-                       indexBuffer:_indexBuffer
-                 indexBufferOffset:0];
+        [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:_indexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:_indexBuffer
+                     indexBufferOffset:0];
 
-    [encoder endEncoding];
-    [command presentDrawable:drawable];
+        [encoder endEncoding];
+        [command presentDrawable:drawable];
 
-    __weak LabController *weakSelf = self;
-    [command addCompletedHandler:^(id<MTLCommandBuffer> finished) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            LabController *strongSelf = weakSelf;
-            if (!strongSelf) return;
-            if (finished.status == MTLCommandBufferStatusCompleted) {
-                ++strongSelf->_completedFrames;
-                strongSelf->_report[@"metal_completed_frames"] = @(strongSelf->_completedFrames);
-                if (strongSelf->_completedFrames == 1 || strongSelf->_completedFrames % 30 == 0) {
-                    auto pacing = strongSelf->_pacingTracker.get_stats();
-                    uint64_t mem_bytes = strongSelf->_memoryMonitor.query_physical_footprint_bytes();
-                    double mem_mb = static_cast<double>(mem_bytes) / (1024.0 * 1024.0);
-                    strongSelf->_gpuStatus.text = [NSString stringWithFormat:
-                        @"Metal 3: %lu frames | FLVER (%u vtx, %u tri) | P50: %.1fms | Mem: %.1f MB",
-                        (unsigned long)strongSelf->_completedFrames,
-                        strongSelf->_modelVertexCount,
-                        strongSelf->_modelTriangleCount,
-                        pacing.p50_ms, mem_mb];
+        __weak LabController *weakSelf = self;
+        [command addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                LabController *strongSelf = weakSelf;
+                if (!strongSelf) return;
+                if (finished.status == MTLCommandBufferStatusCompleted) {
+                    ++strongSelf->_completedFrames;
+                    strongSelf->_report[@"metal_completed_frames"] = @(strongSelf->_completedFrames);
+                    if (strongSelf->_completedFrames == 1 || strongSelf->_completedFrames % 30 == 0) {
+                        auto pacing = strongSelf->_pacingTracker.get_stats();
+                        uint64_t mem_bytes = strongSelf->_memoryMonitor.query_physical_footprint_bytes();
+                        double mem_mb = static_cast<double>(mem_bytes) / (1024.0 * 1024.0);
+                        strongSelf->_gpuStatus.text = [NSString stringWithFormat:
+                            @"Metal 3: %lu frames | FLVER (%u vtx, %u tri) | P50: %.1fms | Mem: %.1f MB",
+                            (unsigned long)strongSelf->_completedFrames,
+                            strongSelf->_modelVertexCount,
+                            strongSelf->_modelTriangleCount,
+                            pacing.p50_ms, mem_mb];
 
-                    if (strongSelf->_lastGuestSteps > 0) {
-                        strongSelf->_topStatusLabel.text = [NSString stringWithFormat:@"BB Lab | %.0f FPS host | %.1fM passos guest",
-                            pacing.average_fps,
-                            static_cast<double>(strongSelf->_lastGuestSteps) / 1000000.0];
+                        if (strongSelf->_lastGuestSteps > 0) {
+                            strongSelf->_topStatusLabel.text = [NSString stringWithFormat:@"BB Lab | %.0f FPS host | %.1fM passos guest",
+                                pacing.average_fps,
+                                static_cast<double>(strongSelf->_lastGuestSteps) / 1000000.0];
+                        }
                     }
+                } else {
+                    [strongSelf gpuError:finished.error ? finished.error.localizedDescription : @"Erro no command buffer"];
                 }
-            } else {
-                [strongSelf gpuError:finished.error ? finished.error.localizedDescription : @"Erro no command buffer"];
-            }
-        });
-    }];
-    [command commit];
+            });
+        }];
+        [command commit];
+    } else {
+        // Diagnóstico explícito: malha demonstrativa desacoplada ou indisponível
+        _report[@"demo_pipeline_status"] = @"Malha/pipeline demonstrativo indisponivel ou desacoplado da apresentacao guest.";
+        [encoder endEncoding];
+        [command presentDrawable:drawable];
+        [command commit];
+    }
 }
 
 - (void)dealloc {
@@ -1432,12 +1773,45 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         AudioQueueDispose(_audioQueue, true);
         _audioQueue = nullptr;
     }
+    if (_bootCoordinator && _bootCoordinator->runtime()) {
+        _bootCoordinator->runtime()->set_gnm_listener(nullptr);
+    }
+    _gnmBridgeListener.reset();
     _videoOutManager.detach_guest_memory();
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
     (void)view; (void)size;
+}
+
+- (BOOL)handleGnmDrawCalls:(const std::vector<bb::DrawCall>&)draws {
+    if (draws.empty()) return YES;
+    if (!_bootCoordinator || !_bootCoordinator->guest_memory()) return NO;
+    bb::GnmMetalBridge bridge(*_bootCoordinator->guest_memory());
+    bridge.set_allow_fallback_shaders(true);
+    for (const auto& draw : draws) {
+        auto res = bridge.process_draw_call(draw);
+        if (!res.ok()) {
+            _guestRasterizerFailures.fetch_add(1);
+            return NO;
+        }
+    }
+    return YES;
+}
+
+- (BOOL)handleGnmDispatchCalls:(const std::vector<bb::DispatchCall>&)dispatches {
+    if (dispatches.empty()) return YES;
+    if (!_bootCoordinator || !_bootCoordinator->guest_memory()) return NO;
+    bb::GnmMetalBridge bridge(*_bootCoordinator->guest_memory());
+    for (const auto& disp : dispatches) {
+        auto res = bridge.process_dispatch(disp);
+        if (!res.ok()) {
+            _guestRasterizerFailures.fetch_add(1);
+            return NO;
+        }
+    }
+    return YES;
 }
 
 #pragma mark - Touch & Controller Handlers
@@ -1466,21 +1840,22 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     NSString *t = sender.currentTitle;
     sender.backgroundColor = [UIColor colorWithRed:0.85 green:0.25 blue:0.25 alpha:0.85];
 
-    if ([t containsString:@"✖"]) _inputManager.set_button(bb::PAD_CROSS, true);
-    else if ([t containsString:@"●"]) _inputManager.set_button(bb::PAD_CIRCLE, true);
-    else if ([t containsString:@"■"]) _inputManager.set_button(bb::PAD_SQUARE, true);
-    else if ([sender.accessibilityIdentifier isEqualToString:@"triangle"]) _inputManager.set_button(bb::PAD_TRIANGLE, true);
-    else if ([t isEqualToString:@"▲"]) _inputManager.set_button(bb::PAD_UP, true);
-    else if ([t isEqualToString:@"▼"]) _inputManager.set_button(bb::PAD_DOWN, true);
-    else if ([t isEqualToString:@"◀"]) _inputManager.set_button(bb::PAD_LEFT, true);
-    else if ([t isEqualToString:@"▶"]) _inputManager.set_button(bb::PAD_RIGHT, true);
-    else if ([t isEqualToString:@"R1"]) _inputManager.set_button(bb::PAD_R1, true);
-    else if ([t isEqualToString:@"R2"]) _inputManager.set_button(bb::PAD_R2, true);
-    else if ([t isEqualToString:@"L1"]) _inputManager.set_button(bb::PAD_L1, true);
-    else if ([t isEqualToString:@"L2"]) _inputManager.set_button(bb::PAD_L2, true);
-    else if ([t isEqualToString:@"R3"]) _inputManager.set_button(bb::PAD_R3, true);
-    else if ([t isEqualToString:@"L3"]) _inputManager.set_button(bb::PAD_L3, true);
-    else if ([t isEqualToString:@"OPT"]) _inputManager.set_button(bb::PAD_OPTIONS, true);
+    if ([t containsString:@"✖"]) _inputManager.set_button(bb::PAD_CROSS, true, bb::InputSource::Touch);
+    else if ([t containsString:@"●"]) _inputManager.set_button(bb::PAD_CIRCLE, true, bb::InputSource::Touch);
+    else if ([t containsString:@"■"]) _inputManager.set_button(bb::PAD_SQUARE, true, bb::InputSource::Touch);
+    else if ([sender.accessibilityIdentifier isEqualToString:@"triangle"]) _inputManager.set_button(bb::PAD_TRIANGLE, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"▲"]) _inputManager.set_button(bb::PAD_UP, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"▼"]) _inputManager.set_button(bb::PAD_DOWN, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"◀"]) _inputManager.set_button(bb::PAD_LEFT, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"▶"]) _inputManager.set_button(bb::PAD_RIGHT, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"R1"]) _inputManager.set_button(bb::PAD_R1, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"R2"]) _inputManager.set_button(bb::PAD_R2, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"L1"]) _inputManager.set_button(bb::PAD_L1, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"L2"]) _inputManager.set_button(bb::PAD_L2, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"R3"]) _inputManager.set_button(bb::PAD_R3, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"L3"]) _inputManager.set_button(bb::PAD_L3, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"OPT"]) _inputManager.set_button(bb::PAD_OPTIONS, true, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"TOUCH"]) _inputManager.set_button(bb::PAD_TOUCH_PAD, true, bb::InputSource::Touch);
 
     if (@available(iOS 10.0, *)) {
         UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
@@ -1493,21 +1868,22 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     NSString *t = sender.currentTitle;
     sender.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.65];
 
-    if ([t containsString:@"✖"]) _inputManager.set_button(bb::PAD_CROSS, false);
-    else if ([t containsString:@"●"]) _inputManager.set_button(bb::PAD_CIRCLE, false);
-    else if ([t containsString:@"■"]) _inputManager.set_button(bb::PAD_SQUARE, false);
-    else if ([sender.accessibilityIdentifier isEqualToString:@"triangle"]) _inputManager.set_button(bb::PAD_TRIANGLE, false);
-    else if ([t isEqualToString:@"▲"]) _inputManager.set_button(bb::PAD_UP, false);
-    else if ([t isEqualToString:@"▼"]) _inputManager.set_button(bb::PAD_DOWN, false);
-    else if ([t isEqualToString:@"◀"]) _inputManager.set_button(bb::PAD_LEFT, false);
-    else if ([t isEqualToString:@"▶"]) _inputManager.set_button(bb::PAD_RIGHT, false);
-    else if ([t isEqualToString:@"R1"]) _inputManager.set_button(bb::PAD_R1, false);
-    else if ([t isEqualToString:@"R2"]) _inputManager.set_button(bb::PAD_R2, false);
-    else if ([t isEqualToString:@"L1"]) _inputManager.set_button(bb::PAD_L1, false);
-    else if ([t isEqualToString:@"L2"]) _inputManager.set_button(bb::PAD_L2, false);
-    else if ([t isEqualToString:@"R3"]) _inputManager.set_button(bb::PAD_R3, false);
-    else if ([t isEqualToString:@"L3"]) _inputManager.set_button(bb::PAD_L3, false);
-    else if ([t isEqualToString:@"OPT"]) _inputManager.set_button(bb::PAD_OPTIONS, false);
+    if ([t containsString:@"✖"]) _inputManager.set_button(bb::PAD_CROSS, false, bb::InputSource::Touch);
+    else if ([t containsString:@"●"]) _inputManager.set_button(bb::PAD_CIRCLE, false, bb::InputSource::Touch);
+    else if ([t containsString:@"■"]) _inputManager.set_button(bb::PAD_SQUARE, false, bb::InputSource::Touch);
+    else if ([sender.accessibilityIdentifier isEqualToString:@"triangle"]) _inputManager.set_button(bb::PAD_TRIANGLE, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"▲"]) _inputManager.set_button(bb::PAD_UP, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"▼"]) _inputManager.set_button(bb::PAD_DOWN, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"◀"]) _inputManager.set_button(bb::PAD_LEFT, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"▶"]) _inputManager.set_button(bb::PAD_RIGHT, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"R1"]) _inputManager.set_button(bb::PAD_R1, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"R2"]) _inputManager.set_button(bb::PAD_R2, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"L1"]) _inputManager.set_button(bb::PAD_L1, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"L2"]) _inputManager.set_button(bb::PAD_L2, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"R3"]) _inputManager.set_button(bb::PAD_R3, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"L3"]) _inputManager.set_button(bb::PAD_L3, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"OPT"]) _inputManager.set_button(bb::PAD_OPTIONS, false, bb::InputSource::Touch);
+    else if ([t isEqualToString:@"TOUCH"]) _inputManager.set_button(bb::PAD_TOUCH_PAD, false, bb::InputSource::Touch);
 }
 
 #pragma mark - Physical GameController Support
@@ -1530,11 +1906,15 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         name:UIApplicationDidEnterBackgroundNotification object:nil];
     [nc addObserver:self selector:@selector(onAppWillEnterForeground:)
         name:UIApplicationWillEnterForegroundNotification object:nil];
+    [nc addObserver:self selector:@selector(onAppWillTerminate:)
+        name:UIApplicationWillTerminateNotification object:nil];
     if (@available(iOS 13.0, *)) {
         [nc addObserver:self selector:@selector(onAppDidEnterBackground:)
             name:UISceneDidEnterBackgroundNotification object:nil];
         [nc addObserver:self selector:@selector(onAppWillEnterForeground:)
             name:UISceneWillEnterForegroundNotification object:nil];
+        [nc addObserver:self selector:@selector(onAppWillTerminate:)
+            name:UISceneDidDisconnectNotification object:nil];
     }
     [nc addObserver:self selector:@selector(onAppDidReceiveMemoryWarning:)
         name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
@@ -1542,51 +1922,110 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         name:NSProcessInfoThermalStateDidChangeNotification object:nil];
 }
 
-- (void)onAppDidEnterBackground:(NSNotification *)note {
+- (void)onAppWillTerminate:(NSNotification *)note {
     (void)note;
+    _continuousExecution = NO;
     if (_bootCoordinator) {
         _bootCoordinator->pause();
+        auto& sm = _bootCoordinator->save_manager();
+        if (sm.is_initialized()) {
+            for (std::size_t i = 0; i < bb::SaveDataManager::MAX_SLOTS; ++i) {
+                const auto *slot = sm.get_slot(static_cast<int>(i));
+                if (slot && slot->used && !slot->read_only) {
+                    sm.umount(slot->mount_point, true);
+                }
+            }
+        }
     }
     bb::AudioOutManager::instance().set_paused(true);
-    _metalView.paused = YES;
+    if (_audioQueue && _audioActive) {
+        AudioQueueStop(_audioQueue, true);
+        AudioQueueDispose(_audioQueue, true);
+        _audioQueue = NULL;
+        _audioActive = NO;
+    }
+    _report[@"lifecycle_state"] = @"app_terminated";
+}
+
+- (void)onAppDidEnterBackground:(NSNotification *)note {
+    (void)note;
+    _pauseReasons |= PauseReasonLifecycle;
+    if (_bootCoordinator) {
+        _bootCoordinator->add_pause_reason(bb::PauseReason::lifecycle);
+    }
+    bb::AudioOutManager::instance().set_paused(true);
+    bb::AudioOutManager::instance().purge_inactive_buffers();
+    if (_audioQueue && _audioActive) {
+        AudioQueuePause(_audioQueue);
+        AudioQueueReset(_audioQueue);
+    }
+    _metal.paused = YES;
     _report[@"lifecycle_state"] = @"background_paused";
 }
 
 - (void)onAppWillEnterForeground:(NSNotification *)note {
     (void)note;
+    _pauseReasons &= ~PauseReasonLifecycle;
     if (_bootCoordinator) {
-        _bootCoordinator->resume();
+        _bootCoordinator->clear_pause_reason(bb::PauseReason::lifecycle);
     }
-    bb::AudioOutManager::instance().set_paused(false);
-    _metalView.paused = NO;
+    NSError *error = nil;
+    [[AVAudioSession sharedInstance] setActive:YES error:&error];
+    _metal.paused = NO;
     _report[@"lifecycle_state"] = @"foreground_active";
+
+    // Preserva pausa se houver motivo manual (PauseReasonUser) ou desconexão (PauseReasonDisconnect)
+    if (_pauseReasons == PauseReasonNone) {
+        bb::AudioOutManager::instance().set_paused(false);
+        if (_audioQueue && _audioActive) {
+            AudioQueueStart(_audioQueue, NULL);
+        }
+        if (_continuousExecution) {
+            [self scheduleGuestCpuStep];
+        }
+    }
+}
+
+- (void)didReceiveMemoryWarning {
+    [super didReceiveMemoryWarning];
+    _memoryMonitor.trigger_low_memory_warning();
+    bb::gnm_bridge_clear_caches();
+    _report[@"memory_warning_triggered"] = @YES;
 }
 
 - (void)onAppDidReceiveMemoryWarning:(NSNotification *)note {
     (void)note;
     _memoryMonitor.trigger_low_memory_warning();
+    bb::gnm_bridge_clear_caches();
     _report[@"memory_warning_triggered"] = @YES;
 }
 
 - (void)onThermalStateChanged:(NSNotification *)note {
     (void)note;
     NSProcessInfoThermalState state = [NSProcessInfo processInfo].thermalState;
+    bb::ThermalThrottlingLevel level = bb::ThermalThrottlingLevel::Nominal;
     if (state == NSProcessInfoThermalStateCritical) {
-        _pacingTracker.set_target_fps(20.0);
-        _metalView.preferredFramesPerSecond = 20;
+        level = bb::ThermalThrottlingLevel::Critical;
         _topStatusLabel.text = @"🔥 Alerta Térmico Crítico: Redução ativa para 20 FPS";
         _report[@"thermal_state"] = @"critical_20fps";
     } else if (state == NSProcessInfoThermalStateSerious) {
-        _pacingTracker.set_target_fps(24.0);
-        _metalView.preferredFramesPerSecond = 24;
+        level = bb::ThermalThrottlingLevel::Serious;
         _topStatusLabel.text = @"🌡 Atenção Térmica: Taxa ajustada para 24 FPS";
         _report[@"thermal_state"] = @"serious_24fps";
+    } else if (state == NSProcessInfoThermalStateFair) {
+        level = bb::ThermalThrottlingLevel::Fair;
+        _topStatusLabel.text = @"⚙ Taxa Estável: 30 FPS (Aquece)";
+        _report[@"thermal_state"] = @"fair_30fps";
     } else {
-        _pacingTracker.set_target_fps(30.0);
-        _metalView.preferredFramesPerSecond = 30;
+        level = bb::ThermalThrottlingLevel::Nominal;
         _topStatusLabel.text = @"⚙ Taxa Estável: 30 FPS";
         _report[@"thermal_state"] = @"nominal_30fps";
     }
+    auto cfg = bb::get_thermal_throttling_config(level);
+    _pacingTracker.set_target_fps(cfg.target_fps);
+    _metal.preferredFramesPerSecond = static_cast<NSInteger>(cfg.target_fps);
+    _guestCpuSliceBudget.store(cfg.cpu_step_budget);
+    _guestCpuRescheduleDelayMs.store(cfg.reschedule_delay_ms);
 }
 
 - (void)setupController:(GCController *)controller {
@@ -1600,67 +2039,141 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         LabController *strongSelf = weakSelf;
         if (!strongSelf) return;
 
-        strongSelf->_inputManager.set_left_stick(pad.leftThumbstick.xAxis.value, pad.leftThumbstick.yAxis.value);
-        strongSelf->_inputManager.set_right_stick(pad.rightThumbstick.xAxis.value, pad.rightThumbstick.yAxis.value);
+        strongSelf->_inputManager.set_left_stick(pad.leftThumbstick.xAxis.value, pad.leftThumbstick.yAxis.value, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_right_stick(pad.rightThumbstick.xAxis.value, pad.rightThumbstick.yAxis.value, bb::InputSource::Gamepad);
 
-        strongSelf->_inputManager.set_button(bb::PAD_CROSS, pad.buttonA.isPressed);
-        strongSelf->_inputManager.set_button(bb::PAD_CIRCLE, pad.buttonB.isPressed);
-        strongSelf->_inputManager.set_button(bb::PAD_SQUARE, pad.buttonX.isPressed);
-        strongSelf->_inputManager.set_button(bb::PAD_TRIANGLE, pad.buttonY.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_CROSS, pad.buttonA.isPressed, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_button(bb::PAD_CIRCLE, pad.buttonB.isPressed, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_button(bb::PAD_SQUARE, pad.buttonX.isPressed, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_button(bb::PAD_TRIANGLE, pad.buttonY.isPressed, bb::InputSource::Gamepad);
 
-        strongSelf->_inputManager.set_button(bb::PAD_L1, pad.leftShoulder.isPressed);
-        strongSelf->_inputManager.set_button(bb::PAD_R1, pad.rightShoulder.isPressed);
-        strongSelf->_inputManager.set_button(bb::PAD_L2, pad.leftTrigger.isPressed);
-        strongSelf->_inputManager.set_button(bb::PAD_R2, pad.rightTrigger.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_L1, pad.leftShoulder.isPressed, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_button(bb::PAD_R1, pad.rightShoulder.isPressed, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_button(bb::PAD_L2, pad.leftTrigger.isPressed, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_button(bb::PAD_R2, pad.rightTrigger.isPressed, bb::InputSource::Gamepad);
 
-        strongSelf->_inputManager.set_button(bb::PAD_UP, pad.dpad.up.isPressed);
-        strongSelf->_inputManager.set_button(bb::PAD_DOWN, pad.dpad.down.isPressed);
-        strongSelf->_inputManager.set_button(bb::PAD_LEFT, pad.dpad.left.isPressed);
-        strongSelf->_inputManager.set_button(bb::PAD_RIGHT, pad.dpad.right.isPressed);
+        strongSelf->_inputManager.set_button(bb::PAD_UP, pad.dpad.up.isPressed, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_button(bb::PAD_DOWN, pad.dpad.down.isPressed, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_button(bb::PAD_LEFT, pad.dpad.left.isPressed, bb::InputSource::Gamepad);
+        strongSelf->_inputManager.set_button(bb::PAD_RIGHT, pad.dpad.right.isPressed, bb::InputSource::Gamepad);
 
         if (@available(iOS 12.1, *)) {
             if (pad.leftThumbstickButton) {
-                strongSelf->_inputManager.set_button(bb::PAD_L3, pad.leftThumbstickButton.isPressed);
+                strongSelf->_inputManager.set_button(bb::PAD_L3, pad.leftThumbstickButton.isPressed, bb::InputSource::Gamepad);
             }
             if (pad.rightThumbstickButton) {
-                strongSelf->_inputManager.set_button(bb::PAD_R3, pad.rightThumbstickButton.isPressed);
+                strongSelf->_inputManager.set_button(bb::PAD_R3, pad.rightThumbstickButton.isPressed, bb::InputSource::Gamepad);
             }
         }
         if (pad.buttonMenu) {
-            strongSelf->_inputManager.set_button(bb::PAD_OPTIONS, pad.buttonMenu.isPressed);
+            strongSelf->_inputManager.set_button(bb::PAD_OPTIONS, pad.buttonMenu.isPressed, bb::InputSource::Gamepad);
+        }
+        if (@available(iOS 13.0, *)) {
+            bool touchpadPressed = false;
+            if (pad.buttonOptions && pad.buttonOptions.isPressed) {
+                touchpadPressed = true;
+            }
+            if (@available(iOS 14.0, *)) {
+                GCControllerButtonInput *tp = controller.physicalInputProfile.buttons[GCInputButtonTouchpad];
+                if (tp && tp.isPressed) {
+                    touchpadPressed = true;
+                }
+            }
+            strongSelf->_inputManager.set_button(bb::PAD_TOUCH_PAD, touchpadPressed, bb::InputSource::Gamepad);
         }
     };
 }
 
 - (void)onControllerConnected:(NSNotification *)note {
-    (void)note;
-    _report[@"gamepad_connected"] = @YES;
-    _touchOverlay.set_gamepad_connected(true);
-    GCController *controller = GCController.controllers.firstObject;
-    if (controller) {
+    GCController *controller = note ? (GCController *)note.object : GCController.controllers.firstObject;
+    if (!controller) return;
+
+    uint64_t cid = (uint64_t)(uintptr_t)controller;
+    bool becameActive = _inputManager.register_controller(cid);
+
+    if (becameActive || _activeController == nil) {
+        _activeController = controller;
         [self setupController:controller];
+        _report[@"gamepad_connected"] = @YES;
+        _touchOverlay.set_gamepad_connected(true);
+        _pauseReasons &= ~PauseReasonDisconnect;
+        if (_bootCoordinator) {
+            _bootCoordinator->clear_pause_reason(bb::PauseReason::disconnect);
+        }
+
+        // Auto-ocultação e atenuação gradual dos botões na tela quando o controle físico estiver ativo (T022)
+        [UIView animateWithDuration:0.35 animations:^{
+            self->_controlsOverlay.alpha = 0.0;
+        } completion:^(BOOL finished) {
+            if (finished && self->_touchOverlay.is_gamepad_connected()) {
+                self->_controlsOverlay.hidden = YES;
+            }
+        }];
+
         _subsystemStatus.text = [NSString stringWithFormat:@"GameController conectado: %@ (Mapeamento ativo)",
             controller.vendorName ? controller.vendorName : @"Compatível"];
-    }
 
-    // Auto-ocultação e atenuação gradual dos botões na tela quando o controle físico estiver ativo (T022)
-    [UIView animateWithDuration:0.35 animations:^{
-        self->_controlsOverlay.alpha = 0.0;
-    } completion:^(BOOL finished) {
-        if (finished && self->_touchOverlay.is_gamepad_connected()) {
-            self->_controlsOverlay.hidden = YES;
+        if (_continuousExecution && _pauseReasons == PauseReasonNone) {
+            _topStatusLabel.text = @"BB Lab | demonstração | sem gameplay validado";
+            [self scheduleGuestCpuStep];
         }
-    }];
+    } else {
+        // T113: Segundo controle conectado sem perturbar o controle ativo
+        _subsystemStatus.text = [NSString stringWithFormat:@"GameController secundário detectado: %@ (Principal: %@)",
+            controller.vendorName ? controller.vendorName : @"Compatível",
+            _activeController.vendorName ? _activeController.vendorName : @"Ativo"];
+    }
+    _report[@"connected_controllers_count"] = @(_inputManager.connected_controllers_count());
 }
 
 - (void)onControllerDisconnected:(NSNotification *)note {
-    (void)note;
+    GCController *controller = (GCController *)note.object;
+    uint64_t cid = controller ? (uint64_t)(uintptr_t)controller : (_activeController ? (uint64_t)(uintptr_t)_activeController : 0);
+    if (cid == 0) return;
+
+    bool activeChanged = _inputManager.unregister_controller(cid);
+    _report[@"connected_controllers_count"] = @(_inputManager.connected_controllers_count());
+
+    if (!activeChanged) {
+        // T113: Controle desconectado não era o ativo. Não limpa entrada nem esconde HUD físico.
+        _subsystemStatus.text = [NSString stringWithFormat:@"Controle secundário desconectado. Principal (%@) permanece ativo.",
+            _activeController.vendorName ? _activeController.vendorName : @"Ativo"];
+        return;
+    }
+
+    // Se o controle ativo mudou, verificar se há outro disponível
+    uint64_t newActiveId = _inputManager.active_controller_id();
+    if (newActiveId != 0) {
+        GCController *fallback = nil;
+        for (GCController *c in GCController.controllers) {
+            if ((uint64_t)(uintptr_t)c == newActiveId) {
+                fallback = c;
+                break;
+            }
+        }
+        if (fallback) {
+            _activeController = fallback;
+            [self setupController:fallback];
+            _subsystemStatus.text = [NSString stringWithFormat:@"Controle desconectado. Alternado automaticamente para: %@",
+                fallback.vendorName ? fallback.vendorName : @"Compatível"];
+            return;
+        }
+    }
+
+    // Nenhum controle restante: desconexão completa (T113 / FR-007)
+    _activeController = nil;
     _report[@"gamepad_connected"] = @NO;
     _touchOverlay.set_gamepad_connected(false);
     _controlsOverlay.hidden = NO;
     [UIView animateWithDuration:0.35 animations:^{
         self->_controlsOverlay.alpha = 1.0;
     }];
+
+    _pauseReasons |= PauseReasonDisconnect;
+    if (_bootCoordinator) {
+        _bootCoordinator->add_pause_reason(bb::PauseReason::disconnect);
+        _topStatusLabel.text = @"⏸ Pausado: GameController desconectado";
+    }
     _subsystemStatus.text = @"GameController desconectado. Controles virtuais na tela reativados.";
 }
 
@@ -1671,6 +2184,11 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     AVAudioSession *session = [AVAudioSession sharedInstance];
     [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&error];
     [session setActive:YES error:&error];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onAudioSessionInterruption:)
+                                                 name:AVAudioSessionInterruptionNotification
+                                               object:session];
 
     AudioStreamBasicDescription format{};
     format.mSampleRate = 48000;
@@ -1693,6 +2211,37 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
         }
         AudioQueueStart(_audioQueue, NULL);
         _audioActive = YES;
+    }
+}
+
+- (void)onAudioSessionInterruption:(NSNotification *)note {
+    NSDictionary *userInfo = note.userInfo;
+    NSNumber *typeVal = userInfo[AVAudioSessionInterruptionTypeKey];
+    if (!typeVal) return;
+    AVAudioSessionInterruptionType type = (AVAudioSessionInterruptionType)[typeVal unsignedIntegerValue];
+
+    if (type == AVAudioSessionInterruptionTypeBegan) {
+        // T050: Interrupção da sessão de áudio (ligação, alarme, etc.)
+        bb::AudioOutManager::instance().set_paused(true);
+        bb::AudioOutManager::instance().purge_inactive_buffers();
+        if (_audioQueue && _audioActive) {
+            AudioQueuePause(_audioQueue);
+            AudioQueueReset(_audioQueue);
+        }
+        _report[@"audio_interrupted"] = @YES;
+    } else if (type == AVAudioSessionInterruptionTypeEnded) {
+        // Retomada sem áudio preso ou estalos
+        NSNumber *optionsVal = userInfo[AVAudioSessionInterruptionOptionKey];
+        NSUInteger options = [optionsVal unsignedIntegerValue];
+        NSError *error = nil;
+        [[AVAudioSession sharedInstance] setActive:YES error:&error];
+        if (options & AVAudioSessionInterruptionOptionShouldResume) {
+            bb::AudioOutManager::instance().set_paused(false);
+            if (_audioQueue && _audioActive) {
+                AudioQueueStart(_audioQueue, NULL);
+            }
+        }
+        _report[@"audio_interrupted"] = @NO;
     }
 }
 
@@ -1749,7 +2298,7 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
                 if (content && bytes.length > 0) {
                     result[@"status"] = @"ok";
                     result[@"valid"] = @YES;
-                    result[@"content_utf8"] = content;
+                    // T070 / Constituição III: minimizar dados exportáveis; não incluir conteúdo integral do arquivo
                     result[@"size_bytes"] = @(bytes.length);
                 }
             }
@@ -1820,6 +2369,31 @@ static void BB_AudioQueueCallback(void *userData, AudioQueueRef queue, AudioQueu
     bb::VirtualFileSystem vfs;
     const bool mounted = documents && vfs.mount("/app0", documents.path.UTF8String, true);
     inventory[@"vfs_mounted"] = @(mounted);
+
+    NSString *gameDir = documents ? [self findGameDirectoryIn:documents.path] : nil;
+    inventory[@"game_directory_found"] = @(gameDir != nil);
+
+    BOOL hasDvdroot = NO;
+    NSUInteger pkgCount = 0;
+    if (gameDir) {
+        NSString *dvdrootPath = [gameDir stringByAppendingPathComponent:@"dvdroot_ps4"];
+        BOOL isDir = NO;
+        if ([manager fileExistsAtPath:dvdrootPath isDirectory:&isDir] && isDir) {
+            hasDvdroot = YES;
+            vfs.mount("/dvdroot", dvdrootPath.UTF8String, true);
+            vfs.mount("/app0/dvdroot_ps4", dvdrootPath.UTF8String, true);
+            NSArray *items = [manager contentsOfDirectoryAtPath:dvdrootPath error:nil];
+            for (NSString *f in items) {
+                if ([f.pathExtension.lowercaseString isEqualToString:@"bhd"] || [f.pathExtension.lowercaseString isEqualToString:@"bhd5"]) {
+                    pkgCount++;
+                }
+            }
+        }
+    }
+    inventory[@"dvdroot_detected"] = @(hasDvdroot);
+    inventory[@"packages_detected"] = @(pkgCount);
+    inventory[@"path_resolution_verified"] = @(mounted);
+
     NSMutableDictionary *files = [NSMutableDictionary dictionary];
     for (NSString *name in @[@"teste-bblab.txt", @"param.sfo", @"m29_00_00_00_408010.flver.dcx", @"eboot.elf", @"eboot.bin", @"libc.prx", @"libSceFios2.prx"]) {
         NSError *error = nil;

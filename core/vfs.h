@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <mutex>
 #include <memory>
+#include <functional>
+#include <filesystem>
 
 namespace bb {
 
@@ -46,6 +48,8 @@ public:
     // Suporte a arquivos sintéticos em memória (stubs para testes, shaders e GUI ausentes)
     bool set_synthetic_file(const std::string &virtual_path, std::vector<std::uint8_t> data);
     bool has_synthetic_file(const std::string &virtual_path) const;
+    bool has_archive_file(const std::string &virtual_path) const;
+    bool has_archive_or_synthetic_file(const std::string &virtual_path) const;
     bool remove_synthetic_file(const std::string &virtual_path);
     void register_shader_gui_stubs();
 
@@ -56,13 +60,20 @@ public:
     bool exists(const std::string &virtual_path) const;
     VfsError stat(const std::string &virtual_path, VfsStat &out_stat) const;
     VfsError read_file(const std::string &virtual_path, std::vector<std::uint8_t> &out_data) const;
-    // Bounded random-access read of a local file or BHD5/BDT entry; never allocates the file's size.
+    // Bounded random-access read of a local file, BHD5/BDT entry, or BND4 entry; never allocates the file's size.
     // Returns ok with out_bytes_read < bytes_to_read at EOF (including zero beyond EOF).
-    // BND4 mounts are not supported by this API. dest may be null only for a zero-byte request.
+    // dest may be null only for a zero-byte request.
     VfsError read_at(const std::string &virtual_path, std::uint64_t offset,
                      void *dest, std::size_t bytes_to_read, std::size_t &out_bytes_read) const;
     VfsError write_file(const std::string &virtual_path, const void *data, std::size_t size, bool atomic = true);
     VfsError remove_file(const std::string &virtual_path);
+
+    // Test hook for simulating rename failures during atomic write
+    using RenameHook = std::function<std::error_code(const std::filesystem::path &from, const std::filesystem::path &to)>;
+    void set_rename_hook_for_testing(RenameHook hook) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        rename_hook_ = std::move(hook);
+    }
 
     // Utilit?rios de seguran?a e integridade
     static std::string normalize_path(const std::string &path);
@@ -86,6 +97,7 @@ private:
     std::vector<Bhd5Mount> bhd5_mounts_;
     std::unordered_map<std::string, std::shared_ptr<Bnd4Reader>> bnd4_mounts_;
     std::unordered_map<std::string, std::vector<std::uint8_t>> synthetic_files_;
+    RenameHook rename_hook_;
 };
 
 } // namespace bb

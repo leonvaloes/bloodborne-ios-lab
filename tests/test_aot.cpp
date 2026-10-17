@@ -1,6 +1,7 @@
 #include "check.h"
 #include "aot.h"
 #include "dispatcher.h"
+#include "guest_scheduler.h"
 #include <random>
 #include <cstring>
 #include <filesystem>
@@ -244,5 +245,230 @@ int main() { return run([] {
 
     IndirectDispatcher::set_active(nullptr);
 
-    std::cout << "aot_batch: instruction decoding, function lifting, ELF batch generation and dispatcher registry verified successfully\n";
+    // ========================================================================
+    // 7. AOT Dispatcher Integration & Safe Fallback Engine (T051)
+    // ========================================================================
+    {
+        // 7.1. Validacao de equivalencia funcional AOT vs Interpretador
+        GuestMemory mem_pure(1024 * 1024);
+        GuestMemory mem_aot(1024 * 1024);
+        CHECK(mem_pure.map(0x200000, 0x10000, read | write) == MemoryError::ok);
+        CHECK(mem_aot.map(0x200000, 0x10000, read | write) == MemoryError::ok);
+        CHECK(mem_pure.map(0x300000, 0x10000, read | write) == MemoryError::ok);
+        CHECK(mem_aot.map(0x300000, 0x10000, read | write) == MemoryError::ok);
+
+        // Bloco x86-64 autoral:
+        // mov rax, 0x1000
+        // mov rbx, 0x234
+        // add rax, rbx
+        // mov rcx, 0x50
+        // sub rax, rcx
+        // xor rdx, rdx
+        // ret
+        const std::vector<std::uint8_t> code = {
+            0x48, 0xb8, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0x1000
+            0x48, 0xbb, 0x34, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rbx, 0x234
+            0x48, 0x01, 0xd8,                                           // add rax, rbx
+            0x48, 0xb9, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rcx, 0x50
+            0x48, 0x29, 0xc8,                                           // sub rax, rcx
+            0x48, 0x31, 0xd2,                                           // xor rdx, rdx
+            0xc3                                                        // ret
+        };
+
+        CHECK(mem_pure.store(0x200000, code.data(), code.size()) == MemoryError::ok);
+        CHECK(mem_aot.store(0x200000, code.data(), code.size()) == MemoryError::ok);
+
+        // Endereco de retorno no topo da pilha
+        const std::uint64_t ret_target = 0x300080;
+        const std::uint64_t rsp_init = 0x30ff00;
+        CHECK(mem_pure.store(rsp_init, &ret_target, 8) == MemoryError::ok);
+        CHECK(mem_aot.store(rsp_init, &ret_target, 8) == MemoryError::ok);
+
+        CpuState init_state{};
+        init_state.rip = 0x200000;
+        init_state.gpr[4] = rsp_init; // rsp
+        init_state.rflags = 0x202;
+
+        // Execucao 1: Interpretador puro
+        X86Interpreter interp_pure(mem_pure);
+        interp_pure.state = init_state;
+        auto res_pure = interp_pure.run(20);
+
+        // Execucao 2: Despacho com bloco AOT
+        X86Interpreter interp_aot(mem_aot);
+        interp_aot.state = init_state;
+
+        auto lifted_fn = lift_function(code.data(), code.size(), 0x200000, "test_fn_math");
+        CHECK(lifted_fn.byte_size == code.size());
+        auto aot_handler = create_aot_block_executor(lifted_fn);
+        interp_aot.register_aot_block(0x200000, aot_handler);
+        CHECK(interp_aot.has_aot_block(0x200000));
+        CHECK(interp_aot.aot_block_count() == 1);
+
+        auto res_aot = interp_aot.run(20);
+
+        // Comprova equivalencia funcional 100% estrita entre AOT e interpretador
+        CHECK(interp_aot.state.rip == interp_pure.state.rip);
+        CHECK(interp_aot.state.rip == ret_target);
+        CHECK(interp_aot.state.gpr[0] == interp_pure.state.gpr[0]); // rax = 0x1000 + 0x234 - 0x50 = 0x11E4
+        CHECK(interp_aot.state.gpr[0] == 0x11E4);
+        CHECK(interp_aot.state.gpr[1] == interp_pure.state.gpr[1]); // rcx = 0x50
+        CHECK(interp_aot.state.gpr[2] == interp_pure.state.gpr[2]); // rdx = 0
+        CHECK(interp_aot.state.gpr[3] == interp_pure.state.gpr[3]); // rbx = 0x234
+        CHECK(interp_aot.state.gpr[4] == interp_pure.state.gpr[4]); // rsp restaurado
+        CHECK(interp_aot.state.rflags == interp_pure.state.rflags);
+        CHECK(res_aot.steps == res_pure.steps);
+    }
+
+    {
+        // 7.2. Fallback seguro de bloco AOT para o interpretador na presenca de instrucao nao traduzida
+        GuestMemory mem(1024 * 1024);
+        CHECK(mem.map(0x210000, 0x10000, read | write) == MemoryError::ok);
+        CHECK(mem.map(0x310000, 0x10000, read | write) == MemoryError::ok);
+
+        // Bloco com:
+        // mov rax, 0x40 (48 c7 c0 40 00 00 00 - 7 bytes)
+        // add rax, 0x02 (48 83 c0 02 - 4 bytes)
+        // bswap rax     (48 0f c8 - 3 bytes - instrucao tratada como untranslated pelo bloco AOT)
+        // add rax, 0x10 (48 83 c0 10 - 4 bytes)
+        // ret           (c3 - 1 byte)
+        const std::vector<std::uint8_t> code_with_fallback = {
+            0x48, 0xc7, 0xc0, 0x40, 0x00, 0x00, 0x00, // 0x210000: mov rax, 0x40
+            0x48, 0x83, 0xc0, 0x02,                   // 0x210007: add rax, 0x02
+            0x48, 0x0f, 0xc8,                         // 0x21000b: bswap rax (fallback untranslated)
+            0x48, 0x83, 0xc0, 0x10,                   // 0x21000e: add rax, 0x10
+            0xc3                                      // 0x210012: ret
+        };
+        CHECK(mem.store(0x210000, code_with_fallback.data(), code_with_fallback.size()) == MemoryError::ok);
+
+        const std::uint64_t ret_target = 0x310080;
+        const std::uint64_t rsp_init = 0x31ff00;
+        CHECK(mem.store(rsp_init, &ret_target, 8) == MemoryError::ok);
+
+        // Cria LiftedFunction artificial marcando a instrucao 0x21000b como Opcode::UNKNOWN
+        LiftedFunction fallback_fn{};
+        fallback_fn.name = "fn_with_untranslated";
+        fallback_fn.vaddr = 0x210000;
+        fallback_fn.byte_size = code_with_fallback.size();
+
+        BasicBlock bb1{};
+        bb1.start_vaddr = 0x210000;
+        bb1.end_vaddr = 0x21000e;
+
+        DecodedInstruction inst1{};
+        inst1.address = 0x210000;
+        inst1.length = 7;
+        inst1.opcode = Opcode::MOV;
+        inst1.op1 = Operand{OperandType::REG, RegId::RAX, 8};
+        inst1.op2 = Operand{OperandType::IMM, RegId::NONE, 8, 0x40};
+        bb1.instructions.push_back(inst1);
+
+        DecodedInstruction inst2{};
+        inst2.address = 0x210007;
+        inst2.length = 4;
+        inst2.opcode = Opcode::ADD;
+        inst2.op1 = Operand{OperandType::REG, RegId::RAX, 8};
+        inst2.op2 = Operand{OperandType::IMM, RegId::NONE, 8, 0x02};
+        bb1.instructions.push_back(inst2);
+
+        // Instrucao nao traduzida no AOT:
+        DecodedInstruction inst_untranslated{};
+        inst_untranslated.address = 0x21000b;
+        inst_untranslated.length = 3;
+        inst_untranslated.opcode = Opcode::UNKNOWN;
+        inst_untranslated.mnemonic = "bswap";
+        bb1.instructions.push_back(inst_untranslated);
+
+        fallback_fn.blocks.push_back(bb1);
+
+        // Registra o bloco AOT no interpretador
+        X86Interpreter interp(mem);
+        interp.state.rip = 0x210000;
+        interp.state.gpr[4] = rsp_init;
+        interp.state.rflags = 0x202;
+
+        auto handler = create_aot_block_executor(fallback_fn);
+        interp.register_aot_block(0x210000, handler);
+
+        // Executa: o bloco AOT deve processar inst1 e inst2, retornar fallback_untranslated em 0x21000b,
+        // e o interpretador deve assumir a partir de 0x21000b, executar bswap rax, add rax, 0x10 e ret!
+        auto res = interp.run(20);
+
+        CHECK(interp.state.rip == ret_target);
+        // rax inicial = 0x42; bswap rax = 0x4200000000000000ULL; + 0x10 = 0x4200000000000010ULL
+        CHECK(interp.state.gpr[0] == 0x4200000000000010ULL);
+        CHECK(res.steps == 5); // 2 passos no AOT + 3 passos no interpretador (bswap, add, ret)
+
+        // Limpeza de blocos
+        interp.clear_aot_blocks();
+        CHECK(interp.aot_block_count() == 0);
+        CHECK(!interp.has_aot_block(0x210000));
+    }
+
+    {
+        // 7.3. Despacho AOT no GuestScheduler com threads concorrentes e traps HLE
+        GuestMemory mem(2 * 1024 * 1024);
+        CHECK(mem.map(0x400000, 0x10000, read | write) == MemoryError::ok);
+
+        const std::vector<std::uint8_t> thread_code = {
+            0x48, 0xc7, 0xc0, 0x2a, 0x00, 0x00, 0x00, // mov rax, 42
+            0xc3                                      // ret (volta para o return_trap do scheduler)
+        };
+        CHECK(mem.store(0x400000, thread_code.data(), thread_code.size()) == MemoryError::ok);
+
+        auto lifted_fn = lift_function(thread_code.data(), thread_code.size(), 0x400000, "thread_fn");
+        auto handler = create_aot_block_executor(lifted_fn);
+
+        GuestScheduler sched(mem, 100);
+        sched.register_aot_block(0x400000, handler);
+        CHECK(sched.has_aot_block(0x400000));
+        CHECK(sched.aot_block_count() == 1);
+
+        const std::uint64_t stack_bot = 0x500000;
+        const std::uint64_t stack_top = 0x510000;
+        CHECK(mem.map(stack_bot, 0x10000, read | write) == MemoryError::ok);
+
+        const std::uint64_t return_trap = 0x900000;
+        sched.add_trap_range(return_trap, 0x100);
+
+        bool trap_hit = false;
+        sched.set_trap([&](GuestScheduler& s, GuestScheduler::Id tid, CpuState& st) -> bool {
+            if (st.rip >= return_trap && st.rip < return_trap + 0x100) {
+                trap_hit = true;
+                s.exit(tid, st.gpr[0]);
+                return true;
+            }
+            return false;
+        });
+
+        auto tid = sched.create(0x400000, stack_bot, stack_top, return_trap, 0);
+        CHECK(tid == 1);
+        CHECK(sched.start(tid) == ORBIS_OK);
+
+        auto sched_res = sched.run(50);
+        (void)sched_res;
+        CHECK(trap_hit);
+        CHECK(sched.state(tid) == GuestScheduler::State::exited);
+        CHECK(sched.value(tid) == 42); // valor retornado em rax
+    }
+
+    {
+        // 7.4. Verificacao de emissao de codigo C++ para bloco AOT com fallback seguro
+        const std::vector<std::uint8_t> code = {
+            0x48, 0x31, 0xc0, // xor rax, rax
+            0xc3              // ret
+        };
+        auto lifted = lift_function(code.data(), code.size(), 0x1000, "bb_test_block");
+        DecodedInstruction unk{};
+        unk.address = 0x1004;
+        unk.opcode = Opcode::UNKNOWN;
+        unk.mnemonic = "unsupported_ext";
+        lifted.blocks[0].instructions.push_back(unk);
+        auto cpp_code = emit_aot_block_cpp(lifted);
+        CHECK(cpp_code.find("bb::AotBlockResult bb_test_block_aot_block") != std::string::npos);
+        CHECK(cpp_code.find("bb::AotExecutionStatus::completed") != std::string::npos);
+        CHECK(cpp_code.find("fallback_untranslated") != std::string::npos);
+    }
+
+    std::cout << "aot_batch: instruction decoding, function lifting, ELF batch generation, dispatcher registry and AOT dispatch with safe fallback verified successfully\n";
 }); }

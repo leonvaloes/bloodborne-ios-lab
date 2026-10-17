@@ -1,4 +1,5 @@
 #include "aot.h"
+#include "alu.h"
 #include <sstream>
 #include <iomanip>
 #include <stdexcept>
@@ -1381,6 +1382,293 @@ AotBatchResult batch_translate_elf(const std::string& elf_path, const std::strin
 
     result.success = true;
     return result;
+}
+
+// ============================================================================
+// 4. AOT Dispatcher Integration & Safe Fallback Engine (T051)
+// ============================================================================
+
+static std::uint64_t eval_operand_read(const Operand& op, const CpuState& state, GuestMemory& mem, std::uint64_t current_rip) {
+    switch (op.type) {
+        case OperandType::IMM: {
+            std::uint64_t mask = (op.size == 1) ? 0xFFULL : (op.size == 2 ? 0xFFFFULL : (op.size == 4 ? 0xFFFFFFFFULL : ~0ULL));
+            return static_cast<std::uint64_t>(op.imm) & mask;
+        }
+        case OperandType::REG: {
+            if (op.reg == RegId::NONE) return 0;
+            if (op.reg == RegId::RIP) return current_rip;
+            auto idx = static_cast<std::size_t>(op.reg);
+            if (idx >= 16) return 0;
+            std::uint64_t val = state.gpr[idx];
+            if (op.size == 1) return val & 0xFFULL;
+            if (op.size == 2) return val & 0xFFFFULL;
+            if (op.size == 4) return val & 0xFFFFFFFFULL;
+            return val;
+        }
+        case OperandType::MEM: {
+            std::uint64_t addr = 0;
+            if (op.is_rip_relative) {
+                addr = op.rip_target;
+            } else {
+                if (op.mem_base != RegId::NONE && static_cast<std::size_t>(op.mem_base) < 16) {
+                    addr += state.gpr[static_cast<std::size_t>(op.mem_base)];
+                }
+                if (op.mem_index != RegId::NONE && static_cast<std::size_t>(op.mem_index) < 16) {
+                    addr += state.gpr[static_cast<std::size_t>(op.mem_index)] * op.mem_scale;
+                }
+                addr += op.mem_disp;
+            }
+            std::uint64_t val = 0;
+            mem.load(addr, &val, op.size);
+            return val;
+        }
+        default:
+            return 0;
+    }
+}
+
+static void eval_operand_write(const Operand& op, std::uint64_t val, CpuState& state, GuestMemory& mem, std::uint64_t current_rip) {
+    (void)current_rip;
+    switch (op.type) {
+        case OperandType::REG: {
+            if (op.reg == RegId::NONE || op.reg == RegId::RIP) return;
+            auto idx = static_cast<std::size_t>(op.reg);
+            if (idx >= 16) return;
+            if (op.size == 1) {
+                state.gpr[idx] = (state.gpr[idx] & ~0xFFULL) | (val & 0xFFULL);
+            } else if (op.size == 2) {
+                state.gpr[idx] = (state.gpr[idx] & ~0xFFFFULL) | (val & 0xFFFFULL);
+            } else if (op.size == 4) {
+                // x86-64 zera os 32 bits superiores ao escrever em reg de 32 bits
+                state.gpr[idx] = val & 0xFFFFFFFFULL;
+            } else {
+                state.gpr[idx] = val;
+            }
+            break;
+        }
+        case OperandType::MEM: {
+            std::uint64_t addr = 0;
+            if (op.is_rip_relative) {
+                addr = op.rip_target;
+            } else {
+                if (op.mem_base != RegId::NONE && static_cast<std::size_t>(op.mem_base) < 16) {
+                    addr += state.gpr[static_cast<std::size_t>(op.mem_base)];
+                }
+                if (op.mem_index != RegId::NONE && static_cast<std::size_t>(op.mem_index) < 16) {
+                    addr += state.gpr[static_cast<std::size_t>(op.mem_index)] * op.mem_scale;
+                }
+                addr += op.mem_disp;
+            }
+            mem.store(addr, &val, op.size);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static inline void update_arithmetic_flags(CpuState& state, std::uint64_t alu_flags) {
+    constexpr std::uint64_t ARITH_FLAGS_MASK = 0x08D5ULL; // CF | PF | AF | ZF | SF | OF
+    state.rflags = (state.rflags & ~ARITH_FLAGS_MASK) | (alu_flags & ARITH_FLAGS_MASK);
+}
+
+std::string emit_aot_block_cpp(const LiftedFunction& fn) {
+    std::ostringstream out;
+    out << "// Lifted AOT block " << fn.name << " at 0x" << std::hex << fn.vaddr << " (size: " << std::dec << fn.byte_size << " bytes)\n";
+    out << "bb::AotBlockResult " << fn.name << "_aot_block(bb::CpuState& state, bb::GuestMemory& mem) {\n";
+    out << "    std::uint64_t executed_steps = 0;\n";
+    out << "    bb::GuestContext ctx{};\n";
+    for (int i = 0; i < 16; ++i) {
+        out << "    ctx.r" << (i == 0 ? "ax" : (i == 1 ? "cx" : (i == 2 ? "dx" : (i == 3 ? "bx" : (i == 4 ? "sp" : (i == 5 ? "bp" : (i == 6 ? "si" : (i == 7 ? "di" : (std::string("8") + (i > 8 ? std::to_string(i - 8) : "")))))))))) << " = state.gpr[" << i << "];\n";
+    }
+    out << "    ctx.rip = state.rip;\n";
+    out << "    ctx.rflags = state.rflags;\n\n";
+
+    for (const auto& block : fn.blocks) {
+        for (const auto& inst : block.instructions) {
+            if (std::find(fn.internal_labels.begin(), fn.internal_labels.end(), inst.address) != fn.internal_labels.end()) {
+                out << "loc_" << std::hex << inst.address << ":\n";
+            }
+            if (inst.opcode == Opcode::UNKNOWN) {
+                out << "    // Fallback seguro: instrucao nao traduzida no endereco 0x" << std::hex << inst.address << "\n";
+                out << "    state.rip = 0x" << std::hex << inst.address << "ULL;\n";
+                for (int i = 0; i < 16; ++i) {
+                    out << "    state.gpr[" << i << "] = ctx.r" << (i == 0 ? "ax" : (i == 1 ? "cx" : (i == 2 ? "dx" : (i == 3 ? "bx" : (i == 4 ? "sp" : (i == 5 ? "bp" : (i == 6 ? "si" : (i == 7 ? "di" : (std::string("8") + (i > 8 ? std::to_string(i - 8) : "")))))))))) << ";\n";
+                }
+                out << "    state.rflags = ctx.rflags;\n";
+                out << "    return bb::AotBlockResult{bb::AotExecutionStatus::fallback_untranslated, executed_steps, 0x" << std::hex << inst.address << "ULL};\n";
+            } else {
+                out << "    ++executed_steps;\n";
+                out << "    " << inst.to_cpp_statement() << "\n";
+            }
+        }
+    }
+
+    out << "\n";
+    for (int i = 0; i < 16; ++i) {
+        out << "    state.gpr[" << i << "] = ctx.r" << (i == 0 ? "ax" : (i == 1 ? "cx" : (i == 2 ? "dx" : (i == 3 ? "bx" : (i == 4 ? "sp" : (i == 5 ? "bp" : (i == 6 ? "si" : (i == 7 ? "di" : (std::string("8") + (i > 8 ? std::to_string(i - 8) : "")))))))))) << ";\n";
+    }
+    out << "    state.rip = ctx.rip != 0 ? ctx.rip : (0x" << std::hex << (fn.vaddr + fn.byte_size) << "ULL);\n";
+    out << "    state.rflags = ctx.rflags;\n";
+    out << "    return bb::AotBlockResult{bb::AotExecutionStatus::completed, executed_steps, 0};\n";
+    out << "}\n";
+    return out.str();
+}
+
+AotBlockHandler create_aot_block_executor(const LiftedFunction& fn) {
+    return [fn](CpuState& state, GuestMemory& mem) -> AotBlockResult {
+        std::uint64_t executed_steps = 0;
+        for (const auto& block : fn.blocks) {
+            for (const auto& inst : block.instructions) {
+                if (inst.opcode == Opcode::UNKNOWN) {
+                    // Fallback seguro imediato para o interpretador na instrucao nao traduzida
+                    state.rip = inst.address;
+                    return AotBlockResult{AotExecutionStatus::fallback_untranslated, executed_steps, inst.address};
+                }
+
+                if (inst.opcode == Opcode::NOP) {
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::MOV || inst.opcode == Opcode::MOVZX) {
+                    std::uint64_t src = eval_operand_read(inst.op2, state, mem, inst.address);
+                    eval_operand_write(inst.op1, src, state, mem, inst.address);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::LEA) {
+                    std::uint64_t addr = 0;
+                    if (inst.op2.is_rip_relative) {
+                        addr = inst.op2.rip_target;
+                    } else {
+                        if (inst.op2.mem_base != RegId::NONE && static_cast<std::size_t>(inst.op2.mem_base) < 16) {
+                            addr += state.gpr[static_cast<std::size_t>(inst.op2.mem_base)];
+                        }
+                        if (inst.op2.mem_index != RegId::NONE && static_cast<std::size_t>(inst.op2.mem_index) < 16) {
+                            addr += state.gpr[static_cast<std::size_t>(inst.op2.mem_index)] * inst.op2.mem_scale;
+                        }
+                        addr += inst.op2.mem_disp;
+                    }
+                    eval_operand_write(inst.op1, addr, state, mem, inst.address);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::ADD) {
+                    std::uint64_t a = eval_operand_read(inst.op1, state, mem, inst.address);
+                    std::uint64_t b = eval_operand_read(inst.op2, state, mem, inst.address);
+                    auto r = bb::addx(a, b, inst.op1.size * 8, false);
+                    eval_operand_write(inst.op1, r.value, state, mem, inst.address);
+                    update_arithmetic_flags(state, r.flags);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::ADC) {
+                    std::uint64_t a = eval_operand_read(inst.op1, state, mem, inst.address);
+                    std::uint64_t b = eval_operand_read(inst.op2, state, mem, inst.address);
+                    auto r = bb::addx(a, b, inst.op1.size * 8, (state.rflags & 1ULL) != 0);
+                    eval_operand_write(inst.op1, r.value, state, mem, inst.address);
+                    update_arithmetic_flags(state, r.flags);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::SUB) {
+                    std::uint64_t a = eval_operand_read(inst.op1, state, mem, inst.address);
+                    std::uint64_t b = eval_operand_read(inst.op2, state, mem, inst.address);
+                    auto r = bb::subx(a, b, inst.op1.size * 8, false);
+                    eval_operand_write(inst.op1, r.value, state, mem, inst.address);
+                    update_arithmetic_flags(state, r.flags);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::SBB) {
+                    std::uint64_t a = eval_operand_read(inst.op1, state, mem, inst.address);
+                    std::uint64_t b = eval_operand_read(inst.op2, state, mem, inst.address);
+                    auto r = bb::subx(a, b, inst.op1.size * 8, (state.rflags & 1ULL) != 0);
+                    eval_operand_write(inst.op1, r.value, state, mem, inst.address);
+                    update_arithmetic_flags(state, r.flags);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::AND) {
+                    std::uint64_t a = eval_operand_read(inst.op1, state, mem, inst.address);
+                    std::uint64_t b = eval_operand_read(inst.op2, state, mem, inst.address);
+                    auto r = bb::andx(a, b, inst.op1.size * 8);
+                    eval_operand_write(inst.op1, r.value, state, mem, inst.address);
+                    update_arithmetic_flags(state, r.flags);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::OR) {
+                    std::uint64_t a = eval_operand_read(inst.op1, state, mem, inst.address);
+                    std::uint64_t b = eval_operand_read(inst.op2, state, mem, inst.address);
+                    auto r = bb::orx(a, b, inst.op1.size * 8);
+                    eval_operand_write(inst.op1, r.value, state, mem, inst.address);
+                    update_arithmetic_flags(state, r.flags);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::XOR) {
+                    std::uint64_t a = eval_operand_read(inst.op1, state, mem, inst.address);
+                    std::uint64_t b = eval_operand_read(inst.op2, state, mem, inst.address);
+                    auto r = bb::xorr(a, b, inst.op1.size * 8);
+                    eval_operand_write(inst.op1, r.value, state, mem, inst.address);
+                    update_arithmetic_flags(state, r.flags);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::CMP) {
+                    std::uint64_t a = eval_operand_read(inst.op1, state, mem, inst.address);
+                    std::uint64_t b = eval_operand_read(inst.op2, state, mem, inst.address);
+                    auto r = bb::cmpx(a, b, inst.op1.size * 8);
+                    update_arithmetic_flags(state, r.flags);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::TEST) {
+                    std::uint64_t a = eval_operand_read(inst.op1, state, mem, inst.address);
+                    std::uint64_t b = eval_operand_read(inst.op2, state, mem, inst.address);
+                    auto r = bb::testx(a, b, inst.op1.size * 8);
+                    update_arithmetic_flags(state, r.flags);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::PUSH) {
+                    std::uint64_t pv = eval_operand_read(inst.op1, state, mem, inst.address);
+                    state.gpr[4] -= 8;
+                    mem.store(state.gpr[4], &pv, 8);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::POP) {
+                    std::uint64_t pv = 0;
+                    mem.load(state.gpr[4], &pv, 8);
+                    state.gpr[4] += 8;
+                    eval_operand_write(inst.op1, pv, state, mem, inst.address);
+                    ++executed_steps;
+                    continue;
+                }
+                if (inst.opcode == Opcode::RET) {
+                    std::uint64_t ret_addr = 0;
+                    mem.load(state.gpr[4], &ret_addr, 8);
+                    state.gpr[4] += 8;
+                    if (inst.op1.type == OperandType::IMM && inst.op1.imm > 0) {
+                        state.gpr[4] += inst.op1.imm;
+                    }
+                    state.rip = ret_addr;
+                    ++executed_steps;
+                    return AotBlockResult{AotExecutionStatus::completed, executed_steps, 0};
+                }
+
+                // Qualquer outro opcode nao explicitamente traduzido aciona fallback seguro
+                state.rip = inst.address;
+                return AotBlockResult{AotExecutionStatus::fallback_untranslated, executed_steps, inst.address};
+            }
+        }
+        if (state.rip == fn.vaddr) {
+            state.rip = fn.vaddr + fn.byte_size;
+        }
+        return AotBlockResult{AotExecutionStatus::completed, executed_steps, 0};
+    };
 }
 
 } // namespace bb

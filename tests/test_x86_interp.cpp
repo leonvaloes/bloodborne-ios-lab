@@ -3,6 +3,9 @@
 #include <cstring>
 #include <initializer_list>
 #include <memory>
+#include <thread>
+#include <vector>
+#include <atomic>
 
 using namespace bb;
 
@@ -1356,9 +1359,285 @@ int main() {
             CHECK(decode_x86(d_bt_mem, sizeof(d_bt_mem)).length == 4);
             CHECK(decode_x86(d_bt_mem, sizeof(d_bt_mem)).supported);
         }
+        {   // CMPXCHG16B (48 0F C7 /1) e CMPXCHG8B (0F C7 /1)
+            // 1. CMPXCHG16B - Caso de igualdade (match): ZF=1, [rsi] <= rcx:rbx
+            Machine m1{0x48, 0x0F, 0xC7, 0x0E, 0xC3}; // cmpxchg16b [rsi]; ret
+            m1.cpu.state.gpr[6] = DATA; // rsi = DATA
+            const std::uint64_t mem16[2] = {0x1111222233334444ULL, 0x5555666677778888ULL};
+            CHECK(m1.mem.store(DATA, mem16, 16) == MemoryError::ok);
+            m1.cpu.state.gpr[0] = 0x1111222233334444ULL; // rax
+            m1.cpu.state.gpr[2] = 0x5555666677778888ULL; // rdx
+            m1.cpu.state.gpr[3] = 0xAAAAAAAAAAAAAAAAULL; // rbx
+            m1.cpu.state.gpr[1] = 0xBBBBBBBBBBBBBBBBULL; // rcx
+            CHECK(m1.run().stop == CpuStop::trap);
+            CHECK((m1.cpu.state.rflags & FLAG_ZF) != 0);
+            std::uint64_t out16[2] = {};
+            CHECK(m1.mem.load(DATA, out16, 16) == MemoryError::ok);
+            CHECK(out16[0] == 0xAAAAAAAAAAAAAAAAULL && out16[1] == 0xBBBBBBBBBBBBBBBBULL);
+
+            // 2. CMPXCHG16B - Caso de diferença (mismatch): ZF=0, rdx:rax <= [rsi], mem inalterada
+            Machine m2{0x48, 0x0F, 0xC7, 0x0E, 0xC3};
+            m2.cpu.state.gpr[6] = DATA;
+            const std::uint64_t mem16_m2[2] = {0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL};
+            CHECK(m2.mem.store(DATA, mem16_m2, 16) == MemoryError::ok);
+            m2.cpu.state.gpr[0] = 0x9999999999999999ULL; // rax != mem[0]
+            m2.cpu.state.gpr[2] = 0;
+            m2.cpu.state.gpr[3] = 0x1234;
+            m2.cpu.state.gpr[1] = 0x5678;
+            CHECK(m2.run().stop == CpuStop::trap);
+            CHECK((m2.cpu.state.rflags & FLAG_ZF) == 0);
+            CHECK(m2.cpu.state.gpr[0] == 0xAAAAAAAAAAAAAAAAULL);
+            CHECK(m2.cpu.state.gpr[2] == 0xBBBBBBBBBBBBBBBBULL);
+            std::uint64_t out16_unchanged[2] = {};
+            CHECK(m2.mem.load(DATA, out16_unchanged, 16) == MemoryError::ok);
+            CHECK(out16_unchanged[0] == 0xAAAAAAAAAAAAAAAAULL && out16_unchanged[1] == 0xBBBBBBBBBBBBBBBBULL);
+
+            // 3. CMPXCHG8B - Caso de igualdade (match): ZF=1, [rsi] <= ecx:ebx
+            Machine m3{0x0F, 0xC7, 0x0E, 0xC3}; // cmpxchg8b [rsi]; ret
+            m3.cpu.state.gpr[6] = DATA;
+            const std::uint32_t mem8[2] = {0x12345678, 0x9ABCDEF0};
+            CHECK(m3.mem.store(DATA, mem8, 8) == MemoryError::ok);
+            m3.cpu.state.gpr[0] = 0x12345678; // eax
+            m3.cpu.state.gpr[2] = 0x9ABCDEF0; // edx
+            m3.cpu.state.gpr[3] = 0x11223344; // ebx
+            m3.cpu.state.gpr[1] = 0x55667788; // ecx
+            CHECK(m3.run().stop == CpuStop::trap);
+            CHECK((m3.cpu.state.rflags & FLAG_ZF) != 0);
+            std::uint32_t out8[2] = {};
+            CHECK(m3.mem.load(DATA, out8, 8) == MemoryError::ok);
+            CHECK(out8[0] == 0x11223344 && out8[1] == 0x55667788);
+
+            // 4. CMPXCHG8B - Caso de diferença (mismatch): ZF=0, edx:eax <= [rsi]
+            Machine m4{0x0F, 0xC7, 0x0E, 0xC3};
+            m4.cpu.state.gpr[6] = DATA;
+            const std::uint32_t mem8_m4[2] = {0x11223344, 0x55667788};
+            CHECK(m4.mem.store(DATA, mem8_m4, 8) == MemoryError::ok);
+            m4.cpu.state.gpr[0] = 0;
+            m4.cpu.state.gpr[2] = 0;
+            CHECK(m4.run().stop == CpuStop::trap);
+            CHECK((m4.cpu.state.rflags & FLAG_ZF) == 0);
+            CHECK(m4.cpu.state.gpr[0] == 0x11223344);
+            CHECK(m4.cpu.state.gpr[2] == 0x55667788);
+
+            // Decodificador
+            const std::uint8_t d_cmpxchg16b[] = {0x48, 0x0F, 0xC7, 0x0E};
+            CHECK(decode_x86(d_cmpxchg16b, sizeof(d_cmpxchg16b)).length == 4);
+            CHECK(decode_x86(d_cmpxchg16b, sizeof(d_cmpxchg16b)).supported);
+            const std::uint8_t d_cmpxchg8b[] = {0x0F, 0xC7, 0x0E};
+            CHECK(decode_x86(d_cmpxchg8b, sizeof(d_cmpxchg8b)).length == 3);
+            CHECK(decode_x86(d_cmpxchg8b, sizeof(d_cmpxchg8b)).supported);
+        }
         {   // ud2
             Machine m{0x0F, 0x0B};
             CHECK(m.run().stop == CpuStop::undefined);
+        }
+        {   // T129: LOCK prefix (0xF0) RMW semantics and #UD exception enforcement
+            // 1. Valid LOCK RMW opcodes with memory destination
+            // LOCK ADD [rbx], eax (0xF0, 0x01, 0x03)
+            Machine m_add{0xF0, 0x01, 0x03, 0xC3};
+            m_add.cpu.state.gpr[3] = DATA;
+            m_add.cpu.state.gpr[0] = 42;
+            std::uint32_t add_val = 100;
+            CHECK(m_add.mem.store(DATA, &add_val, 4) == MemoryError::ok);
+            CHECK(m_add.run().stop == CpuStop::trap);
+            CHECK(m_add.mem.load(DATA, &add_val, 4) == MemoryError::ok);
+            CHECK(add_val == 142);
+
+            // LOCK XADD [rbx], eax (0xF0, 0x0F, 0xC1, 0x03)
+            Machine m_xadd{0xF0, 0x0F, 0xC1, 0x03, 0xC3};
+            m_xadd.cpu.state.gpr[3] = DATA;
+            m_xadd.cpu.state.gpr[0] = 50;
+            std::uint32_t xadd_val = 200;
+            CHECK(m_xadd.mem.store(DATA, &xadd_val, 4) == MemoryError::ok);
+            CHECK(m_xadd.run().stop == CpuStop::trap);
+            CHECK(m_xadd.cpu.state.gpr[0] == 200);
+            CHECK(m_xadd.mem.load(DATA, &xadd_val, 4) == MemoryError::ok);
+            CHECK(xadd_val == 250);
+
+            // LOCK CMPXCHG [rbx], rcx (0xF0, 0x48, 0x0F, 0xB1, 0x0B)
+            Machine m_cmpxchg{0xF0, 0x48, 0x0F, 0xB1, 0x0B, 0xC3};
+            m_cmpxchg.cpu.state.gpr[3] = DATA;
+            m_cmpxchg.cpu.state.gpr[0] = 1000; // rax
+            m_cmpxchg.cpu.state.gpr[1] = 9999; // rcx
+            std::uint64_t cmpxchg_val = 1000;
+            CHECK(m_cmpxchg.mem.store(DATA, &cmpxchg_val, 8) == MemoryError::ok);
+            CHECK(m_cmpxchg.run().stop == CpuStop::trap);
+            CHECK((m_cmpxchg.cpu.state.rflags & FLAG_ZF) != 0);
+            CHECK(m_cmpxchg.mem.load(DATA, &cmpxchg_val, 8) == MemoryError::ok);
+            CHECK(cmpxchg_val == 9999);
+
+            // LOCK INC dword ptr [rbx] (0xF0, 0xFF, 0x03)
+            Machine m_inc{0xF0, 0xFF, 0x03, 0xC3};
+            m_inc.cpu.state.gpr[3] = DATA;
+            std::uint32_t inc_val = 10;
+            CHECK(m_inc.mem.store(DATA, &inc_val, 4) == MemoryError::ok);
+            CHECK(m_inc.run().stop == CpuStop::trap);
+            CHECK(m_inc.mem.load(DATA, &inc_val, 4) == MemoryError::ok);
+            CHECK(inc_val == 11);
+
+            // LOCK DEC dword ptr [rbx] (0xF0, 0xFF, 0x0B)
+            Machine m_dec{0xF0, 0xFF, 0x0B, 0xC3};
+            m_dec.cpu.state.gpr[3] = DATA;
+            std::uint32_t dec_val = 10;
+            CHECK(m_dec.mem.store(DATA, &dec_val, 4) == MemoryError::ok);
+            CHECK(m_dec.run().stop == CpuStop::trap);
+            CHECK(m_dec.mem.load(DATA, &dec_val, 4) == MemoryError::ok);
+            CHECK(dec_val == 9);
+
+            // LOCK NOT dword ptr [rbx] (0xF0, 0xF7, 0x13)
+            Machine m_not{0xF0, 0xF7, 0x13, 0xC3};
+            m_not.cpu.state.gpr[3] = DATA;
+            std::uint32_t not_val = 0x00FF00FF;
+            CHECK(m_not.mem.store(DATA, &not_val, 4) == MemoryError::ok);
+            CHECK(m_not.run().stop == CpuStop::trap);
+            CHECK(m_not.mem.load(DATA, &not_val, 4) == MemoryError::ok);
+            CHECK(not_val == 0xFF00FF00);
+
+            // LOCK NEG dword ptr [rbx] (0xF0, 0xF7, 0x1B)
+            Machine m_neg{0xF0, 0xF7, 0x1B, 0xC3};
+            m_neg.cpu.state.gpr[3] = DATA;
+            std::int32_t neg_val = 55;
+            CHECK(m_neg.mem.store(DATA, &neg_val, 4) == MemoryError::ok);
+            CHECK(m_neg.run().stop == CpuStop::trap);
+            CHECK(m_neg.mem.load(DATA, &neg_val, 4) == MemoryError::ok);
+            CHECK(neg_val == -55);
+
+            // LOCK BTS [rbx], rcx (0xF0, 0x48, 0x0F, 0xAB, 0x0B)
+            Machine m_bts{0xF0, 0x48, 0x0F, 0xAB, 0x0B, 0xC3};
+            m_bts.cpu.state.gpr[3] = DATA;
+            m_bts.cpu.state.gpr[1] = 4;
+            std::uint64_t bit_val = 0;
+            CHECK(m_bts.mem.store(DATA, &bit_val, 8) == MemoryError::ok);
+            CHECK(m_bts.run().stop == CpuStop::trap);
+            CHECK(m_bts.mem.load(DATA, &bit_val, 8) == MemoryError::ok);
+            CHECK(bit_val == 16);
+
+            // LOCK BTR [rbx], rcx (0xF0, 0x48, 0x0F, 0xB3, 0x0B)
+            Machine m_btr{0xF0, 0x48, 0x0F, 0xB3, 0x0B, 0xC3};
+            m_btr.cpu.state.gpr[3] = DATA;
+            m_btr.cpu.state.gpr[1] = 4;
+            bit_val = 16;
+            CHECK(m_btr.mem.store(DATA, &bit_val, 8) == MemoryError::ok);
+            CHECK(m_btr.run().stop == CpuStop::trap);
+            CHECK(m_btr.mem.load(DATA, &bit_val, 8) == MemoryError::ok);
+            CHECK(bit_val == 0);
+
+            // LOCK BTC [rbx], rcx (0xF0, 0x48, 0x0F, 0xBB, 0x0B)
+            Machine m_btc{0xF0, 0x48, 0x0F, 0xBB, 0x0B, 0xC3};
+            m_btc.cpu.state.gpr[3] = DATA;
+            m_btc.cpu.state.gpr[1] = 4;
+            bit_val = 0;
+            CHECK(m_btc.mem.store(DATA, &bit_val, 8) == MemoryError::ok);
+            CHECK(m_btc.run().stop == CpuStop::trap);
+            CHECK(m_btc.mem.load(DATA, &bit_val, 8) == MemoryError::ok);
+            CHECK(bit_val == 16);
+
+            // LOCK XCHG [rbx], eax (0xF0, 0x87, 0x03)
+            Machine m_xchg{0xF0, 0x87, 0x03, 0xC3};
+            m_xchg.cpu.state.gpr[3] = DATA;
+            m_xchg.cpu.state.gpr[0] = 0x12345678;
+            std::uint32_t xchg_val = 0x87654321;
+            CHECK(m_xchg.mem.store(DATA, &xchg_val, 4) == MemoryError::ok);
+            CHECK(m_xchg.run().stop == CpuStop::trap);
+            CHECK(m_xchg.cpu.state.gpr[0] == 0x87654321);
+            CHECK(m_xchg.mem.load(DATA, &xchg_val, 4) == MemoryError::ok);
+            CHECK(xchg_val == 0x12345678);
+
+            // LOCK CMPXCHG8B [rsi] (0xF0, 0x0F, 0xC7, 0x0E)
+            Machine m_c8b{0xF0, 0x0F, 0xC7, 0x0E, 0xC3};
+            m_c8b.cpu.state.gpr[6] = DATA;
+            std::uint32_t c8b_mem[2] = {111, 222};
+            CHECK(m_c8b.mem.store(DATA, c8b_mem, 8) == MemoryError::ok);
+            m_c8b.cpu.state.gpr[0] = 111;
+            m_c8b.cpu.state.gpr[2] = 222;
+            m_c8b.cpu.state.gpr[3] = 333;
+            m_c8b.cpu.state.gpr[1] = 444;
+            CHECK(m_c8b.run().stop == CpuStop::trap);
+            CHECK((m_c8b.cpu.state.rflags & FLAG_ZF) != 0);
+            CHECK(m_c8b.mem.load(DATA, c8b_mem, 8) == MemoryError::ok);
+            CHECK(c8b_mem[0] == 333 && c8b_mem[1] == 444);
+
+            // LOCK CMPXCHG16B [rsi] (0xF0, 0x48, 0x0F, 0xC7, 0x0E)
+            Machine m_c16b{0xF0, 0x48, 0x0F, 0xC7, 0x0E, 0xC3};
+            m_c16b.cpu.state.gpr[6] = DATA;
+            std::uint64_t c16b_mem[2] = {1000, 2000};
+            CHECK(m_c16b.mem.store(DATA, c16b_mem, 16) == MemoryError::ok);
+            m_c16b.cpu.state.gpr[0] = 1000;
+            m_c16b.cpu.state.gpr[2] = 2000;
+            m_c16b.cpu.state.gpr[3] = 3000;
+            m_c16b.cpu.state.gpr[1] = 4000;
+            CHECK(m_c16b.run().stop == CpuStop::trap);
+            CHECK((m_c16b.cpu.state.rflags & FLAG_ZF) != 0);
+            CHECK(m_c16b.mem.load(DATA, c16b_mem, 16) == MemoryError::ok);
+            CHECK(c16b_mem[0] == 3000 && c16b_mem[1] == 4000);
+
+            // 2. Invalid LOCK usages: MUST trigger #UD (CpuStop::undefined)
+            // Register destination: LOCK ADD eax, ebx (0xF0, 0x01, 0xD8)
+            Machine bad_reg{0xF0, 0x01, 0xD8};
+            CHECK(bad_reg.run().stop == CpuStop::undefined);
+
+            // Non-RMW instruction: LOCK MOV [rbx], eax (0xF0, 0x89, 0x03)
+            Machine bad_mov{0xF0, 0x89, 0x03};
+            CHECK(bad_mov.run().stop == CpuStop::undefined);
+
+            // Read-only bit test: LOCK BT [rbx], rcx (0xF0, 0x48, 0x0F, 0xA3, 0x0B)
+            Machine bad_bt{0xF0, 0x48, 0x0F, 0xA3, 0x0B};
+            CHECK(bad_bt.run().stop == CpuStop::undefined);
+
+            // Non-RMW Group 1 compare: LOCK CMP [rbx], eax (0xF0, 0x39, 0x03)
+            Machine bad_cmp{0xF0, 0x39, 0x03};
+            CHECK(bad_cmp.run().stop == CpuStop::undefined);
+
+            // Instruction not supporting lock: LOCK NOP (0xF0, 0x90)
+            Machine bad_nop{0xF0, 0x90};
+            CHECK(bad_nop.run().stop == CpuStop::undefined);
+
+            // LOCK JMP (0xF0, 0xEB, 0x00)
+            Machine bad_jmp{0xF0, 0xEB, 0x00};
+            CHECK(bad_jmp.run().stop == CpuStop::undefined);
+
+            // LOCK VZEROALL (0xF0, 0xC5, 0xF8, 0x77)
+            Machine bad_avx{0xF0, 0xC5, 0xF8, 0x77};
+            CHECK(bad_avx.run().stop == CpuStop::undefined);
+
+            // 3. Multi-threaded host memory atomicity check with LOCK
+            GuestMemory shared_mem(1u << 20);
+            CHECK(shared_mem.map(CODE, 0x1000, Permission::read | Permission::write) == MemoryError::ok);
+            CHECK(shared_mem.map(STACK, 0x10000, Permission::read | Permission::write) == MemoryError::ok);
+            CHECK(shared_mem.map(DATA, 0x1000, Permission::read | Permission::write) == MemoryError::ok);
+            // Instruction: LOCK ADD qword ptr [rbx], 1; RET (0xF0, 0x48, 0x83, 0x03, 0x01, 0xC3)
+            const std::uint8_t lock_inc_code[] = {0xF0, 0x48, 0x83, 0x03, 0x01, 0xC3};
+            CHECK(shared_mem.store(CODE, lock_inc_code, sizeof(lock_inc_code)) == MemoryError::ok);
+            std::uint64_t counter = 0;
+            CHECK(shared_mem.store(DATA, &counter, 8) == MemoryError::ok);
+
+            constexpr int kThreads = 4;
+            constexpr int kIters = 250;
+            std::vector<std::thread> workers;
+            workers.reserve(kThreads);
+
+            for (int t = 0; t < kThreads; ++t) {
+                workers.emplace_back([&shared_mem, t] {
+                    X86Interpreter interp(shared_mem);
+                    interp.add_trap_range(TRAP, 0x1000);
+                    const std::uint64_t thread_stack = STACK + (t + 1) * 0x1000 - 8;
+                    const std::uint64_t ret_trap = TRAP;
+                    for (int i = 0; i < kIters; ++i) {
+                        interp.state.rip = CODE;
+                        interp.state.gpr[3] = DATA; // rbx
+                        interp.state.gpr[4] = thread_stack; // rsp
+                        CHECK(shared_mem.store(thread_stack, &ret_trap, 8) == MemoryError::ok);
+                        auto res = interp.run(100);
+                        CHECK(res.stop == CpuStop::trap);
+                    }
+                });
+            }
+            for (auto& w : workers) {
+                w.join();
+            }
+            std::uint64_t final_val = 0;
+            CHECK(shared_mem.load(DATA, &final_val, 8) == MemoryError::ok);
+            CHECK(final_val == static_cast<std::uint64_t>(kThreads * kIters));
         }
     });
 }

@@ -19,6 +19,8 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <atomic>
 
 namespace bb {
 
@@ -32,6 +34,25 @@ enum class BootState {
 };
 
 const char* boot_state_to_string(BootState state);
+
+enum class PauseReason : std::uint32_t {
+    none       = 0,
+    user       = 1 << 0,
+    lifecycle  = 1 << 1,
+    disconnect = 1 << 2,
+};
+
+inline PauseReason operator|(PauseReason a, PauseReason b) {
+    return static_cast<PauseReason>(static_cast<std::uint32_t>(a) | static_cast<std::uint32_t>(b));
+}
+
+inline PauseReason operator&(PauseReason a, PauseReason b) {
+    return static_cast<PauseReason>(static_cast<std::uint32_t>(a) & static_cast<std::uint32_t>(b));
+}
+
+inline PauseReason operator~(PauseReason a) {
+    return static_cast<PauseReason>(~static_cast<std::uint32_t>(a));
+}
 
 struct BootConfig {
     // Diretório base da aplicação (ex: Image0 ou Documents do iOS)
@@ -146,6 +167,10 @@ public:
     // Controle de ciclo de vida (suspensão/retomada cooperativa)
     void pause();
     void resume();
+    void add_pause_reason(PauseReason reason);
+    void clear_pause_reason(PauseReason reason);
+    std::uint32_t pause_reasons() const;
+    bool has_pause_reason(PauseReason reason) const;
     bool is_paused() const;
 
     // Consulta de estado e diagnóstico
@@ -190,14 +215,29 @@ public:
     GuestScheduler* scheduler() { return scheduler_.get(); }
     const GuestScheduler* scheduler() const { return scheduler_.get(); }
 
+    // Despacho de blocos AOT no coordenador (T051)
+    void register_aot_block(std::uint64_t rip, AotBlockHandler handler);
+    void unregister_aot_block(std::uint64_t rip);
+    bool has_aot_block(std::uint64_t rip) const;
+    void clear_aot_blocks();
+    std::size_t aot_block_count() const;
+
+    // Endereçamento e infraestrutura de objeto sintético de GUI com vtable válida (T037 / FR-001)
+    static constexpr std::uint64_t GUI_SYNTHETIC_OBJECT_BASE = 0x20000;
+    static constexpr std::uint64_t GUI_SYNTHETIC_VTABLE = 0x20100;
+    static constexpr std::uint64_t GUI_SYNTHETIC_CODE = 0x20200;
+    static bool setup_gui_synthetic_object(GuestMemory& mem);
+
     const Ps4Image& image() const;
     const BootConfig& config() const;
     const PackageInspectionReport& package_report() const;
-    const std::string& last_error() const;
+    std::string last_error() const;
 
 private:
+    mutable std::mutex diag_mutex_;
     BootState state_{BootState::not_started};
-    bool paused_{false};
+    std::atomic<bool> paused_{false};
+    std::atomic<std::uint32_t> pause_reasons_{0};
     BootConfig config_;
 
     std::unique_ptr<VirtualFileSystem> vfs_;

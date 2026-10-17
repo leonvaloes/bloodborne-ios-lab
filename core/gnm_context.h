@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace bb {
@@ -354,6 +355,7 @@ struct SamplerDescriptor {
     std::uint32_t min_filter = 0;
     std::uint32_t mag_filter = 0;
     std::uint32_t mip_filter = 0;
+    std::uint32_t aniso_ratio = 0;
     float min_lod = 0.0f;
     float max_lod = 15.0f;
     float lod_bias = 0.0f;
@@ -410,6 +412,7 @@ struct DispatchCall {
 
 class GnmContext : public Pm4Sink {
 public:
+    explicit GnmContext(GuestMemory& memory);
     explicit GnmContext(const GuestMemory& memory);
 
     // Pm4Sink overrides
@@ -473,7 +476,17 @@ public:
     const DispatchCall* last_dispatch_call() const;
     const std::vector<DrawCall>& draw_calls() const { return draw_calls_; }
     const std::vector<DispatchCall>& dispatch_calls() const { return dispatch_calls_; }
+    const std::vector<Pm4Event>& sync_events() const { return sync_events_; }
     void clear_calls();
+
+    // Diagnostico e rastreamento de escrita, DMA e sincronizacao (T153)
+    std::uint32_t write_data_count() const { return write_data_count_; }
+    std::uint32_t dma_count() const { return dma_count_; }
+    std::uint32_t sync_error_count() const { return sync_error_count_; }
+    std::uint32_t cache_invalidate_count() const { return cache_invalidate_count_; }
+    bool caches_invalidated() const { return caches_invalidated_; }
+    void clear_cache_invalidation() { caches_invalidated_ = false; }
+    const std::string& last_error() const { return last_error_; }
 
     // Reset completo de contexto
     void reset();
@@ -493,7 +506,23 @@ private:
     void update_blend_target(std::uint32_t index);
     void update_rasterizer();
 
+    void handle_write_data(const Pm4Event& event);
+    void handle_dma_data(const Pm4Event& event);
+    void handle_release_mem(const Pm4Event& event);
+    void handle_wait_reg_mem(const Pm4Event& event);
+    void handle_acquire_mem(const Pm4Event& event);
+    void handle_event_sync(const Pm4Event& event);
+
     const GuestMemory& memory_;
+    GuestMemory* memory_writer_ = nullptr;
+    std::uint32_t write_data_count_ = 0;
+    std::uint32_t dma_count_ = 0;
+    std::uint32_t sync_error_count_ = 0;
+    std::uint32_t cache_invalidate_count_ = 0;
+    bool caches_invalidated_ = false;
+    std::uint64_t gpu_timestamp_ = 1000;
+    std::string last_error_{};
+
     std::array<std::uint32_t, 0x4000> context_regs_{};
     std::array<std::uint32_t, 0x4000> sh_regs_graphics_{};
     std::array<std::uint32_t, 0x4000> sh_regs_compute_{};
@@ -504,6 +533,7 @@ private:
 
     std::vector<DrawCall> draw_calls_;
     std::vector<DispatchCall> dispatch_calls_;
+    std::vector<Pm4Event> sync_events_;
     DrawCall empty_draw_{};
     DispatchCall empty_dispatch_{};
 };
